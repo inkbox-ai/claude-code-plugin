@@ -1,0 +1,17 @@
+[project]
+name = "claude-code-plugin"
+version = "0.1.0"
+description = "Inkbox bridge for Claude Code — talk to your coding agent over email, SMS, iMessage, and voice"
+requires-python = ">=3.10"
+dependencies = [
+  "aiohttp>=3.9",
+  "inkbox>=0.4.7",
+  "claude-agent-sdk>=0.1.0",
+]
+
+[project.scripts]
+inkbox-claude = "inkbox_claude.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

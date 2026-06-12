@@ -1,0 +1,80 @@
+"""Command-line entry points: run, doctor, whoami."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import sys
+
+try:
+    from .config import read_config
+    from .doctor import print_doctor
+    from .gateway import InkboxGateway
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from config import read_config
+    from doctor import print_doctor
+    from gateway import InkboxGateway
+
+
+def _cmd_run() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    gateway = InkboxGateway(read_config())
+    try:
+        asyncio.run(gateway.run())
+    except KeyboardInterrupt:
+        print("bye")
+    return 0
+
+
+def _cmd_whoami() -> int:
+    cfg = read_config()
+    if not cfg.api_key or not cfg.identity:
+        print("INKBOX_API_KEY / INKBOX_IDENTITY not set — run doctor first.")
+        return 1
+    from inkbox import Inkbox
+
+    identity = Inkbox(api_key=cfg.api_key, base_url=cfg.base_url).get_identity(cfg.identity)
+    mailbox = getattr(identity, "mailbox", None)
+    phone = getattr(identity, "phone_number", None)
+    print(f"handle:   {identity.agent_handle}")
+    print(f"email:    {getattr(mailbox, 'email_address', None) or '-'}")
+    print(f"phone:    {getattr(phone, 'number', None) or '-'}")
+    print(f"imessage: {'enabled' if getattr(identity, 'imessage_enabled', False) else 'disabled'}")
+    print(f"project:  {cfg.project_dir}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI dispatcher.
+
+    Args:
+        argv (list[str] | None): Argument vector; defaults to sys.argv[1:].
+
+    Returns:
+        int: Process exit code.
+    """
+    parser = argparse.ArgumentParser(
+        prog="inkbox-claude",
+        description="Talk to Claude Code over email, SMS, iMessage, and voice via Inkbox.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("run", help="start the bridge gateway")
+    sub.add_parser("doctor", help="check configuration and dependencies")
+    sub.add_parser("whoami", help="show the bridged Inkbox identity")
+
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        return _cmd_run()
+    if args.command == "doctor":
+        return print_doctor()
+    if args.command == "whoami":
+        return _cmd_whoami()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
