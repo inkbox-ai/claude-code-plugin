@@ -1236,6 +1236,37 @@ def _configure_project_dir() -> None:
     print_success(f"  Claude Code will work in {chosen}")
 
 
+def _configure_autostart() -> None:
+    """Offer to keep the gateway running — on boot, or just in the background.
+
+    Returns:
+        None
+    """
+    print()
+    print(color("  --- Keep the bridge running ---", Colors.CYAN))
+    print_info("  The bridge has to stay running to receive your messages and reply.")
+
+    try:
+        from .daemon import install_autostart, start as daemon_start
+    except ImportError:  # pragma: no cover - direct local import/test fallback
+        from daemon import install_autostart, start as daemon_start
+
+    env_file = str(_env_file_path().resolve())
+
+    if prompt_yes_no("  Start it now and automatically on every boot?", True):
+        if install_autostart(env_file):
+            return
+        print_warning("  Couldn't set up boot autostart — starting in the background for now.")
+        daemon_start()
+        return
+
+    if prompt_yes_no("  Start it in the background now (until you reboot)?", True):
+        daemon_start()
+        return
+
+    print_info("  Start it yourself anytime with:  inkbox-claude start")
+
+
 # ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
@@ -1366,8 +1397,9 @@ def interactive_setup() -> None:
 
     _configure_project_dir()
 
+    _configure_autostart()
+
     print()
-    print("Next steps:")
-    print("  set -a; source .env; set +a")
-    print("  inkbox-claude doctor")
-    print("  inkbox-claude run")
+    print(color("Setup complete.", Colors.GREEN, Colors.BOLD))
+    print("  Check it anytime with:  inkbox-claude doctor")
+    print("  Logs:                   ~/.inkbox-claude/gateway.log")

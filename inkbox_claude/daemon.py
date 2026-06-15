@@ -11,7 +11,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import platform
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -225,3 +228,130 @@ def restart() -> int:
     """
     stop()
     return start()
+
+
+# ----------------------------------------------------------------------
+# Boot / login autostart (systemd user service or launchd agent)
+# ----------------------------------------------------------------------
+
+SERVICE_NAME = "inkbox-claude"
+LAUNCHD_LABEL = "ai.inkbox.claude"
+
+
+def _launcher_path() -> str:
+    """Absolute path to the `inkbox-claude` console script.
+
+    Returns:
+        str: Path to the launcher (or the bare name as a last resort).
+    """
+    sibling = Path(sys.executable).with_name("inkbox-claude")
+    if sibling.exists():
+        return str(sibling)
+    return shutil.which("inkbox-claude") or "inkbox-claude"
+
+
+def install_autostart(env_file: str) -> bool:
+    """Install and enable a service that runs the gateway on boot/login.
+
+    Args:
+        env_file (str): Absolute path to the .env the service should load.
+
+    Returns:
+        bool: True if the service was installed and enabled, else False.
+    """
+    exe = _launcher_path()
+    system = platform.system()
+    if system == "Linux":
+        return _install_systemd_user(exe, env_file)
+    if system == "Darwin":
+        return _install_launchd(exe, env_file)
+    print(f"  Boot autostart isn't supported on {system}. Use `inkbox-claude start` instead.")
+    return False
+
+
+def _install_systemd_user(exe: str, env_file: str) -> bool:
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit = unit_dir / f"{SERVICE_NAME}.service"
+    unit.write_text(
+        "[Unit]\n"
+        "Description=Inkbox bridge for Claude Code\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"Environment=INKBOX_CLAUDE_ENV_FILE={env_file}\n"
+        f"ExecStart={exe} run\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    print(f"  Wrote {unit}")
+
+    # systemd will own the gateway now — stop any fork-based one first.
+    if _read_pid():
+        stop()
+
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+    enabled = subprocess.run(
+        ["systemctl", "--user", "enable", "--now", f"{SERVICE_NAME}.service"],
+        capture_output=True, text=True,
+    )
+    if enabled.returncode == 0:
+        # enable-linger keeps user services alive across logout / on boot.
+        linger = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True)
+        print("  Enabled — the bridge is running now and will start on boot.")
+        if linger.returncode != 0:
+            print(f"  To keep it running while logged out: sudo loginctl enable-linger {user or '$USER'}")
+        print(f"  Manage it: systemctl --user status|restart|stop {SERVICE_NAME}")
+        return True
+
+    detail = (enabled.stderr or "").strip().splitlines()
+    print("  Could not enable the systemd user service automatically.")
+    if detail:
+        print(f"    {detail[-1]}")
+    print("  The unit is written — enable it once a user session exists:")
+    print(f"    loginctl enable-linger {user or '$USER'}")
+    print("    systemctl --user daemon-reload")
+    print(f"    systemctl --user enable --now {SERVICE_NAME}.service")
+    return False
+
+
+def _install_launchd(exe: str, env_file: str) -> bool:
+    plist_dir = Path.home() / "Library" / "LaunchAgents"
+    plist_dir.mkdir(parents=True, exist_ok=True)
+    plist = plist_dir / f"{LAUNCHD_LABEL}.plist"
+    log = _log_file()
+    plist.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n<dict>\n'
+        f"  <key>Label</key><string>{LAUNCHD_LABEL}</string>\n"
+        "  <key>ProgramArguments</key>\n"
+        f"  <array><string>{exe}</string><string>run</string></array>\n"
+        "  <key>EnvironmentVariables</key>\n"
+        f"  <dict><key>INKBOX_CLAUDE_ENV_FILE</key><string>{env_file}</string></dict>\n"
+        "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n"
+        f"  <key>StandardOutPath</key><string>{log}</string>\n"
+        f"  <key>StandardErrorPath</key><string>{log}</string>\n"
+        "</dict>\n</plist>\n"
+    )
+    print(f"  Wrote {plist}")
+
+    if _read_pid():
+        stop()
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True, text=True)
+    loaded = subprocess.run(["launchctl", "load", "-w", str(plist)], capture_output=True, text=True)
+    if loaded.returncode == 0:
+        print("  Loaded — the bridge is running now and will start at login.")
+        print(f"  Manage it: launchctl unload/load {plist}")
+        return True
+    print("  Could not load the launchd agent automatically.")
+    detail = (loaded.stderr or "").strip()
+    if detail:
+        print(f"    {detail}")
+    print(f"  Load it yourself: launchctl load -w {plist}")
+    return False

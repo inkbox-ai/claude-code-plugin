@@ -40,7 +40,7 @@ One command does the whole pipeline — finds a Python 3.10+, sets up an isolate
 curl -fsSL https://raw.githubusercontent.com/inkbox-ai/claude-code-plugin/main/install.sh | bash
 ```
 
-(The repo is private, so the one-liner needs GitHub auth — `gh auth login` or an SSH key. From a local checkout just run `./install.sh`. Add `--start` to launch the background daemon when it finishes, `--no-setup` to skip the wizard.)
+(From a local checkout, just run `./install.sh`. Add `--start` to launch the background daemon when it finishes, `--no-setup` to skip the wizard.)
 
 The installer writes config to `~/.inkbox-claude/.env`, so the daemon finds it from anywhere. When it's done:
 
@@ -89,6 +89,15 @@ tail -f ~/.inkbox-claude/gateway.log
 ```
 
 `start` auto-loads `.env` from the current directory, so you don't have to `source` it first. `run` is the foreground version a service manager (systemd, Docker) should supervise; `start`/`stop` are the self-contained background option.
+
+### Start on boot
+
+The setup wizard offers to keep the bridge running for you — either just in the background for this session, or as a service that starts on every boot. On Linux it installs a **systemd user unit** (`~/.config/systemd/user/inkbox-claude.service`) and enables it; on macOS it installs a **launchd agent**. To keep a Linux service alive while you're logged out, enable lingering once:
+
+```bash
+sudo loginctl enable-linger "$USER"
+systemctl --user status inkbox-claude   # restart | stop | status
+```
 
 Then, from your phone:
 

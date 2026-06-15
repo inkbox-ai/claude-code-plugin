@@ -65,6 +65,59 @@ def test_maybe_load_env_file_falls_back_to_state_dir(tmp_path, monkeypatch):
     assert os.environ["INKBOX_API_KEY"] == "ApiKey_global"
 
 
+def test_launcher_path_is_a_string():
+    assert isinstance(daemon._launcher_path(), str)
+
+
+def test_install_autostart_writes_and_enables_systemd_unit(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(daemon, "_read_pid", lambda: None)  # nothing to stop
+
+    calls = []
+
+    class _OK:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return _OK()
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+
+    assert daemon.install_autostart("/home/me/.inkbox-claude/.env") is True
+
+    unit = home / ".config" / "systemd" / "user" / "inkbox-claude.service"
+    text = unit.read_text()
+    assert "ExecStart=" in text and " run" in text
+    assert "INKBOX_CLAUDE_ENV_FILE=/home/me/.inkbox-claude/.env" in text
+    # daemon-reload + enable --now were invoked.
+    assert ["systemctl", "--user", "daemon-reload"] in calls
+    assert any("enable" in c for c in calls)
+
+
+def test_install_autostart_reports_failure_when_enable_fails(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(daemon, "_read_pid", lambda: None)
+
+    class _Fail:
+        returncode = 1
+        stderr = "Failed to connect to bus"
+
+    monkeypatch.setattr(daemon.subprocess, "run", lambda cmd, **_k: _Fail())
+
+    # Unit still written, but returns False so the wizard falls back.
+    assert daemon.install_autostart("/x/.env") is False
+    assert (home / ".config" / "systemd" / "user" / "inkbox-claude.service").exists()
+
+
 def test_cli_routes_daemon_commands(monkeypatch):
     calls = []
     monkeypatch.setattr(cli.daemon, "start", lambda: calls.append("start") or 0)
