@@ -4,9 +4,14 @@ from inkbox_claude.config import BridgeConfig
 from inkbox_claude.sessions import ContactSession
 
 
-def make_session(sent):
+def make_session(sent, typing=None):
     async def send_fn(chat_id, text, mode, meta):
         sent.append((chat_id, text, mode, dict(meta)))
+
+    typing_fn = None
+    if typing is not None:
+        async def typing_fn(chat_id, mode, meta):  # noqa: F811
+            typing.append((chat_id, mode, dict(meta)))
 
     cfg = BridgeConfig(permission_timeout_s=2.0, project_dir="/tmp")
     return ContactSession(
@@ -16,6 +21,7 @@ def make_session(sent):
         mcp_server=None,
         mcp_tool_names=[],
         identity_info={"handle": "t", "email": "", "phone": ""},
+        typing_fn=typing_fn,
     )
 
 
@@ -47,5 +53,74 @@ def test_escalation_timeout_returns_none():
         result = await session._escalate("permission", "anyone there?")
         assert result is None
         assert session.pending is None
+
+    asyncio.run(scenario())
+
+
+def test_typing_loop_pings_imessage_only():
+    async def scenario():
+        typing = []
+        session = make_session([], typing)
+        session.mode = "imessage"
+        session.reply_meta = {"conversation_id": "c1"}
+
+        task = asyncio.create_task(session._typing_loop())
+        await asyncio.sleep(0.05)  # first tick fires immediately
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert typing and typing[0] == ("contact-1", "imessage", {"conversation_id": "c1"})
+
+    asyncio.run(scenario())
+
+
+def test_typing_loop_skips_non_imessage():
+    async def scenario():
+        typing = []
+        session = make_session([], typing)
+        session.mode = "sms"  # SMS has no typing indicator
+
+        task = asyncio.create_task(session._typing_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert typing == []
+
+    asyncio.run(scenario())
+
+
+def test_double_text_interrupts_running_turn():
+    async def scenario():
+        session = make_session([])
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        # Pretend a turn worker is already draining so handle_inbound doesn't
+        # spawn a real one (which would touch the fake client).
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("do this instead", "imessage", {"conversation_id": "c1"})
+
+        assert fake.interrupts == 1
+        assert session._interrupting is True
+        # The new message is queued for the worker to pick up after the abort.
+        assert session._queue.get_nowait() == "do this instead"
+
+        session._worker.cancel()
 
     asyncio.run(scenario())

@@ -144,6 +144,7 @@ class InkboxGateway:
             mcp_server=server,
             mcp_tool_names=tool_names,
             identity_info=identity_info,
+            typing_fn=self.send_typing,
         )
 
         logger.info(
@@ -454,6 +455,29 @@ class InkboxGateway:
     # ------------------------------------------------------------------
     # Outbound
     # ------------------------------------------------------------------
+
+    async def send_typing(self, chat_id: str, mode: str, meta: Dict[str, Any]) -> None:
+        """Show a typing indicator while Claude works on a turn.
+
+        Args:
+            chat_id (str): Contact-keyed session id.
+            mode (str): Channel the human last used.
+            meta (dict): Channel routing details captured on inbound.
+
+        Returns:
+            None: No-op for channels without a typing indicator (iMessage only).
+        """
+        if mode != "imessage":
+            return
+        conversation_id = (meta or {}).get("conversation_id")
+        if not conversation_id:
+            return
+        try:
+            # Reuse the identity fetched at startup — this fires every few
+            # seconds, so we don't want a network round trip just to refresh it.
+            await asyncio.to_thread(self._identity.send_imessage_typing, str(conversation_id))
+        except Exception:
+            logger.debug("[bridge] typing indicator failed", exc_info=True)
 
     async def send_to_contact(
         self, chat_id: str, content: str, mode: str, meta: Dict[str, Any]

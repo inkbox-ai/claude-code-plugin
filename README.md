@@ -73,6 +73,12 @@ Claude Code never silently runs anything destructive. The bridge passes a `can_u
 
 Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Claude session ids are persisted in `~/.inkbox-claude/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used (call replies fall back to SMS if you hang up before Claude finishes).
 
+**Typing indicator.** While Claude works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
+
+**Interrupt by texting again.** Messaging the agent again while it's mid-turn works like pressing Esc in Claude Code and typing a new message: the running turn is interrupted, its partial answer is dropped, and Claude picks up your new message instead. (A reply while it's waiting on a permission/poll still answers that escalation — interrupting only applies while it's actively working.)
+
+**Errors.** If a turn fails, you get a short plain-language heads-up ("I hit an error while working on that and had to stop") rather than silence.
+
 ## Voice
 
 Calls use Inkbox-managed STT/TTS: Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Claude's replies are spoken back. (No OpenAI Realtime path here yet — see hermes-agent-plugin for what that looks like.)

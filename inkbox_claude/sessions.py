@@ -59,6 +59,12 @@ logger = logging.getLogger(__name__)
 
 # gateway.send_to_contact(chat_id, text, mode, meta) signature.
 SendFn = Callable[[str, str, str, Dict[str, Any]], Awaitable[Any]]
+# gateway.send_typing(chat_id, mode, meta) signature.
+TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
+
+# iMessage typing bubbles expire after a few seconds, so we refresh the
+# indicator on this cadence for as long as a turn is running.
+TYPING_REFRESH_SECONDS = 4.0
 
 
 def _state_path() -> Path:
@@ -80,10 +86,12 @@ class ContactSession:
         identity_info: Dict[str, str],
         resume_session_id: Optional[str] = None,
         on_session_id: Optional[Callable[[str, str], None]] = None,
+        typing_fn: Optional[TypingFn] = None,
     ):
         self.chat_id = chat_id
         self.cfg = cfg
         self.send_fn = send_fn
+        self.typing_fn = typing_fn
         self.mcp_server = mcp_server
         self.mcp_tool_names = mcp_tool_names
         self.identity_info = identity_info
@@ -98,6 +106,8 @@ class ContactSession:
         self._client: Optional[ClaudeSDKClient] = None
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker: Optional[asyncio.Task] = None
+        self._turn_active = False     # a Claude turn is mid-flight
+        self._interrupting = False    # a new message asked us to abort it
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -125,6 +135,18 @@ class ContactSession:
             return
 
         await self._queue.put(text)
+
+        # Texting again while Claude is mid-turn behaves like hitting Esc and
+        # typing a new message: interrupt the running turn so the worker drops
+        # to this fresh message instead of making the human wait it out.
+        if self._turn_active and self._client is not None:
+            logger.info("[session %s] new message interrupts the running turn", self.chat_id)
+            self._interrupting = True
+            try:
+                await self._client.interrupt()
+            except Exception:
+                logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
+
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
 
@@ -134,36 +156,83 @@ class ContactSession:
             try:
                 await self._run_turn(text)
             except Exception:
+                # An interrupt aborts the turn on purpose — the next queued
+                # message takes over, so it is not an error to report.
+                if self._interrupting:
+                    logger.info("[session %s] turn interrupted by a new message", self.chat_id)
+                    continue
                 logger.exception("[session %s] turn failed", self.chat_id)
-                await self._reply(
-                    "Sorry — something went wrong on my end while working on that. "
-                    "Try again in a minute."
-                )
+                try:
+                    await self._reply(
+                        "Sorry — I hit an error while working on that and had to stop. "
+                        "Try sending it again."
+                    )
+                except Exception:
+                    logger.exception("[session %s] could not send the error notice", self.chat_id)
 
     # ------------------------------------------------------------------
     # Claude Code turn
     # ------------------------------------------------------------------
 
     async def _run_turn(self, text: str) -> None:
+        self._interrupting = False  # fresh turn starts un-interrupted
         client = await self._ensure_client()
-        await client.query(text)
 
-        chunks: list[str] = []
-        final: Optional[str] = None
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        chunks.append(block.text)
-            elif isinstance(message, ResultMessage):
-                final = message.result
-                if message.session_id and self.on_session_id:
-                    self.resume_session_id = message.session_id
-                    self.on_session_id(self.chat_id, message.session_id)
+        # Keep a typing indicator alive on the human's channel for the whole
+        # turn, then always tear it down — even if the turn raises.
+        self._turn_active = True
+        typing_task = asyncio.create_task(self._typing_loop())
+        try:
+            await client.query(text)
 
+            chunks: list[str] = []
+            final: Optional[str] = None
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            chunks.append(block.text)
+                elif isinstance(message, ResultMessage):
+                    final = message.result
+                    if message.session_id and self.on_session_id:
+                        self.resume_session_id = message.session_id
+                        self.on_session_id(self.chat_id, message.session_id)
+        finally:
+            self._turn_active = False
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+
+        # If a new message interrupted this turn, drop the partial answer —
+        # the next queued message is what the human actually wants now.
+        if self._interrupting:
+            return
         reply = (final or "\n\n".join(chunks)).strip()
         if reply:
             await self._reply(reply)
+
+    async def _typing_loop(self) -> None:
+        """Refresh the channel's typing indicator until the turn ends.
+
+        Returns:
+            None: Runs until cancelled by :meth:`_run_turn`.
+        """
+        if self.typing_fn is None:
+            return
+        try:
+            while True:
+                # Only iMessage has a typing bubble; stay quiet while an
+                # escalation is parked waiting on the human to reply.
+                if self.mode == "imessage" and self.pending is None:
+                    try:
+                        await self.typing_fn(self.chat_id, self.mode, self.reply_meta)
+                    except Exception:
+                        logger.debug("[session %s] typing ping failed", self.chat_id, exc_info=True)
+                await asyncio.sleep(TYPING_REFRESH_SECONDS)
+        except asyncio.CancelledError:
+            return
 
     async def _ensure_client(self) -> ClaudeSDKClient:
         if self._client is not None:
@@ -306,9 +375,11 @@ class SessionManager:
         mcp_server: Any,
         mcp_tool_names: list[str],
         identity_info: Dict[str, str],
+        typing_fn: Optional[TypingFn] = None,
     ):
         self.cfg = cfg
         self.send_fn = send_fn
+        self.typing_fn = typing_fn
         self.mcp_server = mcp_server
         self.mcp_tool_names = mcp_tool_names
         self.identity_info = identity_info
@@ -351,6 +422,7 @@ class SessionManager:
                 identity_info=self.identity_info,
                 resume_session_id=self._session_ids.get(chat_id),
                 on_session_id=self._save_session_id,
+                typing_fn=self.typing_fn,
             )
             self.sessions[chat_id] = session
         return session
