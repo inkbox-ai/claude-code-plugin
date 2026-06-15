@@ -55,6 +55,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("stop", help="stop the background bridge gateway")
     sub.add_parser("restart", help="restart the background bridge gateway")
     sub.add_parser("status", help="show whether the background gateway is running")
+    uninstall_parser = sub.add_parser("uninstall", help="remove the background service and launcher")
+    uninstall_parser.add_argument(
+        "--purge", action="store_true",
+        help="also delete config, logs, and sessions in ~/.inkbox-claude",
+    )
     sub.add_parser("doctor", help="check configuration and dependencies")
     sub.add_parser("whoami", help="show the bridged Inkbox identity")
 
@@ -72,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         return daemon.restart()
     if args.command == "status":
         return daemon.status()
+    if args.command == "uninstall":
+        return daemon.uninstall(purge=getattr(args, "purge", False))
     if args.command == "doctor":
         return print_doctor()
     if args.command == "whoami":

@@ -319,6 +319,84 @@ def _install_systemd_user(exe: str, env_file: str) -> bool:
     return False
 
 
+def uninstall_autostart() -> bool:
+    """Disable and remove the boot/login service if one is installed.
+
+    Returns:
+        bool: True if a service was found and removed, else False.
+    """
+    system = platform.system()
+    if system == "Linux":
+        unit = Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service"
+        if not unit.exists():
+            return False
+        subprocess.run(["systemctl", "--user", "disable", "--now", f"{SERVICE_NAME}.service"],
+                       capture_output=True, text=True)
+        unit.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+        print(f"  Removed systemd service {unit}")
+        return True
+    if system == "Darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+        if not plist.exists():
+            return False
+        subprocess.run(["launchctl", "unload", "-w", str(plist)], capture_output=True, text=True)
+        plist.unlink(missing_ok=True)
+        print(f"  Removed launchd agent {plist}")
+        return True
+    return False
+
+
+def uninstall(purge: bool = False) -> int:
+    """Tear down the local install: stop, remove service + launcher, opt. purge.
+
+    Args:
+        purge (bool): Also delete ``~/.inkbox-claude`` (config, logs, sessions,
+            and an installer-managed app/venv).
+
+    Returns:
+        int: 0.
+    """
+    print("Uninstalling inkbox-claude...")
+
+    # 1. Stop a running background gateway.
+    if _read_pid():
+        stop()
+
+    # 2. Remove the boot/login service.
+    if not uninstall_autostart():
+        print("  No boot service installed.")
+
+    # 3. Remove our launcher symlink wherever it sits on PATH (ours points
+    #    into a venv, so only unlink symlinks that resolve through "inkbox").
+    dirs = {Path.home() / ".local" / "bin"}
+    dirs.update(Path(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+    removed_link = False
+    for link in (d / "inkbox-claude" for d in dirs):
+        try:
+            if link.is_symlink() and "inkbox" in os.path.realpath(link):
+                link.unlink()
+                print(f"  Removed launcher {link}")
+                removed_link = True
+        except OSError:
+            pass
+    if not removed_link:
+        print("  No launcher symlink found on PATH.")
+
+    # 4. Config / state.
+    state = _state_dir()
+    if purge:
+        shutil.rmtree(state, ignore_errors=True)  # ok if our venv lives here (POSIX)
+        print(f"  Purged {state} (config, logs, sessions).")
+    else:
+        print(f"  Kept your config at {state} (.env, logs, sessions).")
+        print("  Remove it too with:  inkbox-claude uninstall --purge")
+
+    print("  Note: webhook subscriptions on the Inkbox side are left as-is — remove them in the console if you want.")
+    print("Done.")
+    return 0
+
+
 def _install_launchd(exe: str, env_file: str) -> bool:
     plist_dir = Path.home() / "Library" / "LaunchAgents"
     plist_dir.mkdir(parents=True, exist_ok=True)

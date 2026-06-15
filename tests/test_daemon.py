@@ -118,6 +118,52 @@ def test_install_autostart_reports_failure_when_enable_fails(tmp_path, monkeypat
     assert (home / ".config" / "systemd" / "user" / "inkbox-claude.service").exists()
 
 
+def test_uninstall_autostart_removes_systemd_unit(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    unit = home / ".config" / "systemd" / "user" / "inkbox-claude.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n")
+    monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(daemon.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(daemon.subprocess, "run", lambda cmd, **_k: None)
+
+    assert daemon.uninstall_autostart() is True
+    assert not unit.exists()
+
+
+def test_uninstall_keeps_config_by_default(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".env").write_text("INKBOX_API_KEY=x\n")
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(state))
+    monkeypatch.setenv("PATH", "")  # no launcher symlinks to hunt
+    monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(daemon, "_read_pid", lambda: None)
+
+    assert daemon.uninstall(purge=False) == 0
+    assert (state / ".env").exists()  # config preserved
+
+
+def test_uninstall_purge_deletes_state(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".env").write_text("INKBOX_API_KEY=x\n")
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(state))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(daemon.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(daemon, "_read_pid", lambda: None)
+
+    assert daemon.uninstall(purge=True) == 0
+    assert not state.exists()  # fully removed
+
+
+def test_cli_routes_uninstall_with_purge(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli.daemon, "uninstall", lambda purge: seen.update(purge=purge) or 0)
+    assert cli.main(["uninstall", "--purge"]) == 0
+    assert seen == {"purge": True}
+
+
 def test_cli_routes_daemon_commands(monkeypatch):
     calls = []
     monkeypatch.setattr(cli.daemon, "start", lambda: calls.append("start") or 0)

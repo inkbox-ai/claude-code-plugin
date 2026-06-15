@@ -2,7 +2,28 @@
 
 [Inkbox](https://inkbox.ai) bridge for [Claude Code](https://claude.com/claude-code). It gives a Claude Code agent its own Inkbox identity — mailbox, phone number, SMS/MMS, iMessage, and voice calls — so you can walk away from the keyboard and keep talking to your agent from your phone.
 
-Status: **prototype.** Gateway with Inkbox tunnel, webhook subscriptions for email/SMS/iMessage, voice calls over Inkbox STT/TTS, contact-keyed sessions that survive restarts, permission and poll escalation over text, and bundled Inkbox messaging tools are implemented. Sibling of [hermes-agent-plugin](https://github.com/inkbox-ai/hermes-agent-plugin), which does the same for Hermes Agent.
+Status: **prototype**, but installable in one command and runnable as a boot service. Sibling of [hermes-agent-plugin](https://github.com/inkbox-ai/hermes-agent-plugin), which does the same for Hermes Agent.
+
+## Get started — one command
+
+This finds a Python 3.10+, installs the bridge in its own venv, puts `inkbox-claude` on your PATH, and runs the setup wizard:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/inkbox-ai/claude-code-plugin/main/install.sh | bash
+```
+
+That's the whole setup. The wizard creates a fresh Inkbox agent for you (or takes an existing API key), provisions a phone number, connects iMessage, mints a webhook signing key, picks the project directory Claude works in, and offers to **keep the bridge running on every boot**. When it finishes, text/email/call your agent and it answers from a real Claude Code session.
+
+The one thing to have ready: be **logged into Claude** — a Claude Pro/Max subscription (via the Claude Code app/CLI) or `ANTHROPIC_API_KEY` set. The installer checks this and warns if it's missing.
+
+Flags: `--start` (launch the background gateway when done), `--no-setup` (install only). From a local checkout, run `./install.sh`. Re-running is safe.
+
+Check it any time:
+
+```bash
+inkbox-claude doctor    # config, SDKs, claude CLI, identity reachability
+inkbox-claude status    # is the background gateway up? where are the logs?
+```
 
 ## What it does
 
@@ -23,36 +44,16 @@ you (phone)  ── SMS / iMessage / email / call ──▶  Inkbox  ──▶  
   > Reply 1 (or YES) to allow once, 2 (or ALWAYS) to allow this kind of action for the rest of the session, 3 (or NO) to block it.
 
 - When Claude needs you to pick between options (the `AskUserQuestion` tool), you get a numbered poll on whatever channel you're on, and your reply is fed back as the answer.
+- Each message you send is tagged with its channel, so Claude knows whether it's on SMS, iMessage, email, or a call.
 - A channel prompt is appended to Claude Code's system prompt so replies fit a phone: plain text, no markdown, short, jargon kept to a minimum ("saved and published the change", not "pushed to origin/main").
 - Claude also gets Inkbox tools (`inkbox_send_email`, `inkbox_send_sms`, `inkbox_send_imessage`, …) so it can proactively reach you — "email me the full report" works.
 
-## Prerequisites
+## Manual install
 
-- [Claude Code](https://claude.com/claude-code) installed and authenticated (`claude` on PATH).
-- Python 3.10+.
-- An Inkbox account with an agent identity (mailbox and/or phone number provisioned). Create one in the [Inkbox Console](https://inkbox.ai/console) or via the Inkbox CLI.
-
-## Quick start
-
-One command does the whole pipeline — finds a Python 3.10+, sets up an isolated venv, installs the bridge, puts `inkbox-claude` on your PATH, and runs the setup wizard:
+If you'd rather not run the installer (any Python 3.10+ environment):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inkbox-ai/claude-code-plugin/main/install.sh | bash
-```
-
-(From a local checkout, just run `./install.sh`. Add `--start` to launch the background daemon when it finishes, `--no-setup` to skip the wizard.)
-
-The installer writes config to `~/.inkbox-claude/.env`, so the daemon finds it from anywhere. When it's done:
-
-```bash
-inkbox-claude doctor   # check config, SDKs, claude CLI, identity reachability
-inkbox-claude start    # run the gateway in the background
-```
-
-### Manual install
-
-```bash
-pip install -e .       # into a Python 3.10+ environment
+pip install -e .
 
 inkbox-claude setup    # interactive wizard — writes .env for you
 set -a; source .env; set +a
@@ -61,13 +62,7 @@ inkbox-claude doctor
 inkbox-claude run
 ```
 
-`inkbox-claude setup` walks you through everything and writes `.env`: create a
-fresh Inkbox agent via self-signup (or bring an existing API key), pick or
-create the identity, provision a phone number, wait for your `START` opt-in,
-connect iMessage, mint a webhook signing key, and choose the project directory
-Claude Code works in. Rerun it anytime to reconfigure. Prefer to wire `.env` by
-hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`,
-`INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
+`inkbox-claude setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, provision a phone number, wait for your `START` opt-in, connect iMessage, mint a webhook signing key, choose the project directory, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
 
 On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Claude Code sessions.
 
@@ -98,6 +93,15 @@ The setup wizard offers to keep the bridge running for you — either just in th
 sudo loginctl enable-linger "$USER"
 systemctl --user status inkbox-claude   # restart | stop | status
 ```
+
+### Uninstall
+
+```bash
+inkbox-claude uninstall           # stop it, remove the boot service + launcher; keep config
+inkbox-claude uninstall --purge   # also delete ~/.inkbox-claude (config, logs, sessions)
+```
+
+This is local-only — webhook subscriptions on the Inkbox side are left as-is; remove them in the [Inkbox Console](https://inkbox.ai/console) if you want.
 
 Then, from your phone:
 
