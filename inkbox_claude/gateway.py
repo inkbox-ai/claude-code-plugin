@@ -204,14 +204,14 @@ class InkboxGateway:
         identity = self._inkbox.get_identity(self.cfg.identity)
 
         def _reconcile(owner_kw: Dict[str, Any], event_types: List[str]) -> None:
-            existing = self._inkbox.webhook_subscriptions.list(**owner_kw)
+            existing = self._inkbox.webhooks.subscriptions.list(**owner_kw)
             for sub in existing:
                 if sub.url == webhook_url and set(sub.event_types) == set(event_types):
                     return  # already wired
                 if sub.url.endswith(DEFAULT_WEBHOOK_PATH):
                     # A previous bridge install — replace it.
-                    self._inkbox.webhook_subscriptions.delete(sub.id)
-            self._inkbox.webhook_subscriptions.create(
+                    self._inkbox.webhooks.subscriptions.delete(sub.id)
+            self._inkbox.webhooks.subscriptions.create(
                 url=webhook_url, event_types=event_types, **owner_kw
             )
 
