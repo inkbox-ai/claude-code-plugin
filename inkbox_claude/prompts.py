@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any, Dict
 
 # Appended to the claude_code system prompt preset for every bridged
 # session. The agent is a full Claude Code instance with tool access —
@@ -10,10 +11,14 @@ import re
 CHANNEL_PROMPT = """
 # Messaging bridge
 
-You are NOT in a terminal. The human is talking to you over {channels}
-through your Inkbox identity ({identity_line}). Your replies are
-delivered to their phone or inbox, so:
+You are NOT in a terminal. You are an Inkbox agent ({identity_line}). The
+human is talking to you over {channels}. Your replies are delivered to
+their phone or inbox, so:
 
+- Each incoming message starts with a small bracketed tag showing how it
+  reached you and from whom — e.g. [iMessage from +15551234567] or
+  [Spoken live on a phone call]. Read it to know which channel you're on
+  right now, but never repeat the tag back in your reply.
 - Plain text only. No markdown — no **bold**, no backticks, no headers,
   no bullet lists, no code blocks unless they explicitly ask for code.
 - Keep it short and conversational. Think texts, not essays. Lead with
@@ -78,6 +83,40 @@ def build_channel_prompt(
         identity_line=identity_line,
         project_dir=project_dir or "the current directory",
     )
+
+
+def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
+    """Prefix an inbound message with a tag naming its channel and sender.
+
+    Gives Claude the per-turn context the static system prompt can't — which
+    channel this message arrived on and who sent it — so it can answer
+    "what channel are we on?" and tailor the reply.
+
+    Args:
+        mode (str): Channel the message arrived on (email/sms/imessage/voice).
+        meta (dict): Inbound routing metadata; ``sender`` and ``subject`` used.
+        text (str): The human's message body.
+
+    Returns:
+        str: ``text`` prefixed with a one-line bracketed channel tag.
+    """
+    meta = meta or {}
+    sender = str(meta.get("sender") or "").strip()
+    from_part = f" from {sender}" if sender else ""
+    if mode == "email":
+        header = f"[Email{from_part}]"
+        subject = str(meta.get("subject") or "").strip()
+        if subject:
+            header += f"\nSubject: {subject}"
+    elif mode == "sms":
+        header = f"[Text message (SMS){from_part}]"
+    elif mode == "imessage":
+        header = f"[iMessage{from_part}]"
+    elif mode == "voice":
+        header = "[Spoken live on a phone call — keep the reply short and speech-friendly]"
+    else:
+        header = f"[Message via {mode}{from_part}]"
+    return f"{header}\n\n{text}"
 
 
 _MD_PATTERNS = [

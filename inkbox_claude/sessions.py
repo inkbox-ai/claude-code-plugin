@@ -43,7 +43,7 @@ try:
         parse_permission_reply,
         parse_poll_reply,
     )
-    from .prompts import build_channel_prompt
+    from .prompts import build_channel_prompt, frame_inbound
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import BridgeConfig
     from escalation import (
@@ -53,7 +53,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         parse_permission_reply,
         parse_poll_reply,
     )
-    from prompts import build_channel_prompt
+    from prompts import build_channel_prompt, frame_inbound
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,9 @@ class ContactSession:
             self.pending.future.set_result(text)
             return
 
-        await self._queue.put(text)
+        # Tag the message with its channel + sender so Claude knows where it
+        # is and who it's talking to (the static system prompt can't).
+        await self._queue.put(frame_inbound(mode, meta, text))
 
         # Texting again while Claude is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops

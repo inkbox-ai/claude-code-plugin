@@ -329,11 +329,12 @@ class InkboxGateway:
         chat_id = self._chat_key(data, sender)
         meta = {
             "to": sender,
+            "sender": sender,
             "subject": subject,
             "thread_id": message.get("thread_id"),
         }
-        turn = f"[email from {sender}]\nSubject: {subject}\n\n{body_text}"
-        await self.sessions.get(chat_id).handle_inbound(turn, "email", meta)
+        # The channel tag (Subject included) is added by frame_inbound.
+        await self.sessions.get(chat_id).handle_inbound(body_text, "email", meta)
         return web.json_response({"ok": True})
 
     def _fetch_mail_body(self, message: Dict[str, Any]) -> str:
@@ -369,6 +370,7 @@ class InkboxGateway:
         meta = {
             "conversation_id": message.get("conversation_id"),
             "to": sender,
+            "sender": sender,
         }
         await self.sessions.get(chat_id).handle_inbound(text, "sms", meta)
         return web.json_response({"ok": True})
@@ -386,7 +388,7 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
         chat_id = self._chat_key(data, sender)
-        meta = {"conversation_id": message.get("conversation_id")}
+        meta = {"conversation_id": message.get("conversation_id"), "sender": sender}
         await self.sessions.get(chat_id).handle_inbound(text, "imessage", meta)
         return web.json_response({"ok": True})
 
@@ -435,7 +437,7 @@ class InkboxGateway:
                     text = str(payload.get("text") or "").strip()
                     if not text:
                         continue
-                    meta = {"call_id": call_id}
+                    meta = {"call_id": call_id, "sender": remote}
                     session = self.sessions.get(chat_id)
                     await session.handle_inbound(text, "voice", meta)
                 elif event == "stop":

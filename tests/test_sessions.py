@@ -118,8 +118,8 @@ def test_double_text_interrupts_running_turn():
 
         assert fake.interrupts == 1
         assert session._interrupting is True
-        # The new message is queued for the worker to pick up after the abort.
-        assert session._queue.get_nowait() == "do this instead"
+        # The new (channel-tagged) message is queued for the worker to pick up.
+        assert session._queue.get_nowait().endswith("do this instead")
 
         session._worker.cancel()
 
