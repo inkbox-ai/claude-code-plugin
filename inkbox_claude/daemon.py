@@ -59,14 +59,22 @@ def _read_pid() -> int | None:
 def _maybe_load_env_file() -> None:
     """Fill missing config from a ``.env`` file so the daemon just works.
 
-    Reads ``$INKBOX_CLAUDE_ENV_FILE`` or ``./.env`` and sets any vars not
-    already present in the environment (real env always wins).
+    Loads the first that exists — ``$INKBOX_CLAUDE_ENV_FILE``, then ``./.env``,
+    then ``~/.inkbox-claude/.env`` (where the installer writes it for a global
+    install) — and sets any vars not already in the environment (real env wins).
 
     Returns:
         None
     """
-    path = Path(os.getenv("INKBOX_CLAUDE_ENV_FILE") or Path.cwd() / ".env")
-    if not path.exists():
+    candidates = []
+    explicit = os.getenv("INKBOX_CLAUDE_ENV_FILE")
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(_state_dir() / ".env")
+
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
         return
     for line in path.read_text().splitlines():
         stripped = line.strip()

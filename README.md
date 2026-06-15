@@ -34,14 +34,31 @@ you (phone)  ── SMS / iMessage / email / call ──▶  Inkbox  ──▶  
 
 ## Quick start
 
+One command does the whole pipeline — finds a Python 3.10+, sets up an isolated venv, installs the bridge, puts `inkbox-claude` on your PATH, and runs the setup wizard:
+
 ```bash
-pip install -e .
+curl -fsSL https://raw.githubusercontent.com/inkbox-ai/claude-code-plugin/main/install.sh | bash
+```
+
+(The repo is private, so the one-liner needs GitHub auth — `gh auth login` or an SSH key. From a local checkout just run `./install.sh`. Add `--start` to launch the background daemon when it finishes, `--no-setup` to skip the wizard.)
+
+The installer writes config to `~/.inkbox-claude/.env`, so the daemon finds it from anywhere. When it's done:
+
+```bash
+inkbox-claude doctor   # check config, SDKs, claude CLI, identity reachability
+inkbox-claude start    # run the gateway in the background
+```
+
+### Manual install
+
+```bash
+pip install -e .       # into a Python 3.10+ environment
 
 inkbox-claude setup    # interactive wizard — writes .env for you
 set -a; source .env; set +a
 
-inkbox-claude doctor   # check config, SDKs, claude CLI, identity reachability
-inkbox-claude run      # start the gateway
+inkbox-claude doctor
+inkbox-claude run
 ```
 
 `inkbox-claude setup` walks you through everything and writes `.env`: create a

@@ -47,6 +47,24 @@ def test_maybe_load_env_file_fills_missing(tmp_path, monkeypatch):
     assert os.environ["INKBOX_IDENTITY"] == "already-set"  # real env wins
 
 
+def test_maybe_load_env_file_falls_back_to_state_dir(tmp_path, monkeypatch):
+    # No INKBOX_CLAUDE_ENV_FILE and no ./.env — the global install location
+    # (~/.inkbox-claude/.env, via INKBOX_CLAUDE_HOME) is the fallback.
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("INKBOX_API_KEY=ApiKey_global\n")
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(home))
+    monkeypatch.delenv("INKBOX_API_KEY", raising=False)
+
+    daemon._maybe_load_env_file()
+
+    assert os.environ["INKBOX_API_KEY"] == "ApiKey_global"
+
+
 def test_cli_routes_daemon_commands(monkeypatch):
     calls = []
     monkeypatch.setattr(cli.daemon, "start", lambda: calls.append("start") or 0)
