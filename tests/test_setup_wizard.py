@@ -8,6 +8,19 @@ from inkbox_claude import setup_wizard
 # ----------------------------------------------------------------------
 
 
+def test_show_qr_renders_block_chars():
+    # segno is a declared dependency, so a QR should render to the terminal.
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = setup_wizard._show_qr("sms:+15550009999&body=connect @agent")
+    out = buf.getvalue()
+    assert ok is True
+    assert "█" in out or "▀" in out  # QR modules rendered as block glyphs
+
+
 def test_save_and_env_roundtrip(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))

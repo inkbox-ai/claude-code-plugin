@@ -7,6 +7,7 @@ dependencies = [
   "aiohttp>=3.9",
   "inkbox>=0.4.7",
   "claude-agent-sdk>=0.1.0",
+  "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]
 
 [project.scripts]

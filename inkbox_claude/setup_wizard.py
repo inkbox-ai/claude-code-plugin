@@ -78,6 +78,26 @@ def print_header(title: str) -> None:
     print(color(f"* {title}", Colors.CYAN, Colors.BOLD))
 
 
+def _show_qr(data: str) -> bool:
+    """Render ``data`` as a terminal QR code, if segno is available.
+
+    Args:
+        data (str): The string to encode (a URL, sms: deep link, etc.).
+
+    Returns:
+        bool: True if a QR was printed, False if segno isn't installed.
+    """
+    try:
+        import segno
+    except ImportError:
+        return False  # QR is a bonus; the text instructions still stand
+    try:
+        segno.make(data).terminal(compact=True)
+        return True
+    except Exception:
+        return False
+
+
 # ----------------------------------------------------------------------
 # .env persistence (the gateway reads config straight from the env)
 # ----------------------------------------------------------------------
@@ -648,6 +668,17 @@ def _wait_for_imessage_first_message(client: Any, identity: Any, handle: str) ->
     print_info("    2. Inkbox texts you back from the number now assigned to this agent.")
     print_info("    3. Send any first message (e.g. \"hi\") in that NEW thread.")
     print_info("  The agent can only message you after you message it first.")
+
+    # Scan-to-connect: a QR of the sms: deep link opens Messages on the iPhone
+    # with the number and connect command already filled in (step 1 in one tap).
+    from urllib.parse import quote
+
+    sms_link = f"sms:{triage.number}&body={quote(connect_command)}"
+    print()
+    print_info("  Or just scan this with your iPhone camera to do step 1 in one tap:")
+    print()
+    if not _show_qr(sms_link):
+        print_info(f"    (install 'segno' to show a scannable QR here: {sms_link})")
 
     print()
     print(color("  --- Waiting for your first iMessage ---", Colors.YELLOW))
