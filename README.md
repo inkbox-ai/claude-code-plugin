@@ -36,12 +36,21 @@ you (phone)  ── SMS / iMessage / email / call ──▶  Inkbox  ──▶  
 
 ```bash
 pip install -e .
-cp .env.example .env   # fill in INKBOX_API_KEY, INKBOX_IDENTITY, INKBOX_SIGNING_KEY, CLAUDE_PROJECT_DIR
+
+inkbox-claude setup    # interactive wizard — writes .env for you
 set -a; source .env; set +a
 
 inkbox-claude doctor   # check config, SDKs, claude CLI, identity reachability
 inkbox-claude run      # start the gateway
 ```
+
+`inkbox-claude setup` walks you through everything and writes `.env`: create a
+fresh Inkbox agent via self-signup (or bring an existing API key), pick or
+create the identity, provision a phone number, wait for your `START` opt-in,
+connect iMessage, mint a webhook signing key, and choose the project directory
+Claude Code works in. Rerun it anytime to reconfigure. Prefer to wire `.env` by
+hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`,
+`INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
 
 Keep `inkbox-claude run` going. On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Claude Code sessions.
 

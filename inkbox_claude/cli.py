@@ -11,10 +11,12 @@ try:
     from .config import read_config
     from .doctor import print_doctor
     from .gateway import InkboxGateway
+    from .setup_wizard import interactive_setup
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import read_config
     from doctor import print_doctor
     from gateway import InkboxGateway
+    from setup_wizard import interactive_setup
 
 
 def _cmd_run() -> int:
@@ -62,11 +64,15 @@ def main(argv: list[str] | None = None) -> int:
         description="Talk to Claude Code over email, SMS, iMessage, and voice via Inkbox.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("setup", help="run the interactive setup wizard")
     sub.add_parser("run", help="start the bridge gateway")
     sub.add_parser("doctor", help="check configuration and dependencies")
     sub.add_parser("whoami", help="show the bridged Inkbox identity")
 
     args = parser.parse_args(argv)
+    if args.command == "setup":
+        interactive_setup()
+        return 0
     if args.command == "run":
         return _cmd_run()
     if args.command == "doctor":
