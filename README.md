@@ -52,7 +52,26 @@ Claude Code works in. Rerun it anytime to reconfigure. Prefer to wire `.env` by
 hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`,
 `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
 
-Keep `inkbox-claude run` going. On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Claude Code sessions.
+On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Claude Code sessions.
+
+### Running it
+
+```bash
+inkbox-claude run        # foreground (Ctrl+C to stop) — good for first runs and debugging
+```
+
+Or run it as a background daemon (PID + log under `~/.inkbox-claude/`):
+
+```bash
+inkbox-claude start      # detach and run in the background
+inkbox-claude status     # is it running? where are the logs?
+inkbox-claude restart    # restart it
+inkbox-claude stop       # graceful stop (SIGTERM, then SIGKILL after 5s)
+
+tail -f ~/.inkbox-claude/gateway.log
+```
+
+`start` auto-loads `.env` from the current directory, so you don't have to `source` it first. `run` is the foreground version a service manager (systemd, Docker) should supervise; `start`/`stop` are the self-contained background option.
 
 Then, from your phone:
 

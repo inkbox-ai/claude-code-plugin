@@ -1,35 +1,20 @@
-"""Command-line entry points: run, doctor, whoami."""
+"""Command-line entry points: setup, run, start/stop/status/restart, doctor, whoami."""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
-import logging
 import sys
 
 try:
+    from . import daemon
     from .config import read_config
     from .doctor import print_doctor
-    from .gateway import InkboxGateway
     from .setup_wizard import interactive_setup
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    import daemon
     from config import read_config
     from doctor import print_doctor
-    from gateway import InkboxGateway
     from setup_wizard import interactive_setup
-
-
-def _cmd_run() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    gateway = InkboxGateway(read_config())
-    try:
-        asyncio.run(gateway.run())
-    except KeyboardInterrupt:
-        print("bye")
-    return 0
 
 
 def _cmd_whoami() -> int:
@@ -65,7 +50,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup", help="run the interactive setup wizard")
-    sub.add_parser("run", help="start the bridge gateway")
+    sub.add_parser("run", help="run the bridge gateway in the foreground")
+    sub.add_parser("start", help="start the bridge gateway in the background")
+    sub.add_parser("stop", help="stop the background bridge gateway")
+    sub.add_parser("restart", help="restart the background bridge gateway")
+    sub.add_parser("status", help="show whether the background gateway is running")
     sub.add_parser("doctor", help="check configuration and dependencies")
     sub.add_parser("whoami", help="show the bridged Inkbox identity")
 
@@ -74,7 +63,15 @@ def main(argv: list[str] | None = None) -> int:
         interactive_setup()
         return 0
     if args.command == "run":
-        return _cmd_run()
+        return daemon.run_foreground()
+    if args.command == "start":
+        return daemon.start()
+    if args.command == "stop":
+        return daemon.stop()
+    if args.command == "restart":
+        return daemon.restart()
+    if args.command == "status":
+        return daemon.status()
     if args.command == "doctor":
         return print_doctor()
     if args.command == "whoami":
