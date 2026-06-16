@@ -295,8 +295,17 @@ def _install_systemd_user(exe: str, env_file: str) -> bool:
 
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+    # Link the unit so it comes up on boot. `enable` alone doesn't start it,
+    # and `enable --now` is a no-op on an already-running service — which would
+    # leave a stale gateway holding the OLD .env (e.g. a rotated signing key)
+    # after a reconfigure. So enable, then always `restart` to force the live
+    # process to reload the rewritten unit and fresh env.
+    subprocess.run(
+        ["systemctl", "--user", "enable", f"{SERVICE_NAME}.service"],
+        capture_output=True, text=True,
+    )
     enabled = subprocess.run(
-        ["systemctl", "--user", "enable", "--now", f"{SERVICE_NAME}.service"],
+        ["systemctl", "--user", "restart", f"{SERVICE_NAME}.service"],
         capture_output=True, text=True,
     )
     if enabled.returncode == 0:
@@ -315,7 +324,8 @@ def _install_systemd_user(exe: str, env_file: str) -> bool:
     print("  The unit is written — enable it once a user session exists:")
     print(f"    loginctl enable-linger {user or '$USER'}")
     print("    systemctl --user daemon-reload")
-    print(f"    systemctl --user enable --now {SERVICE_NAME}.service")
+    print(f"    systemctl --user enable {SERVICE_NAME}.service")
+    print(f"    systemctl --user restart {SERVICE_NAME}.service")
     return False
 
 

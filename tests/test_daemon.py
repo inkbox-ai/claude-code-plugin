@@ -95,9 +95,11 @@ def test_install_autostart_writes_and_enables_systemd_unit(tmp_path, monkeypatch
     text = unit.read_text()
     assert "ExecStart=" in text and " run" in text
     assert "INKBOX_CLAUDE_ENV_FILE=/home/me/.inkbox-claude/.env" in text
-    # daemon-reload + enable --now were invoked.
+    # daemon-reload + enable + restart were invoked. The restart is what
+    # forces an already-running gateway to reload a rewritten unit / fresh env.
     assert ["systemctl", "--user", "daemon-reload"] in calls
     assert any("enable" in c for c in calls)
+    assert ["systemctl", "--user", "restart", "inkbox-claude.service"] in calls
 
 
 def test_install_autostart_reports_failure_when_enable_fails(tmp_path, monkeypatch):
