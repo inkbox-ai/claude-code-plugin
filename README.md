@@ -124,6 +124,8 @@ Sessions are keyed by Inkbox contact, so one person = one conversation across ch
 
 **Typing indicator.** While Claude works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
 
+**Delivery failures.** Outbound messages can silently fail — a carrier filters an SMS, an iMessage is declined, an email bounces. Inkbox reports these asynchronously (`text.delivery_failed`/`text.delivery_unconfirmed`, `imessage.delivery_failed`, `message.bounced`/`message.failed`). The bridge catches them and wakes the affected contact's session to tell Claude *which* message didn't land and *why*, so it can retry or reach you another way (a different channel, or a call) using its Inkbox tools. The notice runs as a side-effect turn — Claude acts via tools rather than replying on the channel that just failed — and repeat webhooks for the same message are de-duplicated so it can't loop.
+
 **Interrupt by texting again.** Messaging the agent again while it's mid-turn works like pressing Esc in Claude Code and typing a new message: the running turn is interrupted, its partial answer is dropped, and Claude picks up your new message instead. (A reply while it's waiting on a permission/poll still answers that escalation — interrupting only applies while it's actively working.)
 
 **Control commands.** A handful of slash-commands steer the conversation itself and are handled by the bridge instead of being sent to Claude (works on any channel):

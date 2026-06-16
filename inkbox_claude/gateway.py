@@ -104,6 +104,33 @@ def _post_call_prompt(actions: List[Dict[str, str]], transcript: Any) -> str:
     return "\n".join(parts)
 
 
+def _delivery_failure_prompt(channel: str, recipient: str, body: str, reason: str) -> str:
+    """Build the Claude Code prompt for a failed outbound message.
+
+    Args:
+        channel (str): Channel that failed (SMS / iMessage / email).
+        recipient (str): Intended recipient.
+        body (str): The undelivered message text, if known.
+        reason (str): Carrier/provider failure reason.
+
+    Returns:
+        str: A prompt instructing the agent to retry or switch channels.
+    """
+    quoted = f'\n\nThe message was:\n"{body}"' if body else ""
+    return "\n".join([
+        f"[delivery failed] Your {channel} message to {recipient} was NOT delivered.",
+        f"Reason: {reason or 'unknown'}.{quoted}",
+        "",
+        "This matters — the person did not get what you sent. Decide how to recover:",
+        f"- If it looks transient, retry once on {channel} using your Inkbox tools.",
+        f"- If {channel} seems broken for them (or already failed on retry), reach "
+        "them another way — try a different channel you have for them (SMS, iMessage, "
+        "email), and only as a last resort place a call.",
+        "Act now via your Inkbox messaging tools. Do not just acknowledge this; the "
+        "original channel may be down, so a plain reply here may not reach them.",
+    ])
+
+
 def _call_ended_prompt(transcript: Any) -> str:
     """Build the Claude Code prompt for a no-actions post-call reflection."""
     convo = _format_transcript(transcript)
@@ -164,6 +191,10 @@ class InkboxGateway:
         self._recent_request_ids: Dict[str, float] = {}
         self._active_call_ws: Dict[str, Any] = {}
         self._call_meta_by_id: Dict[str, Dict[str, Any]] = {}
+        # Failed outbound message ids we've already told the agent about, so a
+        # webhook retry (or a second failure event for the same message) doesn't
+        # re-notify and spin the agent in a loop.
+        self._notified_failures: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -372,8 +403,16 @@ class InkboxGateway:
             return await self._on_text_received(envelope)
         if event_type == "imessage.received":
             return await self._on_imessage_received(envelope)
-        # Delivery lifecycle (text.sent/delivered/..., imessage.sent/...)
-        # is logged without waking the agent, matching the hermes plugin.
+        # Outbound delivery failures: tell the agent its message didn't land so
+        # it can retry or reach the human another way.
+        if event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
+            return await self._on_text_delivery_failed(envelope, event_type)
+        if event_type == "imessage.delivery_failed":
+            return await self._on_imessage_delivery_failed(envelope)
+        if event_type in ("message.bounced", "message.failed"):
+            return await self._on_mail_delivery_failed(envelope, event_type)
+        # Other delivery lifecycle (text.sent/delivered, imessage.sent/...) is
+        # logged without waking the agent, matching the hermes plugin.
         logger.debug("[bridge] lifecycle event %s", event_type)
         return web.json_response({"ok": True, "ignored": event_type})
 
@@ -462,6 +501,106 @@ class InkboxGateway:
         meta = {"conversation_id": message.get("conversation_id"), "sender": sender}
         await self.sessions.get(chat_id).handle_inbound(text, "imessage", meta)
         return web.json_response({"ok": True})
+
+    # ------------------------------------------------------------------
+    # Outbound delivery failures
+    # ------------------------------------------------------------------
+
+    def _already_notified(self, message_id: str) -> bool:
+        """True if we've recently told the agent about this failed message id."""
+        now = time.time()
+        for key, seen_at in list(self._notified_failures.items()):
+            if now - seen_at > WEBHOOK_DEDUP_TTL_SECONDS:
+                self._notified_failures.pop(key, None)
+        if message_id and message_id in self._notified_failures:
+            return True
+        if message_id:
+            self._notified_failures[message_id] = now
+        return False
+
+    async def _notify_delivery_failure(
+        self, chat_id: str, channel: str, recipient: str, body: str, reason: str
+    ) -> "web.Response":
+        """Wake the agent's session to handle a failed outbound message.
+
+        Runs as a side-effect turn (run_consult): the agent decides whether to
+        retry or switch channels and acts via its Inkbox tools. We deliberately
+        do NOT auto-reply on the original channel — it may be the dead one, and
+        replying there would just fail again and loop.
+
+        Args:
+            chat_id (str): Session key for the affected contact.
+            channel (str): Channel that failed (SMS / iMessage / email).
+            recipient (str): Who the message was meant for.
+            body (str): The undelivered message text (may be empty).
+            reason (str): Carrier/provider failure reason.
+
+        Returns:
+            web.Response: 200 ack for the webhook.
+        """
+        if self.sessions is None:
+            return web.json_response({"ok": True, "ignored": "no-sessions"})
+        prompt = _delivery_failure_prompt(channel, recipient, body, reason)
+        # Run in the background so the webhook returns promptly; the turn can
+        # take a while (the agent may send on another channel).
+        asyncio.create_task(self._run_failure_turn(chat_id, prompt, channel, recipient))
+        return web.json_response({"ok": True})
+
+    async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str) -> None:
+        try:
+            await self.sessions.get(chat_id).run_consult(prompt)
+        except Exception:
+            logger.exception("[bridge] delivery-failure turn failed: %s → %s", channel, recipient)
+
+    async def _on_text_delivery_failed(self, envelope: Dict[str, Any], event_type: str) -> "web.Response":
+        data = envelope.get("data") or {}
+        message = data.get("text_message") or {}
+        message_id = str(message.get("id") or "")
+        if self._already_notified(message_id):
+            return web.json_response({"ok": True, "deduped": True})
+        recipient = str(message.get("remote_phone_number") or "").strip()
+        body = str(message.get("text") or "").strip()
+        # Prefer the human detail; fall back to the carrier code, then event.
+        reason = str(message.get("error_detail") or message.get("error_code") or "").strip()
+        if event_type == "text.delivery_unconfirmed" and not reason:
+            reason = "carrier could not confirm delivery"
+        chat_id = self._chat_key(data, recipient)
+        logger.info("[bridge] SMS delivery failed to %s: %s", recipient, reason or event_type)
+        return await self._notify_delivery_failure(chat_id, "SMS", recipient, body, reason or event_type)
+
+    async def _on_imessage_delivery_failed(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data") or {}
+        message = data.get("message") or {}
+        message_id = str(message.get("id") or "")
+        if self._already_notified(message_id):
+            return web.json_response({"ok": True, "deduped": True})
+        recipient = str(message.get("remote_number") or "").strip()
+        body = str(message.get("content") or "").strip()
+        reason = str(
+            message.get("error_detail")
+            or message.get("error_reason")
+            or message.get("error_message")
+            or message.get("status")
+            or ""
+        ).strip()
+        chat_id = self._chat_key(data, recipient)
+        logger.info("[bridge] iMessage delivery failed to %s: %s", recipient, reason)
+        return await self._notify_delivery_failure(chat_id, "iMessage", recipient, body, reason)
+
+    async def _on_mail_delivery_failed(self, envelope: Dict[str, Any], event_type: str) -> "web.Response":
+        data = envelope.get("data") or {}
+        message = data.get("message") or {}
+        message_id = str(message.get("id") or "")
+        if self._already_notified(message_id):
+            return web.json_response({"ok": True, "deduped": True})
+        to_addresses = message.get("to_addresses") or []
+        recipient = str(to_addresses[0] if to_addresses else "").strip()
+        subject = str(message.get("subject") or "").strip()
+        reason = "bounced" if event_type == "message.bounced" else "permanent send failure"
+        chat_id = self._chat_key(data, recipient)
+        logger.info("[bridge] email %s to %s (subject: %s)", reason, recipient, subject)
+        body = f"(email, subject: {subject})" if subject else ""
+        return await self._notify_delivery_failure(chat_id, "email", recipient, body, reason)
 
     # ------------------------------------------------------------------
     # Inbound: live calls (Inkbox STT/TTS text-frame bridge)
