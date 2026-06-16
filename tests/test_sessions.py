@@ -6,6 +6,7 @@ from pathlib import Path
 from inkbox_claude.config import BridgeConfig
 from inkbox_claude.sessions import (
     ContactSession,
+    _Turn,
     _parse_index,
     list_recent_sessions,
 )
@@ -30,6 +31,54 @@ def make_session(sent, typing=None):
         identity_info={"handle": "t", "email": "", "phone": ""},
         typing_fn=typing_fn,
     )
+
+
+def test_abort_settles_queued_capture_future():
+    # A consult/post-call/failure turn waiting in the queue must not hang when
+    # the session is aborted (/stop, /clear) — its future settles to "".
+    async def scenario():
+        session = make_session([])
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await session._queue.put(_Turn(text="do work", future=fut))
+
+        await session._abort_in_flight()
+
+        assert fut.done()
+        assert fut.result() == ""
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_new_message_does_not_interrupt_a_running_capture_turn():
+    # A capture turn (voice consult, post-call, failure recovery) runs to
+    # completion; a new inbound queues behind it instead of interrupting.
+    async def scenario():
+        session = make_session([])
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        # A capture turn is mid-flight (future set) — must NOT be interrupted.
+        session._current_turn = _Turn(text="consult", future=asyncio.get_running_loop().create_future())
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("hello while busy", "sms", {})
+
+        assert fake.interrupts == 0
+        assert session._interrupting is False
+        assert session._queue.get_nowait().text.endswith("hello while busy")
+        session._worker.cancel()
+
+    asyncio.run(scenario())
 
 
 def test_pending_escalation_consumes_next_inbound():
@@ -203,7 +252,7 @@ def test_non_command_is_forwarded_as_a_turn():
         # A message that merely mentions a slash word is a normal turn.
         await session.handle_inbound("please /clear the cache", "sms", {})
         assert not session._queue.empty()
-        assert session._queue.get_nowait().endswith("please /clear the cache")
+        assert session._queue.get_nowait().text.endswith("please /clear the cache")
         session._worker.cancel()
 
     asyncio.run(scenario())
@@ -406,6 +455,9 @@ def test_double_text_interrupts_running_turn():
         fake = FakeClient()
         session._client = fake
         session._turn_active = True
+        # A normal turn is mid-flight (future is None) — that's what makes a new
+        # message interrupt it. A capture turn would instead be left to finish.
+        session._current_turn = _Turn(text="previous message")
         # Pretend a turn worker is already draining so handle_inbound doesn't
         # spawn a real one (which would touch the fake client).
         session._worker = asyncio.create_task(asyncio.sleep(10))
@@ -415,7 +467,7 @@ def test_double_text_interrupts_running_turn():
         assert fake.interrupts == 1
         assert session._interrupting is True
         # The new (channel-tagged) message is queued for the worker to pick up.
-        assert session._queue.get_nowait().endswith("do this instead")
+        assert session._queue.get_nowait().text.endswith("do this instead")
 
         session._worker.cancel()
 

@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -69,6 +70,22 @@ HealthFn = Callable[[], Awaitable[str]]
 # iMessage typing bubbles expire after a few seconds, so we refresh the
 # indicator on this cadence for as long as a turn is running.
 TYPING_REFRESH_SECONDS = 4.0
+
+
+@dataclass
+class _Turn:
+    """One unit of work for a session's single Claude client.
+
+    Everything that drives a turn — inbound messages and capture turns alike —
+    goes through one queue and one worker, so two turns can never hit the
+    subprocess at once. A normal turn (``future is None``) sends its reply on
+    the channel the human last used. A capture turn (``future`` set) hands the
+    reply text back to the awaiting caller instead and never auto-replies —
+    used by voice consults, post-call actions, and delivery-failure notices.
+    """
+
+    text: str
+    future: Optional["asyncio.Future[str]"] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Claude as a turn.
@@ -269,12 +286,12 @@ class ContactSession:
         self.always_allowed: set[str] = set()
 
         self._client: Optional[ClaudeSDKClient] = None
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
         self._worker: Optional[asyncio.Task] = None
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Claude turn is mid-flight
         self._interrupting = False    # a new message asked us to abort it
-        self._consult_lock = asyncio.Lock()  # serializes realtime consults
+        self._current_turn: Optional[_Turn] = None  # the turn the worker is running
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -326,12 +343,16 @@ class ContactSession:
 
         # Tag the message with its channel + sender so Claude knows where it
         # is and who it's talking to (the static system prompt can't).
-        await self._queue.put(frame_inbound(mode, meta, text))
+        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text)))
 
         # Texting again while Claude is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
-        # to this fresh message instead of making the human wait it out.
-        if self._turn_active and self._client is not None:
+        # to this fresh message instead of making the human wait it out. Only
+        # interrupt a normal turn — a capture turn (voice consult, post-call,
+        # delivery-failure recovery) runs to completion and this message just
+        # queues behind it.
+        running_normal = self._current_turn is not None and self._current_turn.future is None
+        if self._turn_active and self._client is not None and running_normal:
             logger.info("[session %s] new message interrupts the running turn", self.chat_id)
             self._interrupting = True
             try:
@@ -344,9 +365,9 @@ class ContactSession:
 
     async def _drain(self) -> None:
         while not self._queue.empty():
-            text = await self._queue.get()
+            turn = await self._queue.get()
             try:
-                await self._run_turn(text)
+                await self._run_turn(turn)
             except Exception:
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
@@ -415,12 +436,16 @@ class ContactSession:
                 await self._client.interrupt()
             except Exception:
                 logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
-        # Discard messages queued but not yet started.
+        # Discard messages queued but not yet started. Settle any capture-turn
+        # futures (consult / post-call / failure recovery) so their awaiters
+        # don't hang waiting on work we just dropped.
         while not self._queue.empty():
             try:
-                self._queue.get_nowait()
+                turn = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if turn.future is not None and not turn.future.done():
+                turn.future.set_result("")
 
     async def _begin_resume(self) -> None:
         """List recent sessions and let the human pick one to reopen.
@@ -513,16 +538,17 @@ class ContactSession:
     # Claude Code turn
     # ------------------------------------------------------------------
 
-    async def _run_turn(self, text: str) -> None:
+    async def _run_turn(self, turn: _Turn) -> None:
         self._interrupting = False  # fresh turn starts un-interrupted
-        client = await self._ensure_client()
-
-        # Keep a typing indicator alive on the human's channel for the whole
-        # turn, then always tear it down — even if the turn raises.
-        self._turn_active = True
-        typing_task = asyncio.create_task(self._typing_loop())
+        self._current_turn = turn
+        typing_task: Optional[asyncio.Task] = None
         try:
-            await client.query(text)
+            client = await self._ensure_client()
+            # Keep a typing indicator alive on the human's channel for the whole
+            # turn, then always tear it down — even if the turn raises.
+            self._turn_active = True
+            typing_task = asyncio.create_task(self._typing_loop())
+            await client.query(turn.text)
 
             chunks: list[str] = []
             final: Optional[str] = None
@@ -536,59 +562,61 @@ class ContactSession:
                     if message.session_id and self.on_session_id:
                         self.resume_session_id = message.session_id
                         self.on_session_id(self.chat_id, message.session_id)
+            reply = (final or "\n\n".join(chunks)).strip()
+        except Exception as exc:
+            # A capture turn must always settle its waiter — surface the error
+            # there. A normal turn re-raises so _drain shows the human a notice.
+            if turn.future is not None and not turn.future.done():
+                turn.future.set_exception(exc)
+                return
+            raise
         finally:
             self._turn_active = False
-            typing_task.cancel()
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
+            self._current_turn = None
+            if typing_task is not None:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
 
-        # If a new message interrupted this turn, drop the partial answer —
-        # the next queued message is what the human actually wants now.
+        # Route the result. Capture turns hand the text back to their waiter and
+        # never auto-reply (the caller speaks/queues/swallows it). Normal turns
+        # reply on the channel the human last used — unless a new message
+        # interrupted this one, in which case the partial answer is dropped.
+        if turn.future is not None:
+            if not turn.future.done():
+                turn.future.set_result(reply or "I finished that, but didn't have anything to say back.")
+            return
         if self._interrupting:
             return
-        reply = (final or "\n\n".join(chunks)).strip()
         if reply:
             await self._reply(reply)
 
     async def run_consult(self, query: str) -> str:
         """Run one Claude Code turn and RETURN its text (don't send it).
 
-        Used by the Realtime voice bridge: the OpenAI model asks Claude Code to
-        do real work via the consult tool, then speaks the returned text itself.
-        Runs on the same resumed session as this contact's texts, so a call
-        shares context with their SMS/iMessage/email. Replies are captured here
-        rather than routed through ``send_fn`` so they never double up as Inkbox
-        TTS while the Realtime model is speaking.
+        Used by the Realtime voice bridge, post-call actions, and delivery-
+        failure recovery: the caller wants Claude to act, then to receive the
+        reply text rather than have it auto-sent. Runs on the same resumed
+        session as this contact's texts, so it shares context across channels.
+
+        Goes through the session's single queue/worker like a normal turn, so it
+        can never run concurrently with one — it just carries a future the worker
+        resolves instead of replying on a channel.
 
         Args:
-            query (str): Plain-English request from the Realtime model.
+            query (str): Plain-English request for Claude.
 
         Returns:
             str: Claude's reply text, or a short fallback if it produced none.
         """
-        # One consult at a time per contact — the shared ClaudeSDKClient can't
-        # run two turns at once.
-        async with self._consult_lock:
-            client = await self._ensure_client()
-            await client.query(query)
-            chunks: list[str] = []
-            final: Optional[str] = None
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            chunks.append(block.text)
-                elif isinstance(message, ResultMessage):
-                    final = message.result
-                    # Keep the resumed-session id current so a later text picks
-                    # up the same conversation the call advanced.
-                    if message.session_id and self.on_session_id:
-                        self.resume_session_id = message.session_id
-                        self.on_session_id(self.chat_id, message.session_id)
-            reply = (final or "\n\n".join(chunks)).strip()
-            return reply or "I finished that, but didn't have anything to say back."
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        await self._queue.put(_Turn(text=query, future=future))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
 
     async def _typing_loop(self) -> None:
         """Refresh the channel's typing indicator until the turn ends.
