@@ -11,7 +11,14 @@ import asyncio
 import dataclasses
 import json
 import logging
+import mimetypes
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+try:
+    from .media import file_to_email_attachment
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from media import file_to_email_attachment
 
 try:
     from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -89,17 +96,21 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
     @tool(
         "inkbox_send_email",
-        "Send an email from this agent's Inkbox mailbox.",
-        {"to": str, "subject": str, "body": str},
+        "Send an email from this agent's Inkbox mailbox. To attach files, pass "
+        "attachment_paths as a list of local file paths (max ~25 MB total).",
+        {"to": str, "subject": str, "body": str, "attachment_paths": list},
     )
     async def inkbox_send_email(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
+            paths = args.get("attachment_paths") or []
+            attachments = [file_to_email_attachment(str(p)) for p in paths] or None
             msg = _identity().send_email(
                 to=[str(args["to"])],
                 subject=str(args.get("subject") or ""),
                 body_text=str(args.get("body") or ""),
+                attachments=attachments,
             )
-            return {"sent": True, "id": str(getattr(msg, "id", ""))}
+            return {"sent": True, "id": str(getattr(msg, "id", "")), "attachments": len(paths)}
 
         try:
             return _result(await asyncio.to_thread(_run))
@@ -108,9 +119,11 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
     @tool(
         "inkbox_send_sms",
-        "Send an SMS from this agent's Inkbox phone number. Use conversation_id "
-        "to reply in an existing thread, or to (E.164) for a new one.",
-        {"to": str, "text": str},
+        "Send an SMS/MMS from this agent's Inkbox phone number. Use conversation_id "
+        "to reply in an existing thread, or to (E.164) for a new one. For MMS, pass "
+        "media_urls as a list of PUBLIC image/file URLs (SMS media must be a hosted "
+        "URL — to send a local file, call inkbox_upload_media first to get a URL).",
+        {"to": str, "text": str, "media_urls": list},
     )
     async def inkbox_send_sms(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
@@ -120,6 +133,9 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                 kwargs["to"] = target
             else:
                 kwargs["conversation_id"] = target
+            media_urls = [str(u) for u in (args.get("media_urls") or [])]
+            if media_urls:
+                kwargs["media_urls"] = media_urls
             msg = _identity().send_text(**kwargs)
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
 
@@ -132,16 +148,56 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "inkbox_send_imessage",
         "Send an iMessage. Pass an existing conversation_id — get it from "
         "inkbox_list_imessage_conversations (iMessage is recipient-first: a "
-        "conversation exists only after the person has messaged this agent).",
-        {"conversation_id": str, "text": str},
+        "conversation exists only after the person has messaged this agent). To "
+        "attach an image/file, pass media_path as a local file path (uploaded "
+        "automatically, max 10 MB).",
+        {"conversation_id": str, "text": str, "media_path": str},
     )
     async def inkbox_send_imessage(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
-            msg = _identity().send_imessage(
-                conversation_id=str(args["conversation_id"]),
-                text=str(args.get("text") or ""),
-            )
+            identity = _identity()
+            kwargs: Dict[str, Any] = {
+                "conversation_id": str(args["conversation_id"]),
+                "text": str(args.get("text") or ""),
+            }
+            media_path = str(args.get("media_path") or "").strip()
+            if media_path:
+                # iMessage media is upload-then-send: push the bytes, send the URL.
+                path = Path(media_path).expanduser()
+                upload = identity.upload_imessage_media(
+                    content=path.read_bytes(),
+                    filename=path.name,
+                    content_type=mimetypes.guess_type(path.name)[0],
+                )
+                kwargs["media_urls"] = [upload.media_url]
+            msg = identity.send_imessage(**kwargs)
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_upload_media",
+        "Upload a local file and get back a hosted media_url. Use it as a "
+        "media_urls entry for inkbox_send_sms (MMS) when you need to send a local "
+        "file over SMS. Max 10 MB.",
+        {"file_path": str},
+    )
+    async def inkbox_upload_media(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            path = Path(str(args["file_path"])).expanduser()
+            upload = _identity().upload_imessage_media(
+                content=path.read_bytes(),
+                filename=path.name,
+                content_type=mimetypes.guess_type(path.name)[0],
+            )
+            return {
+                "media_url": upload.media_url,
+                "content_type": getattr(upload, "content_type", None),
+                "size": getattr(upload, "size", None),
+            }
 
         try:
             return _result(await asyncio.to_thread(_run))
@@ -219,6 +275,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_get_text_conversation,
         inkbox_list_imessage_conversations,
         inkbox_get_imessage_conversation,
+        inkbox_upload_media,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
     tool_names = [
@@ -230,5 +287,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_get_text_conversation",
         "mcp__inkbox__inkbox_list_imessage_conversations",
         "mcp__inkbox__inkbox_get_imessage_conversation",
+        "mcp__inkbox__inkbox_upload_media",
     ]
     return server, tool_names
