@@ -181,6 +181,21 @@ def test_stop_command_when_idle():
     asyncio.run(scenario())
 
 
+def test_cancel_is_an_alias_for_stop():
+    from inkbox_claude.sessions import _control_command
+
+    assert _control_command("/cancel") == "stop"
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        await session.handle_inbound("/cancel", "sms", {"conversation_id": "c1"})
+        assert sent[-1][1] == "Nothing to stop — I'm idle."  # same behavior as /stop
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
 def test_non_command_is_forwarded_as_a_turn():
     async def scenario():
         sent = []

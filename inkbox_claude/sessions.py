@@ -71,7 +71,7 @@ TYPING_REFRESH_SECONDS = 4.0
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Claude as a turn.
 RESET_COMMANDS = frozenset({"/clear", "/new"})  # start a fresh conversation
-STOP_COMMANDS = frozenset({"/stop"})            # abort whatever's in flight
+STOP_COMMANDS = frozenset({"/stop", "/cancel"})  # abort whatever's in flight
 RESUME_COMMANDS = frozenset({"/resume"})        # pick a past session to reopen
 STATUS_COMMANDS = frozenset({"/status"})        # report what the bridge is doing
 USAGE_COMMANDS = frozenset({"/usage"})          # report Claude usage this convo
