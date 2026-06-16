@@ -437,6 +437,15 @@ class InkboxGateway:
         chat_id = remote or f"call:{call_id}"
 
         ws = web.WebSocketResponse()
+        # Tell Inkbox which side runs speech. This bridge has no realtime
+        # raw-media path, so it always asks Inkbox to do both: STT on the
+        # caller's audio (so we receive `transcript` events) and TTS on the
+        # text frames we send back (so the caller hears the reply). These
+        # headers must be set on the upgrade response BEFORE prepare();
+        # without them Inkbox defaults to raw media and neither transcripts
+        # nor spoken replies flow.
+        ws.headers["x-use-inkbox-speech-to-text"] = "true"
+        ws.headers["x-use-inkbox-text-to-speech"] = "true"
         await ws.prepare(request)
         self._active_call_ws[chat_id] = ws
         logger.info("[bridge] call connected: %s", chat_id or call_id)
