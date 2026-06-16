@@ -96,6 +96,97 @@ def test_typing_loop_skips_non_imessage():
     asyncio.run(scenario())
 
 
+def test_clear_command_starts_fresh_session():
+    async def scenario():
+        sent = []
+        cleared = []
+        session = make_session(sent)
+        session.on_clear = lambda chat_id: cleared.append(chat_id)
+        session.mode = "imessage"
+
+        class FakeClient:
+            def __init__(self):
+                self.disconnects = 0
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session.resume_session_id = "old-session"
+        session.always_allowed.add("Bash")
+
+        await session.handle_inbound("/clear", "imessage", {"conversation_id": "c1"})
+
+        # Resume id forgotten, client torn down, persisted state cleared.
+        assert session.resume_session_id is None
+        assert session._client is None
+        assert fake.disconnects == 1
+        assert cleared == ["contact-1"]
+        assert session.always_allowed == set()
+        # The command is confirmed and never queued as a Claude turn.
+        assert session._queue.empty()
+        assert "fresh conversation" in sent[-1][1].lower()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_interrupts_turn_without_clearing():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        session.resume_session_id = "keep-me"
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("/stop", "imessage", {"conversation_id": "c1"})
+
+        assert fake.interrupts == 1
+        assert session._interrupting is True
+        # Context is preserved — /stop only halts the current work.
+        assert session.resume_session_id == "keep-me"
+        assert session._queue.empty()
+        assert sent[-1][1] == "Stopped."
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_when_idle():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        await session.handle_inbound("/stop", "sms", {"conversation_id": "c1"})
+        assert sent[-1][1] == "Nothing to stop — I'm idle."
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_non_command_is_forwarded_as_a_turn():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        # A message that merely mentions a slash word is a normal turn.
+        await session.handle_inbound("please /clear the cache", "sms", {})
+        assert not session._queue.empty()
+        assert session._queue.get_nowait().endswith("please /clear the cache")
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
 def test_double_text_interrupts_running_turn():
     async def scenario():
         session = make_session([])

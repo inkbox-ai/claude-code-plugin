@@ -66,6 +66,29 @@ TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
 # indicator on this cadence for as long as a turn is running.
 TYPING_REFRESH_SECONDS = 4.0
 
+# Leading slash-commands the human can text to steer the conversation itself.
+# The bridge acts on these locally — they never reach Claude as a turn.
+RESET_COMMANDS = frozenset({"/clear", "/new"})  # start a fresh conversation
+STOP_COMMANDS = frozenset({"/stop"})            # abort whatever's in flight
+
+
+def _control_command(text: str) -> Optional[str]:
+    """Classify a message as a bridge control command, if it is one.
+
+    Args:
+        text (str): The raw inbound message text.
+
+    Returns:
+        Optional[str]: "reset" or "stop" when the whole message is exactly
+            that command, otherwise None (so it's forwarded to Claude).
+    """
+    token = text.strip().lower()
+    if token in RESET_COMMANDS:
+        return "reset"
+    if token in STOP_COMMANDS:
+        return "stop"
+    return None
+
 
 def _state_path() -> Path:
     root = Path(os.getenv("INKBOX_CLAUDE_HOME") or Path.home() / ".inkbox-claude")
@@ -86,6 +109,7 @@ class ContactSession:
         identity_info: Dict[str, str],
         resume_session_id: Optional[str] = None,
         on_session_id: Optional[Callable[[str, str], None]] = None,
+        on_clear: Optional[Callable[[str], None]] = None,
         typing_fn: Optional[TypingFn] = None,
     ):
         self.chat_id = chat_id
@@ -97,6 +121,7 @@ class ContactSession:
         self.identity_info = identity_info
         self.resume_session_id = resume_session_id
         self.on_session_id = on_session_id
+        self.on_clear = on_clear
 
         self.mode = "email"  # last inbound modality; selects the reply channel
         self.reply_meta: Dict[str, Any] = {}
@@ -126,6 +151,16 @@ class ContactSession:
         """
         self.mode = mode
         self.reply_meta = dict(meta or {})
+
+        # Bridge control commands (/clear, /new, /stop) steer the conversation
+        # itself — handle them here instead of forwarding them to Claude.
+        command = _control_command(text)
+        if command == "reset":
+            await self._reset_session()
+            return
+        if command == "stop":
+            await self._stop_turn()
+            return
 
         # A reply while an escalation is outstanding answers the escalation —
         # it does not start a new agent turn.
@@ -171,6 +206,66 @@ class ContactSession:
                     )
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
+
+    # ------------------------------------------------------------------
+    # Control commands (/clear, /new, /stop)
+    # ------------------------------------------------------------------
+
+    async def _reset_session(self) -> None:
+        """Start a fresh conversation: drop the resumed Claude session id and
+        tear down the client so the next turn opens a brand-new session.
+
+        Returns:
+            None
+        """
+        await self._abort_in_flight()
+        # Forget the resumed conversation everywhere — in memory, the live
+        # client, the persisted map, and any session-scoped tool grants.
+        self.resume_session_id = None
+        await self.close()
+        if self.on_clear is not None:
+            self.on_clear(self.chat_id)
+        self.always_allowed.clear()
+        await self._reply("Started a fresh conversation — previous context cleared.")
+
+    async def _stop_turn(self) -> None:
+        """Interrupt the running turn (if any) and drop anything queued,
+        keeping the conversation context intact.
+
+        Returns:
+            None
+        """
+        had_work = (
+            self._turn_active or self.pending is not None or not self._queue.empty()
+        )
+        await self._abort_in_flight()
+        await self._reply("Stopped." if had_work else "Nothing to stop — I'm idle.")
+
+    async def _abort_in_flight(self) -> None:
+        """Cancel whatever the session is currently doing: a parked
+        escalation, a running turn, and any queued-but-unstarted messages.
+
+        Returns:
+            None
+        """
+        # Unblock a parked permission/poll so its turn can unwind (None reads
+        # as "no answer" — the same as a timeout).
+        if self.pending is not None and not self.pending.future.done():
+            self.pending.future.set_result(None)
+            self.pending = None
+        # Interrupt a turn that's actively running, like pressing Esc.
+        if self._turn_active and self._client is not None:
+            self._interrupting = True
+            try:
+                await self._client.interrupt()
+            except Exception:
+                logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
+        # Discard messages queued but not yet started.
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     # ------------------------------------------------------------------
     # Claude Code turn
@@ -394,8 +489,7 @@ class SessionManager:
         except Exception:
             return {}
 
-    def _save_session_id(self, chat_id: str, session_id: str) -> None:
-        self._session_ids[chat_id] = session_id
+    def _persist(self) -> None:
         try:
             path = _state_path()
             tmp = path.with_suffix(".tmp")
@@ -403,6 +497,15 @@ class SessionManager:
             os.replace(tmp, path)
         except Exception:
             logger.exception("failed to persist session state")
+
+    def _save_session_id(self, chat_id: str, session_id: str) -> None:
+        self._session_ids[chat_id] = session_id
+        self._persist()
+
+    def _clear_state(self, chat_id: str) -> None:
+        """Forget a contact's persisted Claude session id (for /clear, /new)."""
+        if self._session_ids.pop(chat_id, None) is not None:
+            self._persist()
 
     def get(self, chat_id: str) -> ContactSession:
         """Fetch or lazily create the session for one remote party.
@@ -424,6 +527,7 @@ class SessionManager:
                 identity_info=self.identity_info,
                 resume_session_id=self._session_ids.get(chat_id),
                 on_session_id=self._save_session_id,
+                on_clear=self._clear_state,
                 typing_fn=self.typing_fn,
             )
             self.sessions[chat_id] = session

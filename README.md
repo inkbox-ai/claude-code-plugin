@@ -126,6 +126,13 @@ Sessions are keyed by Inkbox contact, so one person = one conversation across ch
 
 **Interrupt by texting again.** Messaging the agent again while it's mid-turn works like pressing Esc in Claude Code and typing a new message: the running turn is interrupted, its partial answer is dropped, and Claude picks up your new message instead. (A reply while it's waiting on a permission/poll still answers that escalation — interrupting only applies while it's actively working.)
 
+**Control commands.** A handful of slash-commands steer the conversation itself and are handled by the bridge instead of being sent to Claude (works on any channel):
+
+- `/clear` (or `/new`) — start a fresh conversation: forgets the resumed session, tears down the client, and clears session-scoped permission grants.
+- `/stop` — interrupt the current turn and drop anything queued, keeping your conversation context intact.
+
+These match only when the whole message is exactly the command, so "please /clear the cache" is still a normal turn.
+
 **Errors.** If a turn fails, you get a short plain-language heads-up ("I hit an error while working on that and had to stop") rather than silence.
 
 ## Voice
