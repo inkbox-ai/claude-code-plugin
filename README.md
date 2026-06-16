@@ -157,10 +157,10 @@ Calls have two modes, chosen per call:
 
 **Inbound.** When someone sends an MMS image, an iMessage attachment, or an email with files, the gateway downloads them to `~/.inkbox-claude/media/` (override with `INKBOX_CLAUDE_MEDIA_DIR`) and appends the local paths to the message, so Claude can open them with its Read tool — including viewing images. Media-only messages (no text) still wake the agent.
 
-**Outbound.** Claude can send you media on any channel via its Inkbox tools:
-- **Email** — `inkbox_send_email(..., attachment_paths=[...])` attaches local files (base64 inline, ~25 MB total).
-- **iMessage** — `inkbox_send_imessage(..., media_path=...)` uploads a local file (≤10 MB) and sends it.
-- **SMS/MMS** — `inkbox_send_sms(..., media_urls=[...])` takes public URLs; to send a local file over MMS, `inkbox_upload_media(file_path)` first to get a hosted URL.
+**Outbound.** Claude sends media with a single tool call per channel — it just passes local file paths, and the tool handles any upload-then-send round trip internally:
+- **Email** — `inkbox_send_email(..., attachment_paths=[...])` (base64 inline, ~25 MB total).
+- **iMessage** — `inkbox_send_imessage(..., media_path=...)` (uploaded + sent, ≤10 MB).
+- **SMS/MMS** — `inkbox_send_sms(..., media_paths=[...])` (uploaded + sent; `media_urls` also accepts already-hosted URLs).
 
 ## Config reference
 
