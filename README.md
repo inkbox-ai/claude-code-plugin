@@ -131,6 +131,8 @@ Sessions are keyed by Inkbox contact, so one person = one conversation across ch
 - `/clear` (or `/new`) — start a fresh conversation: forgets the resumed session, tears down the client, and clears session-scoped permission grants.
 - `/stop` — interrupt the current turn and drop anything queued, keeping your conversation context intact.
 - `/resume` — texts you back a numbered list of recent conversations for the project (each with a short summary and timestamp); reply with a number to reopen that one. Like `/resume` in the Claude Code CLI.
+- `/status` — reports what the bridge is doing for you right now (working, waiting on a reply, or idle) and whether you're in a fresh or ongoing conversation. Read-only; doesn't disturb a running turn.
+- `/usage` — reports this conversation's cumulative Claude usage (turns, input/output tokens, and approximate cost).
 
 These match only when the whole message is exactly the command, so "please /clear the cache" is still a normal turn.
 

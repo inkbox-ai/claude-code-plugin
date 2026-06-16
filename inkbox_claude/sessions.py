@@ -73,6 +73,8 @@ TYPING_REFRESH_SECONDS = 4.0
 RESET_COMMANDS = frozenset({"/clear", "/new"})  # start a fresh conversation
 STOP_COMMANDS = frozenset({"/stop"})            # abort whatever's in flight
 RESUME_COMMANDS = frozenset({"/resume"})        # pick a past session to reopen
+STATUS_COMMANDS = frozenset({"/status"})        # report what the bridge is doing
+USAGE_COMMANDS = frozenset({"/usage"})          # report Claude usage this convo
 
 # How many recent sessions to offer when the human texts /resume.
 RESUME_LIST_LIMIT = 5
@@ -85,8 +87,8 @@ def _control_command(text: str) -> Optional[str]:
         text (str): The raw inbound message text.
 
     Returns:
-        Optional[str]: "reset", "stop", or "resume" when the whole message is
-            exactly that command, otherwise None (so it's forwarded to Claude).
+        Optional[str]: "reset", "stop", "resume", "status", or "usage" when the
+            whole message is exactly that command, else None (forwarded to Claude).
     """
     token = text.strip().lower()
     if token in RESET_COMMANDS:
@@ -95,6 +97,10 @@ def _control_command(text: str) -> Optional[str]:
         return "stop"
     if token in RESUME_COMMANDS:
         return "resume"
+    if token in STATUS_COMMANDS:
+        return "status"
+    if token in USAGE_COMMANDS:
+        return "usage"
     return None
 
 
@@ -261,6 +267,11 @@ class ContactSession:
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Claude turn is mid-flight
         self._interrupting = False    # a new message asked us to abort it
+        # Running usage totals for this conversation, surfaced by /usage.
+        self._usage_turns = 0
+        self._usage_input = 0
+        self._usage_output = 0
+        self._usage_cost = 0.0
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -291,6 +302,13 @@ class ContactSession:
             return
         if command == "resume":
             await self._begin_resume()
+            return
+        # /status and /usage just report back — they don't disturb a running turn.
+        if command == "status":
+            await self._report_status()
+            return
+        if command == "usage":
+            await self._report_usage()
             return
 
         # A reply while an escalation is outstanding answers the escalation —
@@ -441,6 +459,60 @@ class ContactSession:
             logger.exception("[session %s] resume pick failed", self.chat_id)
 
     # ------------------------------------------------------------------
+    # Status / usage reports (/status, /usage)
+    # ------------------------------------------------------------------
+
+    async def _report_status(self) -> None:
+        """Text back what the bridge is doing for this contact right now.
+
+        Returns:
+            None
+        """
+        if self._turn_active:
+            state = "I'm working on your last message right now."
+        elif self.pending is not None and not self.pending.future.done():
+            state = f"I'm waiting on your reply to a {self.pending.kind}."
+        elif not self._queue.empty():
+            state = "I'm about to start on your message."
+        else:
+            state = "I'm idle and ready for your next message."
+        convo = "an ongoing conversation" if self.resume_session_id else "a fresh conversation"
+        await self._reply(f"{state} We're in {convo}.")
+
+    def _accumulate_usage(self, message: "ResultMessage") -> None:
+        """Fold one finished turn's token/cost usage into the running totals.
+
+        Args:
+            message (ResultMessage): The turn's terminal result message.
+
+        Returns:
+            None
+        """
+        self._usage_turns += 1
+        if message.total_cost_usd:
+            self._usage_cost += float(message.total_cost_usd)
+        usage = message.usage or {}
+        self._usage_input += int(usage.get("input_tokens") or 0)
+        self._usage_output += int(usage.get("output_tokens") or 0)
+
+    async def _report_usage(self) -> None:
+        """Text back this conversation's cumulative Claude usage.
+
+        Returns:
+            None
+        """
+        if self._usage_turns == 0:
+            await self._reply("No usage yet this conversation — I haven't run anything.")
+            return
+        parts = [
+            f"{self._usage_turns} turn{'s' if self._usage_turns != 1 else ''}",
+            f"{self._usage_input:,} in / {self._usage_output:,} out tokens",
+        ]
+        if self._usage_cost:
+            parts.append(f"about ${self._usage_cost:.2f}")
+        await self._reply("This conversation so far: " + ", ".join(parts) + ".")
+
+    # ------------------------------------------------------------------
     # Claude Code turn
     # ------------------------------------------------------------------
 
@@ -464,6 +536,7 @@ class ContactSession:
                             chunks.append(block.text)
                 elif isinstance(message, ResultMessage):
                     final = message.result
+                    self._accumulate_usage(message)
                     if message.session_id and self.on_session_id:
                         self.resume_session_id = message.session_id
                         self.on_session_id(self.chat_id, message.session_id)

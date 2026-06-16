@@ -194,6 +194,74 @@ def test_non_command_is_forwarded_as_a_turn():
     asyncio.run(scenario())
 
 
+def test_status_command_reports_idle_without_queueing():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        await session.handle_inbound("/status", "imessage", {"conversation_id": "c1"})
+        # Reports state, starts no turn.
+        assert "idle" in sent[-1][1].lower()
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_status_command_does_not_interrupt_a_running_turn():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        class FakeClient:
+            def __init__(self):
+                self.interrupts = 0
+
+            async def interrupt(self):
+                self.interrupts += 1
+
+        fake = FakeClient()
+        session._client = fake
+        session._turn_active = True
+        session._worker = asyncio.create_task(asyncio.sleep(10))
+
+        await session.handle_inbound("/status", "imessage", {"conversation_id": "c1"})
+
+        # Read-only: it reports "working" and leaves the turn running.
+        assert fake.interrupts == 0
+        assert session._interrupting is False
+        assert "working" in sent[-1][1].lower()
+
+        session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_usage_command_reports_nothing_then_accumulated():
+    import types
+
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        await session.handle_inbound("/usage", "imessage", {"conversation_id": "c1"})
+        assert "no usage yet" in sent[-1][1].lower()
+
+        # Fold in two finished turns and report the running totals.
+        session._accumulate_usage(
+            types.SimpleNamespace(total_cost_usd=0.01, usage={"input_tokens": 100, "output_tokens": 40})
+        )
+        session._accumulate_usage(
+            types.SimpleNamespace(total_cost_usd=0.02, usage={"input_tokens": 200, "output_tokens": 60})
+        )
+        await session.handle_inbound("/usage", "imessage", {"conversation_id": "c1"})
+
+        line = sent[-1][1]
+        assert "2 turns" in line
+        assert "300 in / 100 out" in line
+        assert "$0.03" in line
+
+    asyncio.run(scenario())
+
+
 def _make_transcripts(base, project, specs):
     """Write fake Claude Code transcripts.
 
