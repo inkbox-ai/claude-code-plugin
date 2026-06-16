@@ -1,7 +1,14 @@
 import asyncio
+import json
+import os
+from pathlib import Path
 
 from inkbox_claude.config import BridgeConfig
-from inkbox_claude.sessions import ContactSession
+from inkbox_claude.sessions import (
+    ContactSession,
+    _parse_index,
+    list_recent_sessions,
+)
 
 
 def make_session(sent, typing=None):
@@ -183,6 +190,116 @@ def test_non_command_is_forwarded_as_a_turn():
         assert not session._queue.empty()
         assert session._queue.get_nowait().endswith("please /clear the cache")
         session._worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def _make_transcripts(base, project, specs):
+    """Write fake Claude Code transcripts.
+
+    Each spec is (name, [user message contents], mtime) — one JSONL user line
+    is written per content string.
+    """
+    slug = str(Path(project).resolve()).replace("/", "-")
+    tdir = Path(base) / "projects" / slug
+    tdir.mkdir(parents=True, exist_ok=True)
+    for name, contents, mtime in specs:
+        path = tdir / name
+        body = "".join(
+            json.dumps({"type": "user", "message": {"content": c}}) + "\n"
+            for c in contents
+        )
+        path.write_text(body)
+        os.utime(path, (mtime, mtime))
+    return tdir
+
+
+def test_list_recent_sessions_orders_excludes_and_summarizes(tmp_path, monkeypatch):
+    project = str(tmp_path / "proj")
+    base = tmp_path / "cfg"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(base))
+
+    _make_transcripts(
+        base,
+        project,
+        [
+            ("aaa.jsonl", ["[iMessage from +1] fix the auth bug"], 100),
+            ("bbb.jsonl", ["exclude me"], 200),
+            ("ccc.jsonl", ["older one"], 50),
+            # First user line is an injected reminder — the digest should skip
+            # it and use the next real message.
+            ("ddd.jsonl", ["<system-reminder>x</system-reminder>", "the real message"], 300),
+        ],
+    )
+
+    out = list_recent_sessions(project, exclude_id="bbb")
+    # Newest first, excluded id dropped.
+    assert [s["id"] for s in out] == ["ddd", "aaa", "ccc"]
+    # Channel tag stripped, and the reminder line skipped.
+    assert out[1]["summary"] == "fix the auth bug"
+    assert out[0]["summary"] == "the real message"
+
+
+def test_parse_index():
+    assert _parse_index("2", 3) == 1
+    assert _parse_index("#3 please", 3) == 2
+    assert _parse_index("0", 3) is None
+    assert _parse_index("9", 3) is None
+    assert _parse_index("nope", 3) is None
+
+
+def test_resume_command_with_no_sessions(tmp_path, monkeypatch):
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.cfg.project_dir = str(tmp_path / "empty-proj")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        await session.handle_inbound("/resume", "imessage", {"conversation_id": "c1"})
+        assert sent[-1][1] == "No other recent conversations to resume."
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_resume_command_lists_then_swaps_on_pick(tmp_path, monkeypatch):
+    async def scenario():
+        project = str(tmp_path / "proj")
+        base = tmp_path / "cfg"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(base))
+        _make_transcripts(
+            base,
+            project,
+            [
+                ("newer.jsonl", ["the newer conversation"], 200),
+                ("older.jsonl", ["the older conversation"], 100),
+            ],
+        )
+
+        sent = []
+        persisted = []
+        session = make_session(sent)
+        session.cfg.project_dir = project
+        session.on_session_id = lambda chat_id, sid: persisted.append((chat_id, sid))
+
+        class FakeClient:
+            async def disconnect(self):
+                pass
+
+        session._client = FakeClient()
+
+        # /resume sends the numbered menu and parks waiting for a pick.
+        await session.handle_inbound("/resume", "imessage", {"conversation_id": "c1"})
+        await asyncio.sleep(0.05)
+        assert "Recent conversations" in sent[-1][1]
+        assert session.pending is not None
+
+        # Picking #2 swaps in the older session and persists it.
+        await session.handle_inbound("2", "imessage", {"conversation_id": "c1"})
+        await asyncio.sleep(0.05)
+        assert session.resume_session_id == "older"
+        assert persisted == [("contact-1", "older")]
+        assert session._client is None
+        assert sent[-1][1] == "Resumed: the older conversation"
 
     asyncio.run(scenario())
 

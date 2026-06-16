@@ -130,6 +130,7 @@ Sessions are keyed by Inkbox contact, so one person = one conversation across ch
 
 - `/clear` (or `/new`) — start a fresh conversation: forgets the resumed session, tears down the client, and clears session-scoped permission grants.
 - `/stop` — interrupt the current turn and drop anything queued, keeping your conversation context intact.
+- `/resume` — texts you back a numbered list of recent conversations for the project (each with a short summary and timestamp); reply with a number to reopen that one. Like `/resume` in the Claude Code CLI.
 
 These match only when the whole message is exactly the command, so "please /clear the cache" is still a normal turn.
 
