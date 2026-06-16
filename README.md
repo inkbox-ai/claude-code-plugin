@@ -153,6 +153,15 @@ Calls have two modes, chosen per call:
   When the call ends, queued actions run in your session (and any plain "reflect on the call" follow-up if none were queued) — so "after we hang up, open a PR and text me" actually happens. Enable it in `inkbox-claude setup` (it validates your OpenAI key live) or via the `INKBOX_REALTIME_*` env vars below.
 - **Inkbox STT/TTS** (default / fallback): Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Claude's replies are spoken back. The bridge falls back to this automatically if Realtime is off or OpenAI can't be reached (unless `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS=false`).
 
+## Media
+
+**Inbound.** When someone sends an MMS image, an iMessage attachment, or an email with files, the gateway downloads them to `~/.inkbox-claude/media/` (override with `INKBOX_CLAUDE_MEDIA_DIR`) and appends the local paths to the message, so Claude can open them with its Read tool — including viewing images. Media-only messages (no text) still wake the agent.
+
+**Outbound.** Claude sends media with a single tool call per channel — it just passes local file paths, and the tool handles any upload-then-send round trip internally:
+- **Email** — `inkbox_send_email(..., attachment_paths=[...])` (base64 inline, ~25 MB total).
+- **iMessage** — `inkbox_send_imessage(..., media_path=...)` (uploaded + sent, ≤10 MB).
+- **SMS/MMS** — `inkbox_send_sms(..., media_paths=[...])` (uploaded + sent; `media_urls` also accepts already-hosted URLs).
+
 ## Config reference
 
 | Env var | Required | Default | Description |

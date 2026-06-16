@@ -54,6 +54,7 @@ except ImportError:  # pragma: no cover
 
 try:
     from .config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
+    from .media import download_media, inbound_media_note
     from .prompts import strip_markdown
     from .realtime import (
         RealtimeBridgeConnectError,
@@ -64,6 +65,7 @@ try:
     from .tools import build_inkbox_mcp_server
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
+    from media import download_media, inbound_media_note
     from prompts import strip_markdown
     from realtime import (
         RealtimeBridgeConnectError,
@@ -436,6 +438,9 @@ class InkboxGateway:
 
         subject = str(message.get("subject") or "")
         body_text = await asyncio.to_thread(self._fetch_mail_body, message)
+        if message.get("has_attachments"):
+            saved = await self._fetch_mail_attachments(message)
+            body_text = (body_text + inbound_media_note(saved)).strip()
         chat_id = self._chat_key(data, sender)
         meta = {
             "to": sender,
@@ -446,6 +451,49 @@ class InkboxGateway:
         # The channel tag (Subject included) is added by frame_inbound.
         await self.sessions.get(chat_id).handle_inbound(body_text, "email", meta)
         return web.json_response({"ok": True})
+
+    async def _fetch_mail_attachments(self, message: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Fetch + download an inbound email's attachments, best-effort.
+
+        Email webhooks only carry ``has_attachments``; the file list and signed
+        URLs come from the message detail + per-attachment endpoint.
+
+        Args:
+            message (dict): The inbound message object from the webhook.
+
+        Returns:
+            list[dict]: Saved attachments ({path, content_type, size}); empty on
+            any failure.
+        """
+        msg_id = str(message.get("id") or "")
+        email = getattr(self._identity, "email_address", None)
+        if not msg_id or not email:
+            return []
+        try:
+            detail = await asyncio.to_thread(self._identity.get_message, msg_id)
+            metadata = list(getattr(detail, "attachment_metadata", None) or [])
+        except Exception:
+            logger.debug("[bridge] attachment metadata fetch failed", exc_info=True)
+            return []
+
+        items: List[Dict[str, Any]] = []
+        for att in metadata:
+            filename = att.get("filename") if isinstance(att, dict) else getattr(att, "filename", None)
+            if not filename:
+                continue
+            try:
+                # Mint a signed URL per attachment (mirrors identity.get_message).
+                signed = await asyncio.to_thread(
+                    self._inkbox._messages.get_attachment, email, msg_id, filename
+                )
+            except Exception:
+                logger.debug("[bridge] attachment URL fetch failed for %s", filename, exc_info=True)
+                continue
+            url = signed.get("url") if isinstance(signed, dict) else None
+            if url:
+                ctype = att.get("content_type") if isinstance(att, dict) else None
+                items.append({"url": url, "content_type": ctype, "size": None})
+        return await download_media(items, prefix=f"mail-{msg_id}")
 
     def _fetch_mail_body(self, message: Dict[str, Any]) -> str:
         # The webhook only carries a snippet; pull the full body when we can.
@@ -468,7 +516,9 @@ class InkboxGateway:
             message.get("sender_phone_number") or message.get("remote_phone_number") or ""
         ).strip()
         text = str(message.get("text") or "").strip()
-        if not sender or not text:
+        media = message.get("media") or []
+        # An MMS can be media-only (no text) — still wake the agent for it.
+        if not sender or (not text and not media):
             return web.json_response({"ok": True, "ignored": "empty"})
         if text.lower() in SMS_CONTROL_WORDS:
             # Carrier keywords (STOP/START/HELP/...) are acked by Inkbox.
@@ -476,13 +526,14 @@ class InkboxGateway:
         if not self._sender_allowed(sender):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
+        body = await self._with_media(text, media, prefix=f"sms-{message.get('id', '')}")
         chat_id = self._chat_key(data, sender)
         meta = {
             "conversation_id": message.get("conversation_id"),
             "to": sender,
             "sender": sender,
         }
-        await self.sessions.get(chat_id).handle_inbound(text, "sms", meta)
+        await self.sessions.get(chat_id).handle_inbound(body, "sms", meta)
         return web.json_response({"ok": True})
 
     async def _on_imessage_received(self, envelope: Dict[str, Any]) -> "web.Response":
@@ -492,15 +543,34 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "outbound-or-reaction"})
         sender = str(message.get("remote_number") or "").strip()
         text = str(message.get("content") or "").strip()
-        if not sender or not text:
+        media = message.get("media") or []
+        if not sender or (not text and not media):
             return web.json_response({"ok": True, "ignored": "empty"})
         if not self._sender_allowed(sender):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
+        body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         chat_id = self._chat_key(data, sender)
         meta = {"conversation_id": message.get("conversation_id"), "sender": sender}
-        await self.sessions.get(chat_id).handle_inbound(text, "imessage", meta)
+        await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
         return web.json_response({"ok": True})
+
+    async def _with_media(self, text: str, media: List[Dict[str, Any]], *, prefix: str) -> str:
+        """Download inbound media and append a note pointing Claude at the files.
+
+        Args:
+            text (str): The message text (may be empty for media-only messages).
+            media (list): The webhook's media items ({url, content_type, size}).
+            prefix (str): Filename prefix for the saved files.
+
+        Returns:
+            str: The text with a saved-attachments note appended (or just the
+            note when the message had no text).
+        """
+        if not media:
+            return text
+        saved = await download_media(media, prefix=prefix)
+        return (text + inbound_media_note(saved)).strip()
 
     # ------------------------------------------------------------------
     # Outbound delivery failures
