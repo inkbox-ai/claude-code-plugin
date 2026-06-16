@@ -5,10 +5,11 @@ from inkbox_claude import claude_usage
 
 def test_format_usage_matches_claude_code_shape():
     now = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
+    # utilization is a 0-100 percentage, as the live endpoint returns it.
     data = {
-        "five_hour": {"utilization": 0.42, "resets_at": "2026-06-16T14:30:00Z"},
-        "seven_day": {"utilization": 0.10, "resets_at": "2026-06-19T12:00:00Z"},
-        "seven_day_opus": {"utilization": 0.0, "resets_at": "2026-06-19T12:00:00Z"},
+        "five_hour": {"utilization": 42, "resets_at": "2026-06-16T14:30:00Z"},
+        "seven_day": {"utilization": 10, "resets_at": "2026-06-19T12:00:00Z"},
+        "seven_day_opus": {"utilization": 0, "resets_at": "2026-06-19T12:00:00Z"},
     }
     out = claude_usage.format_usage(data, now=now)
     assert "5-hour session: 42% used, resets in 2h 30m" in out
@@ -17,7 +18,7 @@ def test_format_usage_matches_claude_code_shape():
 
 
 def test_format_usage_skips_missing_windows():
-    out = claude_usage.format_usage({"five_hour": {"utilization": 0.5, "resets_at": None}})
+    out = claude_usage.format_usage({"five_hour": {"utilization": 50, "resets_at": None}})
     assert out == "5-hour session: 50% used"  # no reset suffix when unknown
 
 

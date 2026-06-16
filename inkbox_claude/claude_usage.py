@@ -8,7 +8,7 @@ then format the blocks for a text reply.
 
 The response shape (matching the CLI) is::
 
-    {"five_hour":  {"utilization": 0.0-1.0, "resets_at": <iso|epoch>},
+    {"five_hour":  {"utilization": 0-100, "resets_at": <iso|epoch>},
      "seven_day":  {...},
      "seven_day_opus": {...}}
 """
@@ -129,7 +129,8 @@ def format_usage(data: dict, *, now: Optional[datetime] = None) -> str:
         block = data.get(key)
         if not isinstance(block, dict) or block.get("utilization") is None:
             continue
-        pct = round(float(block["utilization"]) * 100)
+        # utilization is already a percentage (0-100), not a 0-1 fraction.
+        pct = round(float(block["utilization"]))
         reset = _fmt_reset(block.get("resets_at"), now=now)
         lines.append(f"{label}: {pct}% used" + (f", resets {reset}" if reset else ""))
     return "\n".join(lines) if lines else "No usage windows reported."
