@@ -62,7 +62,7 @@ inkbox-claude doctor
 inkbox-claude run
 ```
 
-`inkbox-claude setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, provision a phone number, wait for your `START` opt-in, optionally enable OpenAI Realtime voice (validating your key), connect iMessage, mint a webhook signing key, choose the project directory, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
+`inkbox-claude setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, attach the Claude Code avatar to the agent's contact card (auto for a new self-signup agent; offered for an existing one with no avatar), provision a phone number, wait for your `START` opt-in, optionally enable OpenAI Realtime voice (validating your key), connect iMessage, mint a webhook signing key, choose the project directory, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
 
 On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Claude Code sessions.
 
