@@ -235,29 +235,17 @@ def test_status_command_does_not_interrupt_a_running_turn():
     asyncio.run(scenario())
 
 
-def test_usage_command_reports_nothing_then_accumulated():
-    import types
+def test_usage_command_reports_claude_usage(monkeypatch):
+    # /usage delegates to claude_usage.usage_report (the real subscription fetch).
+    import inkbox_claude.claude_usage as cu
 
     async def scenario():
         sent = []
         session = make_session(sent)
-
+        monkeypatch.setattr(cu, "usage_report", lambda: "Claude usage:\n5-hour session: 12% used")
         await session.handle_inbound("/usage", "imessage", {"conversation_id": "c1"})
-        assert "no usage yet" in sent[-1][1].lower()
-
-        # Fold in two finished turns and report the running totals.
-        session._accumulate_usage(
-            types.SimpleNamespace(total_cost_usd=0.01, usage={"input_tokens": 100, "output_tokens": 40})
-        )
-        session._accumulate_usage(
-            types.SimpleNamespace(total_cost_usd=0.02, usage={"input_tokens": 200, "output_tokens": 60})
-        )
-        await session.handle_inbound("/usage", "imessage", {"conversation_id": "c1"})
-
-        line = sent[-1][1]
-        assert "2 turns" in line
-        assert "300 in / 100 out" in line
-        assert "$0.03" in line
+        assert "5-hour session: 12% used" in sent[-1][1]
+        assert session._queue.empty()  # report only, no Claude turn
 
     asyncio.run(scenario())
 

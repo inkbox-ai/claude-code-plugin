@@ -267,11 +267,6 @@ class ContactSession:
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Claude turn is mid-flight
         self._interrupting = False    # a new message asked us to abort it
-        # Running usage totals for this conversation, surfaced by /usage.
-        self._usage_turns = 0
-        self._usage_input = 0
-        self._usage_output = 0
-        self._usage_cost = 0.0
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -479,38 +474,18 @@ class ContactSession:
         convo = "an ongoing conversation" if self.resume_session_id else "a fresh conversation"
         await self._reply(f"{state} We're in {convo}.")
 
-    def _accumulate_usage(self, message: "ResultMessage") -> None:
-        """Fold one finished turn's token/cost usage into the running totals.
-
-        Args:
-            message (ResultMessage): The turn's terminal result message.
-
-        Returns:
-            None
-        """
-        self._usage_turns += 1
-        if message.total_cost_usd:
-            self._usage_cost += float(message.total_cost_usd)
-        usage = message.usage or {}
-        self._usage_input += int(usage.get("input_tokens") or 0)
-        self._usage_output += int(usage.get("output_tokens") or 0)
-
     async def _report_usage(self) -> None:
-        """Text back this conversation's cumulative Claude usage.
+        """Text back Claude subscription usage, mirroring Claude Code's /usage.
 
         Returns:
             None
         """
-        if self._usage_turns == 0:
-            await self._reply("No usage yet this conversation — I haven't run anything.")
-            return
-        parts = [
-            f"{self._usage_turns} turn{'s' if self._usage_turns != 1 else ''}",
-            f"{self._usage_input:,} in / {self._usage_output:,} out tokens",
-        ]
-        if self._usage_cost:
-            parts.append(f"about ${self._usage_cost:.2f}")
-        await self._reply("This conversation so far: " + ", ".join(parts) + ".")
+        try:
+            from .claude_usage import usage_report
+        except ImportError:  # pragma: no cover - direct local import/test fallback
+            from claude_usage import usage_report
+        # The fetch is a blocking HTTP call — keep it off the event loop.
+        await self._reply(await asyncio.to_thread(usage_report))
 
     # ------------------------------------------------------------------
     # Claude Code turn
@@ -536,7 +511,6 @@ class ContactSession:
                             chunks.append(block.text)
                 elif isinstance(message, ResultMessage):
                     final = message.result
-                    self._accumulate_usage(message)
                     if message.session_id and self.on_session_id:
                         self.resume_session_id = message.session_id
                         self.on_session_id(self.chat_id, message.session_id)
