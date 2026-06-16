@@ -250,6 +250,23 @@ def test_status_command_does_not_interrupt_a_running_turn():
     asyncio.run(scenario())
 
 
+def test_health_command_reports_gateway_health():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        async def fake_health():
+            return "Inkbox: reachable as agent (iMessage)\nClaude: ready (subscription login)"
+
+        session.health_fn = fake_health
+        await session.handle_inbound("/health", "imessage", {"conversation_id": "c1"})
+        assert "Inkbox: reachable" in sent[-1][1]
+        assert "Claude: ready" in sent[-1][1]
+        assert session._queue.empty()  # report only, no Claude turn
+
+    asyncio.run(scenario())
+
+
 def test_usage_command_reports_claude_usage(monkeypatch):
     # /usage delegates to claude_usage.usage_report (the real subscription fetch).
     import inkbox_claude.claude_usage as cu

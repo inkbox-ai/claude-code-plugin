@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -69,6 +70,23 @@ SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
 # Inbound SMS carrier keywords handled entirely by the Inkbox server;
 # never wake the agent for them.
 SMS_CONTROL_WORDS = {"stop", "start", "help", "unstop", "unsubscribe", "cancel", "end", "quit"}
+
+
+def _claude_health() -> str:
+    """Describe whether Claude Code can run: SDK present and auth available.
+
+    Returns:
+        str: A short readiness description (no token is spent).
+    """
+    try:
+        import claude_agent_sdk  # noqa: F401
+    except ImportError:
+        return "agent SDK missing — can't run turns"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "ready (API key billing)"
+    if (Path.home() / ".claude" / ".credentials.json").exists():
+        return "ready (subscription login)"
+    return "NOT authenticated — log in to Claude or set ANTHROPIC_API_KEY"
 
 
 def _tunnel_state_dir() -> Path:
@@ -145,6 +163,7 @@ class InkboxGateway:
             mcp_tool_names=tool_names,
             identity_info=identity_info,
             typing_fn=self.send_typing,
+            health_fn=self.health_report,
         )
 
         logger.info(
@@ -457,6 +476,41 @@ class InkboxGateway:
     # ------------------------------------------------------------------
     # Outbound
     # ------------------------------------------------------------------
+
+    async def health_report(self) -> str:
+        """Probe Inkbox + Claude readiness for the texted /health command.
+
+        Returns:
+            str: A short multi-line health summary for the human.
+        """
+        lines = []
+
+        # Inkbox: a live identity fetch proves the API is reachable and the key
+        # is valid; report which channels are provisioned.
+        try:
+            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            channels = []
+            if getattr(identity, "mailbox", None) is not None:
+                channels.append("email")
+            if getattr(identity, "phone_number", None) is not None:
+                channels.append("phone")
+            if getattr(identity, "imessage_enabled", False):
+                channels.append("iMessage")
+            lines.append(
+                f"Inkbox: reachable as {identity.agent_handle} "
+                f"({', '.join(channels) or 'no channels yet'})"
+            )
+        except Exception as exc:
+            lines.append(f"Inkbox: NOT reachable — {exc}")
+
+        # Inbound path: the tunnel + reconciled webhook subscriptions.
+        if self._public_url:
+            lines.append(f"Inbound: connected ({self._public_host or self._public_url})")
+        else:
+            lines.append("Inbound: not connected")
+
+        lines.append(f"Claude: {_claude_health()}")
+        return "\n".join(lines)
 
     async def send_typing(self, chat_id: str, mode: str, meta: Dict[str, Any]) -> None:
         """Show a typing indicator while Claude works on a turn.

@@ -63,6 +63,8 @@ logger = logging.getLogger(__name__)
 SendFn = Callable[[str, str, str, Dict[str, Any]], Awaitable[Any]]
 # gateway.send_typing(chat_id, mode, meta) signature.
 TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
+# gateway.health_report() signature.
+HealthFn = Callable[[], Awaitable[str]]
 
 # iMessage typing bubbles expire after a few seconds, so we refresh the
 # indicator on this cadence for as long as a turn is running.
@@ -75,6 +77,7 @@ STOP_COMMANDS = frozenset({"/stop", "/cancel"})  # abort whatever's in flight
 RESUME_COMMANDS = frozenset({"/resume"})        # pick a past session to reopen
 STATUS_COMMANDS = frozenset({"/status"})        # report what the bridge is doing
 USAGE_COMMANDS = frozenset({"/usage"})          # report Claude usage this convo
+HEALTH_COMMANDS = frozenset({"/health"})        # probe Inkbox + Claude reachability
 
 # How many recent sessions to offer when the human texts /resume.
 RESUME_LIST_LIMIT = 5
@@ -87,8 +90,8 @@ def _control_command(text: str) -> Optional[str]:
         text (str): The raw inbound message text.
 
     Returns:
-        Optional[str]: "reset", "stop", "resume", "status", or "usage" when the
-            whole message is exactly that command, else None (forwarded to Claude).
+        Optional[str]: "reset", "stop", "resume", "status", "usage", or "health"
+            when the whole message is exactly that command, else None (forwarded).
     """
     token = text.strip().lower()
     if token in RESET_COMMANDS:
@@ -101,6 +104,8 @@ def _control_command(text: str) -> Optional[str]:
         return "status"
     if token in USAGE_COMMANDS:
         return "usage"
+    if token in HEALTH_COMMANDS:
+        return "health"
     return None
 
 
@@ -244,11 +249,13 @@ class ContactSession:
         on_session_id: Optional[Callable[[str, str], None]] = None,
         on_clear: Optional[Callable[[str], None]] = None,
         typing_fn: Optional[TypingFn] = None,
+        health_fn: Optional[HealthFn] = None,
     ):
         self.chat_id = chat_id
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
+        self.health_fn = health_fn
         self.mcp_server = mcp_server
         self.mcp_tool_names = mcp_tool_names
         self.identity_info = identity_info
@@ -304,6 +311,9 @@ class ContactSession:
             return
         if command == "usage":
             await self._report_usage()
+            return
+        if command == "health":
+            await self._report_health()
             return
 
         # A reply while an escalation is outstanding answers the escalation —
@@ -486,6 +496,17 @@ class ContactSession:
             from claude_usage import usage_report
         # The fetch is a blocking HTTP call — keep it off the event loop.
         await self._reply(await asyncio.to_thread(usage_report))
+
+    async def _report_health(self) -> None:
+        """Text back Inkbox + Claude reachability (the gateway probes it).
+
+        Returns:
+            None
+        """
+        if self.health_fn is None:
+            await self._reply("Health check unavailable.")
+            return
+        await self._reply(await self.health_fn())
 
     # ------------------------------------------------------------------
     # Claude Code turn
@@ -693,10 +714,12 @@ class SessionManager:
         mcp_tool_names: list[str],
         identity_info: Dict[str, str],
         typing_fn: Optional[TypingFn] = None,
+        health_fn: Optional[HealthFn] = None,
     ):
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
+        self.health_fn = health_fn
         self.mcp_server = mcp_server
         self.mcp_tool_names = mcp_tool_names
         self.identity_info = identity_info
@@ -749,6 +772,7 @@ class SessionManager:
                 on_session_id=self._save_session_id,
                 on_clear=self._clear_state,
                 typing_fn=self.typing_fn,
+                health_fn=self.health_fn,
             )
             self.sessions[chat_id] = session
         return session
