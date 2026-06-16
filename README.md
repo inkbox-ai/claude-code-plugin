@@ -62,7 +62,7 @@ inkbox-claude doctor
 inkbox-claude run
 ```
 
-`inkbox-claude setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, provision a phone number, wait for your `START` opt-in, connect iMessage, mint a webhook signing key, choose the project directory, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
+`inkbox-claude setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, provision a phone number, wait for your `START` opt-in, optionally enable OpenAI Realtime voice (validating your key), connect iMessage, mint a webhook signing key, choose the project directory, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
 
 On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Claude Code sessions.
 
@@ -141,7 +141,10 @@ These match only when the whole message is exactly the command, so "please /clea
 
 ## Voice
 
-Calls use Inkbox-managed STT/TTS: Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Claude's replies are spoken back. (No OpenAI Realtime path here yet — see hermes-agent-plugin for what that looks like.)
+Calls have two modes, chosen per call:
+
+- **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and only reaches into Claude Code — via the `consult_claude_code` tool — when you ask for real work; that consult runs in the *same* contact-keyed session as your SMS/iMessage, and its answer is spoken back in the model's own voice. Enable it in `inkbox-claude setup` (it validates your OpenAI key live) or via the `INKBOX_REALTIME_*` env vars below.
+- **Inkbox STT/TTS** (default / fallback): Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Claude's replies are spoken back. The bridge falls back to this automatically if Realtime is off or OpenAI can't be reached (unless `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS=false`).
 
 ## Config reference
 
@@ -161,6 +164,11 @@ Calls use Inkbox-managed STT/TTS: Inkbox auto-accepts the call and opens a WebSo
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_AUTO_ALLOWED_TOOLS` | no | read-only set | Tools that never need a permission text. |
+| `INKBOX_REALTIME_ENABLED` | no | `false` | Use OpenAI Realtime for calls. Needs a key; off → Inkbox STT/TTS. |
+| `INKBOX_REALTIME_API_KEY` | realtime | `OPENAI_API_KEY` | OpenAI key with `/v1/realtime` access. |
+| `INKBOX_REALTIME_MODEL` | no | `gpt-realtime-2` | Realtime model id. |
+| `INKBOX_REALTIME_VOICE` | no | `cedar` | Realtime voice name. |
+| `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS` | no | `true` | Fall back to Inkbox STT/TTS if OpenAI connect fails. |
 
 ## Tools exposed to Claude
 

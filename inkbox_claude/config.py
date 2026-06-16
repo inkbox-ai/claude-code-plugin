@@ -6,6 +6,12 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from .realtime import (
+    DEFAULT_MODEL as REALTIME_DEFAULT_MODEL,
+    DEFAULT_VOICE as REALTIME_DEFAULT_VOICE,
+    RealtimeConfig,
+)
+
 INKBOX_BASE_URL_DEFAULT = "https://inkbox.ai"
 INKBOX_WS_PATH = "/phone/media/ws"
 DEFAULT_HOST = "0.0.0.0"
@@ -57,6 +63,29 @@ class BridgeConfig:
     claude_model: str = ""
     permission_timeout_s: float = 600.0
     auto_allowed_tools: List[str] = field(default_factory=lambda: list(DEFAULT_AUTO_ALLOWED_TOOLS))
+    # OpenAI Realtime voice (off unless the wizard validated a key)
+    realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
+
+
+def _read_realtime_config() -> RealtimeConfig:
+    """Build the Realtime voice config from the env.
+
+    The API key falls back to OPENAI_API_KEY so an operator who already
+    exports one doesn't have to re-enter it. Realtime stays disabled unless
+    INKBOX_REALTIME_ENABLED is truthy.
+
+    Returns:
+        RealtimeConfig: Resolved settings; ``enabled`` False leaves calls on
+        the Inkbox STT/TTS path.
+    """
+    api_key = str(os.getenv("INKBOX_REALTIME_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+    return RealtimeConfig(
+        enabled=env_flag("INKBOX_REALTIME_ENABLED", False) and bool(api_key),
+        api_key=api_key,
+        model=str(os.getenv("INKBOX_REALTIME_MODEL") or REALTIME_DEFAULT_MODEL).strip(),
+        voice=str(os.getenv("INKBOX_REALTIME_VOICE") or REALTIME_DEFAULT_VOICE).strip(),
+        fallback_to_inkbox_stt_tts=env_flag("INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS", True),
+    )
 
 
 def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
@@ -78,4 +107,5 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         claude_model=str(os.getenv("CLAUDE_MODEL") or extra.get("claude_model") or "").strip(),
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         auto_allowed_tools=_csv_env("INKBOX_AUTO_ALLOWED_TOOLS") or list(DEFAULT_AUTO_ALLOWED_TOOLS),
+        realtime=_read_realtime_config(),
     )

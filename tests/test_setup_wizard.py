@@ -336,3 +336,66 @@ def test_connect_qr_uses_smsto_scheme(monkeypatch):
     setup_wizard._wait_for_imessage_first_message(client, identity, "agent")
 
     assert captured["payload"] == "SMSTO:+15550009999:connect @agent"
+
+
+# ----------------------------------------------------------------------
+# OpenAI Realtime configuration
+# ----------------------------------------------------------------------
+
+
+def test_detect_realtime_key_prefers_plugin_var(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-plugin")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-generic")
+    assert setup_wizard._detect_openai_realtime_key() == ("INKBOX_REALTIME_API_KEY", "sk-plugin")
+
+
+def test_detect_realtime_key_falls_back_to_openai(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-generic")
+    assert setup_wizard._detect_openai_realtime_key() == ("OPENAI_API_KEY", "sk-generic")
+
+
+def test_detect_realtime_key_none_when_unset(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert setup_wizard._detect_openai_realtime_key() is None
+
+
+def test_configure_realtime_declined_writes_disabled(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: False)
+
+    identity = types.SimpleNamespace(phone_number=types.SimpleNamespace(number="+16614031457"))
+    setup_wizard._configure_realtime_calls(identity)
+    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "false"
+
+
+def test_configure_realtime_enables_on_valid_key(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-rt")
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
+    # Validation passes without hitting the network.
+    monkeypatch.setattr(setup_wizard, "_test_openai_realtime_api_key", lambda *a, **k: (True, "ok"))
+
+    identity = types.SimpleNamespace(phone_number=types.SimpleNamespace(number="+16614031457"))
+    setup_wizard._configure_realtime_calls(identity)
+    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "true"
+    assert setup_wizard._env("INKBOX_REALTIME_API_KEY") == "sk-rt"
+
+
+def test_configure_realtime_skips_without_phone(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    setup_wizard._configure_realtime_calls(types.SimpleNamespace(phone_number=None))
+    # No phone → returns before writing anything to this run's .env file.
+    assert not env_file.exists()

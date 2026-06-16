@@ -274,6 +274,7 @@ class ContactSession:
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Claude turn is mid-flight
         self._interrupting = False    # a new message asked us to abort it
+        self._consult_lock = asyncio.Lock()  # serializes realtime consults
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -550,6 +551,44 @@ class ContactSession:
         reply = (final or "\n\n".join(chunks)).strip()
         if reply:
             await self._reply(reply)
+
+    async def run_consult(self, query: str) -> str:
+        """Run one Claude Code turn and RETURN its text (don't send it).
+
+        Used by the Realtime voice bridge: the OpenAI model asks Claude Code to
+        do real work via the consult tool, then speaks the returned text itself.
+        Runs on the same resumed session as this contact's texts, so a call
+        shares context with their SMS/iMessage/email. Replies are captured here
+        rather than routed through ``send_fn`` so they never double up as Inkbox
+        TTS while the Realtime model is speaking.
+
+        Args:
+            query (str): Plain-English request from the Realtime model.
+
+        Returns:
+            str: Claude's reply text, or a short fallback if it produced none.
+        """
+        # One consult at a time per contact — the shared ClaudeSDKClient can't
+        # run two turns at once.
+        async with self._consult_lock:
+            client = await self._ensure_client()
+            await client.query(query)
+            chunks: list[str] = []
+            final: Optional[str] = None
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            chunks.append(block.text)
+                elif isinstance(message, ResultMessage):
+                    final = message.result
+                    # Keep the resumed-session id current so a later text picks
+                    # up the same conversation the call advanced.
+                    if message.session_id and self.on_session_id:
+                        self.resume_session_id = message.session_id
+                        self.on_session_id(self.chat_id, message.session_id)
+            reply = (final or "\n\n".join(chunks)).strip()
+            return reply or "I finished that, but didn't have anything to say back."
 
     async def _typing_loop(self) -> None:
         """Refresh the channel's typing indicator until the turn ends.

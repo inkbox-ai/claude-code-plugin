@@ -55,11 +55,21 @@ except ImportError:  # pragma: no cover
 try:
     from .config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
     from .prompts import strip_markdown
+    from .realtime import (
+        RealtimeBridgeConnectError,
+        RealtimeCallMeta,
+        open_inkbox_realtime_bridge,
+    )
     from .sessions import SessionManager
     from .tools import build_inkbox_mcp_server
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
     from prompts import strip_markdown
+    from realtime import (
+        RealtimeBridgeConnectError,
+        RealtimeCallMeta,
+        open_inkbox_realtime_bridge,
+    )
     from sessions import SessionManager
     from tools import build_inkbox_mcp_server
 
@@ -415,6 +425,34 @@ class InkboxGateway:
     # Inbound: live calls (Inkbox STT/TTS text-frame bridge)
     # ------------------------------------------------------------------
 
+    async def _open_realtime_bridge(self, remote: str, call_id: str) -> Any:
+        """Preflight an OpenAI Realtime session for an incoming call.
+
+        Args:
+            remote (str): Caller phone number (may be empty).
+            call_id (str): Inkbox call id, for logging.
+
+        Returns:
+            Any: An OpenedRealtimeBridge on success, or None if the connect
+            failed (the caller then falls back to Inkbox STT/TTS).
+        """
+        phone = getattr(self._identity, "phone_number", None)
+        meta = RealtimeCallMeta(
+            call_id=call_id or "unknown",
+            remote_phone_number=remote or None,
+            agent_identity_phone=getattr(phone, "number", None),
+            project_dir=self.cfg.project_dir,
+        )
+        try:
+            return await open_inkbox_realtime_bridge(config=self.cfg.realtime, meta=meta)
+        except RealtimeBridgeConnectError as exc:
+            logger.warning(
+                "[bridge] realtime connect failed for call %s (%s); "
+                "falling back to Inkbox STT/TTS unless disabled",
+                call_id, exc.cause,
+            )
+            return None
+
     async def _handle_call_ws(self, request: "web.Request") -> Any:
         # The tunnel URL is internet-reachable; Inkbox signs the WS upgrade
         # with the webhook scheme over the X-Call-Context header body.
@@ -437,8 +475,40 @@ class InkboxGateway:
         chat_id = remote or f"call:{call_id}"
 
         ws = web.WebSocketResponse()
-        # Tell Inkbox which side runs speech. This bridge has no realtime
-        # raw-media path, so it always asks Inkbox to do both: STT on the
+
+        # Realtime branch: when configured, pre-open OpenAI Realtime BEFORE we
+        # commit the WS to a mode. If it connects, accept in raw-media mode and
+        # bridge audio both ways; the model runs the call and consults Claude
+        # Code via run_consult. If the preflight fails, fall through to Inkbox
+        # STT/TTS below (unless fallback is disabled, then refuse the call).
+        if self.cfg.realtime.enabled:
+            bridge = await self._open_realtime_bridge(remote, call_id)
+            if bridge is None and not self.cfg.realtime.fallback_to_inkbox_stt_tts:
+                return web.Response(status=503, text="realtime bridge unavailable")
+            if bridge is not None:
+                # Raw-media mode: Inkbox must NOT run its own STT/TTS — the
+                # OpenAI model handles both ends of the audio.
+                ws.headers["x-use-inkbox-speech-to-text"] = "false"
+                ws.headers["x-use-inkbox-text-to-speech"] = "false"
+                await ws.prepare(request)
+                self._active_call_ws[chat_id] = ws
+                logger.info("[bridge] realtime call connected: %s", chat_id or call_id)
+
+                async def _consult(query: str, _transcript: Any) -> str:
+                    # Route the model's request into the caller's shared session.
+                    return await self.sessions.get(chat_id).run_consult(query)
+
+                try:
+                    await bridge.run(inkbox_ws=ws, on_agent_consult=_consult)
+                except Exception:
+                    logger.exception("[bridge] realtime call failed: %s", call_id)
+                finally:
+                    await bridge.close()
+                    self._active_call_ws.pop(chat_id, None)
+                    logger.info("[bridge] realtime call ended: %s", chat_id or call_id)
+                return ws
+
+        # Inkbox STT/TTS path. Tell Inkbox which side runs speech: STT on the
         # caller's audio (so we receive `transcript` events) and TTS on the
         # text frames we send back (so the caller hears the reply). These
         # headers must be set on the upgrade response BEFORE prepare();
