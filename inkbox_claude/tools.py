@@ -130,8 +130,9 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
     @tool(
         "inkbox_send_imessage",
-        "Send an iMessage. Pass an existing conversation_id (iMessage is "
-        "recipient-first: the person must have messaged this agent before).",
+        "Send an iMessage. Pass an existing conversation_id — get it from "
+        "inkbox_list_imessage_conversations (iMessage is recipient-first: a "
+        "conversation exists only after the person has messaged this agent).",
         {"conversation_id": str, "text": str},
     )
     async def inkbox_send_imessage(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,6 +163,38 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return _error(str(exc))
 
     @tool(
+        "inkbox_list_imessage_conversations",
+        "List this agent's iMessage conversations (conversation_id + the "
+        "remote number), newest first. Use this to find the conversation_id "
+        "to pass to inkbox_send_imessage.",
+        {"limit": int},
+    )
+    async def inkbox_list_imessage_conversations(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return _identity().list_imessage_conversations(limit=int(args.get("limit") or 25))
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_get_imessage_conversation",
+        "Fetch message history for one iMessage conversation by conversation_id.",
+        {"conversation_id": str, "limit": int},
+    )
+    async def inkbox_get_imessage_conversation(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return _identity().get_imessage_conversation(
+                str(args["conversation_id"]), limit=int(args.get("limit") or 50)
+            )
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
         "inkbox_get_text_conversation",
         "Fetch message history for one SMS conversation by conversation_id.",
         {"conversation_id": str, "limit": int},
@@ -184,6 +217,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_send_imessage,
         inkbox_list_text_conversations,
         inkbox_get_text_conversation,
+        inkbox_list_imessage_conversations,
+        inkbox_get_imessage_conversation,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
     tool_names = [
@@ -193,5 +228,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_send_imessage",
         "mcp__inkbox__inkbox_list_text_conversations",
         "mcp__inkbox__inkbox_get_text_conversation",
+        "mcp__inkbox__inkbox_list_imessage_conversations",
+        "mcp__inkbox__inkbox_get_imessage_conversation",
     ]
     return server, tool_names
