@@ -14,6 +14,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -70,6 +72,12 @@ TYPING_REFRESH_SECONDS = 4.0
 # The bridge acts on these locally — they never reach Claude as a turn.
 RESET_COMMANDS = frozenset({"/clear", "/new"})  # start a fresh conversation
 STOP_COMMANDS = frozenset({"/stop"})            # abort whatever's in flight
+RESUME_COMMANDS = frozenset({"/resume"})        # pick a past session to reopen
+STATUS_COMMANDS = frozenset({"/status"})        # report what the bridge is doing
+USAGE_COMMANDS = frozenset({"/usage"})          # report Claude usage this convo
+
+# How many recent sessions to offer when the human texts /resume.
+RESUME_LIST_LIMIT = 5
 
 
 def _control_command(text: str) -> Optional[str]:
@@ -79,15 +87,140 @@ def _control_command(text: str) -> Optional[str]:
         text (str): The raw inbound message text.
 
     Returns:
-        Optional[str]: "reset" or "stop" when the whole message is exactly
-            that command, otherwise None (so it's forwarded to Claude).
+        Optional[str]: "reset", "stop", "resume", "status", or "usage" when the
+            whole message is exactly that command, else None (forwarded to Claude).
     """
     token = text.strip().lower()
     if token in RESET_COMMANDS:
         return "reset"
     if token in STOP_COMMANDS:
         return "stop"
+    if token in RESUME_COMMANDS:
+        return "resume"
+    if token in STATUS_COMMANDS:
+        return "status"
+    if token in USAGE_COMMANDS:
+        return "usage"
     return None
+
+
+def _transcript_dir(project_dir: Optional[str]) -> Optional[Path]:
+    """Locate Claude Code's transcript folder for a project.
+
+    Claude Code stores one JSONL transcript per session under
+    ``<config>/projects/<slugified project path>``.
+
+    Args:
+        project_dir (Optional[str]): Project working directory.
+
+    Returns:
+        Optional[Path]: The transcript directory, or None without a project.
+    """
+    if not project_dir:
+        return None
+    base = Path(os.getenv("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    # The slug is the absolute path with every separator turned into a dash.
+    slug = str(Path(project_dir).resolve()).replace("/", "-")
+    return base / "projects" / slug
+
+
+def _clean_summary(text: str) -> str:
+    # Drop the leading channel tag the bridge prepends ("[iMessage from ...]").
+    text = text.strip()
+    if text.startswith("["):
+        end = text.find("]")
+        if end != -1:
+            text = text[end + 1:].strip()
+    # Collapse whitespace and keep it short enough for a text message.
+    return " ".join(text.split())[:80]
+
+
+def _session_digest(path: Path) -> Optional[Dict[str, Any]]:
+    """Summarize one transcript file into {id, summary, mtime}.
+
+    Args:
+        path (Path): Path to a ``<session id>.jsonl`` transcript.
+
+    Returns:
+        Optional[Dict[str, Any]]: Digest, or None if the file can't be read.
+    """
+    summary = ""
+    try:
+        with path.open() as fh:
+            for raw in fh:
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                # Prefer an explicit compaction summary when one exists.
+                if entry.get("type") == "summary" and entry.get("summary"):
+                    summary = str(entry["summary"])
+                    break
+                # Otherwise fall back to the first real user message.
+                if entry.get("type") == "user":
+                    content = (entry.get("message") or {}).get("content")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    text = _clean_summary(str(content or ""))
+                    # Skip injected system reminders and other tool noise.
+                    if text and not text.startswith("<"):
+                        summary = text
+                        break
+    except OSError:
+        return None
+    return {"id": path.stem, "summary": summary or "(no summary)", "mtime": path.stat().st_mtime}
+
+
+def list_recent_sessions(
+    project_dir: Optional[str],
+    limit: int = RESUME_LIST_LIMIT,
+    exclude_id: Optional[str] = None,
+) -> list[Dict[str, Any]]:
+    """List a project's most recent Claude Code sessions, newest first.
+
+    Args:
+        project_dir (Optional[str]): Project working directory.
+        limit (int): Max sessions to return.
+        exclude_id (Optional[str]): Session id to omit (e.g. the live one).
+
+    Returns:
+        list[Dict[str, Any]]: Digests {id, summary, mtime}, newest first.
+    """
+    tdir = _transcript_dir(project_dir)
+    if tdir is None or not tdir.is_dir():
+        return []
+    files = sorted(tdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    out: list[Dict[str, Any]] = []
+    for path in files:
+        if path.stem == exclude_id:
+            continue
+        digest = _session_digest(path)
+        if digest is not None:
+            out.append(digest)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _format_resume_list(sessions: list[Dict[str, Any]]) -> str:
+    # A numbered, one-line-each menu sized for a text message.
+    lines = ["Recent conversations — reply with a number to resume:"]
+    for i, s in enumerate(sessions, 1):
+        when = datetime.fromtimestamp(s["mtime"]).strftime("%b %d %H:%M")
+        lines.append(f"{i}. ({when}) {s['summary']}")
+    return "\n".join(lines)
+
+
+def _parse_index(reply: str, count: int) -> Optional[int]:
+    # Pull the first integer out of the reply ("2", "#2", "option 2").
+    match = re.search(r"\d+", reply or "")
+    if not match:
+        return None
+    choice = int(match.group())
+    return choice - 1 if 1 <= choice <= count else None
 
 
 def _state_path() -> Path:
@@ -131,6 +264,7 @@ class ContactSession:
         self._client: Optional[ClaudeSDKClient] = None
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker: Optional[asyncio.Task] = None
+        self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Claude turn is mid-flight
         self._interrupting = False    # a new message asked us to abort it
 
@@ -160,6 +294,16 @@ class ContactSession:
             return
         if command == "stop":
             await self._stop_turn()
+            return
+        if command == "resume":
+            await self._begin_resume()
+            return
+        # /status and /usage just report back — they don't disturb a running turn.
+        if command == "status":
+            await self._report_status()
+            return
+        if command == "usage":
+            await self._report_usage()
             return
 
         # A reply while an escalation is outstanding answers the escalation —
@@ -266,6 +410,82 @@ class ContactSession:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    async def _begin_resume(self) -> None:
+        """List recent sessions and let the human pick one to reopen.
+
+        Returns:
+            None
+        """
+        sessions = list_recent_sessions(
+            self.cfg.project_dir, exclude_id=self.resume_session_id
+        )
+        if not sessions:
+            await self._reply("No other recent conversations to resume.")
+            return
+        # Run the numbered pick in the background so the inbound webhook can
+        # return promptly while we wait (up to the escalation timeout) for the
+        # human's choice. Keep a reference so the task isn't GC'd.
+        self._resume_task = asyncio.create_task(self._run_resume_pick(sessions))
+
+    async def _run_resume_pick(self, sessions: list[Dict[str, Any]]) -> None:
+        try:
+            reply = await self._escalate("resume", _format_resume_list(sessions))
+            if reply is None:
+                await self._reply("No pick — staying in the current conversation.")
+                return
+            index = _parse_index(reply, len(sessions))
+            if index is None:
+                await self._reply(
+                    f"Didn't catch a number from 1-{len(sessions)} — staying put. "
+                    "Send /resume to try again."
+                )
+                return
+            chosen = sessions[index]
+            # Swap in the chosen session and tear down the client so the next
+            # turn continues it; persist it so it survives bridge restarts.
+            await self.close()
+            self.resume_session_id = chosen["id"]
+            if self.on_session_id is not None:
+                self.on_session_id(self.chat_id, chosen["id"])
+            self.always_allowed.clear()
+            await self._reply(f"Resumed: {chosen['summary']}")
+        except Exception:
+            logger.exception("[session %s] resume pick failed", self.chat_id)
+
+    # ------------------------------------------------------------------
+    # Status / usage reports (/status, /usage)
+    # ------------------------------------------------------------------
+
+    async def _report_status(self) -> None:
+        """Text back what the bridge is doing for this contact right now.
+
+        Returns:
+            None
+        """
+        if self._turn_active:
+            state = "I'm working on your last message right now."
+        elif self.pending is not None and not self.pending.future.done():
+            state = f"I'm waiting on your reply to a {self.pending.kind}."
+        elif not self._queue.empty():
+            state = "I'm about to start on your message."
+        else:
+            state = "I'm idle and ready for your next message."
+        convo = "an ongoing conversation" if self.resume_session_id else "a fresh conversation"
+        await self._reply(f"{state} We're in {convo}.")
+
+    async def _report_usage(self) -> None:
+        """Text back Claude subscription usage, mirroring Claude Code's /usage.
+
+        Returns:
+            None
+        """
+        try:
+            from .claude_usage import usage_report
+        except ImportError:  # pragma: no cover - direct local import/test fallback
+            from claude_usage import usage_report
+        # The fetch is a blocking HTTP call — keep it off the event loop.
+        await self._reply(await asyncio.to_thread(usage_report))
 
     # ------------------------------------------------------------------
     # Claude Code turn
