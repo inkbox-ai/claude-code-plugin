@@ -86,6 +86,9 @@ class _Turn:
 
     text: str
     future: Optional["asyncio.Future[str]"] = None
+    # True for a one-shot turn spawned to recover from a rejected reply send.
+    # A recovery turn that itself fails to send is not recovered again (no loop).
+    recovery: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Claude as a turn.
@@ -124,6 +127,51 @@ def _control_command(text: str) -> Optional[str]:
     if token in HEALTH_COMMANDS:
         return "health"
     return None
+
+
+def _send_error_reason(exc: Exception) -> str:
+    """Pull a human reason out of a send exception.
+
+    Inkbox API errors carry a ``detail`` dict whose ``message`` is already a
+    clear, actionable sentence (e.g. the spam-filter rejection). Fall back to
+    the string form for anything else.
+
+    Args:
+        exc (Exception): The exception raised by the send.
+
+    Returns:
+        str: A human-readable failure reason.
+    """
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        message = detail.get("message") or detail.get("error")
+        if message:
+            return str(message)
+    return str(exc)
+
+
+def _send_rejected_prompt(reply: str, reason: str) -> str:
+    """Build the recovery prompt for a reply the provider rejected at send time.
+
+    Args:
+        reply (str): The text that was blocked.
+        reason (str): Why the send was rejected.
+
+    Returns:
+        str: A prompt telling Claude to rephrase or switch channels.
+    """
+    return "\n".join([
+        "[reply rejected] Your last reply was NOT delivered — the messaging "
+        "provider rejected it before sending.",
+        f"Reason: {reason}",
+        "",
+        f'Your blocked reply was:\n"{reply}"',
+        "",
+        "Recover now: rephrase to avoid whatever was flagged (e.g. drop the "
+        "restricted content), or send it over a different channel with your "
+        "Inkbox tools — iMessage isn't subject to carrier SMS content filtering. "
+        "Send the recovered version now.",
+    ])
 
 
 def _transcript_dir(project_dir: Optional[str]) -> Optional[Path]:
@@ -591,7 +639,34 @@ class ContactSession:
         if self._interrupting:
             return
         if reply:
+            await self._deliver_reply(turn, reply)
+
+    async def _deliver_reply(self, turn: _Turn, reply: str) -> None:
+        """Send a normal turn's reply, recovering once if the send is rejected.
+
+        A synchronous send rejection (carrier spam filter, opt-out, invalid
+        recipient) comes back as an API error, not a webhook. Rather than
+        surfacing a generic failure, hand the reason back to Claude once so it
+        can rephrase or switch channels. A recovery turn that itself fails is
+        re-raised (the worker logs it) — never retried, so it can't loop.
+
+        Args:
+            turn (_Turn): The turn whose reply is being sent.
+            reply (str): Claude's reply text.
+
+        Returns:
+            None
+        """
+        try:
             await self._reply(reply)
+        except Exception as exc:
+            reason = _send_error_reason(exc)
+            logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
+            if turn.recovery:
+                raise  # already a recovery attempt — don't spawn another
+            await self._queue.put(
+                _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
+            )
 
     async def run_consult(self, query: str) -> str:
         """Run one Claude Code turn and RETURN its text (don't send it).

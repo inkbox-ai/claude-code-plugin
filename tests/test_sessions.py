@@ -81,6 +81,41 @@ def test_new_message_does_not_interrupt_a_running_capture_turn():
     asyncio.run(scenario())
 
 
+def test_rejected_reply_send_spawns_one_recovery_turn():
+    # A blocked outbound reply (e.g. carrier spam filter 422) must not surface a
+    # generic error — it queues a one-shot recovery turn with the real reason so
+    # Claude can rephrase or switch channels.
+    async def scenario():
+        session = make_session([])
+
+        class Blocked(Exception):
+            detail = {"error": "message_blocked_spam_filter", "rule": "crypto_content",
+                      "message": "Cryptocurrency price content is restricted."}
+
+        async def boom(_text):
+            raise Blocked()
+        session._reply = boom
+
+        # First (normal) turn's reply is rejected → one recovery turn queued.
+        await session._deliver_reply(_Turn(text="orig"), "Bitcoin: $63295")
+        assert session._queue.qsize() == 1
+        recovery = session._queue.get_nowait()
+        assert recovery.recovery is True
+        assert "Cryptocurrency price content is restricted." in recovery.text
+        assert "Bitcoin: $63295" in recovery.text
+
+        # A recovery turn that ALSO fails re-raises (no second recovery → no loop).
+        raised = False
+        try:
+            await session._deliver_reply(_Turn(text="retry", recovery=True), "Bitcoin: $1")
+        except Blocked:
+            raised = True
+        assert raised is True
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
 def test_pending_escalation_consumes_next_inbound():
     async def scenario():
         sent = []
