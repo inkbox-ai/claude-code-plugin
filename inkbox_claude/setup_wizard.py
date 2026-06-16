@@ -669,15 +669,23 @@ def _wait_for_imessage_first_message(client: Any, identity: Any, handle: str) ->
     print_info("    3. Send any first message (e.g. \"hi\") in that NEW thread.")
     print_info("  The agent can only message you after you message it first.")
 
-    # Scan-to-connect: a QR of the sms: deep link opens Messages on the iPhone
-    # with the number and connect command already filled in (step 1 in one tap).
-    from urllib.parse import quote
+    # Tap-to-connect link: prefer the server-resolved sms_link (servers PR #234),
+    # falling back / overriding when it's missing or still carries the generic
+    # "your-handle" placeholder, so it matches the command shown in step 1.
+    sms_link = str(getattr(triage, "sms_link", "") or "").strip()
+    if not sms_link or "your-handle" in sms_link:
+        from urllib.parse import quote
 
-    sms_link = f"sms:{triage.number}&body={quote(connect_command)}"
+        sms_link = f"sms:{triage.number}?&body={quote(connect_command)}"
+
+    # Scan-to-connect QR. Encode the SMSTO: scheme the server's QR now uses —
+    # phone scanners map SMSTO:<number>:<body> to a drafted text far more
+    # reliably than a raw sms: link, doing step 1 in one tap.
+    qr_payload = f"SMSTO:{triage.number}:{connect_command}"
     print()
     print_info("  Or just scan this with your iPhone camera to do step 1 in one tap:")
     print()
-    if not _show_qr(sms_link):
+    if not _show_qr(qr_payload):
         print_info(f"    (install 'segno' to show a scannable QR here: {sms_link})")
 
     print()
@@ -1335,6 +1343,17 @@ def _print_agent_summary(identity: Any) -> None:
         print(color("  --- SMS opt-in ---", Colors.YELLOW))
         print_info(f"  Text START to {phone.number} to enable SMS from this agent")
         print_info("  to your phone. Do this from every phone you want to message it from.")
+
+        # Scan-to-opt-in QR. Same SMSTO: scheme the iMessage connect step uses —
+        # scanners draft a START text to the number in one tap. The fallback
+        # sms: link is for terminals without segno installed.
+        qr_payload = f"SMSTO:{phone.number}:START"
+        sms_link = f"sms:{phone.number}?&body=START"
+        print()
+        print_info("  Or just scan this with your phone camera to draft that text in one tap:")
+        print()
+        if not _show_qr(qr_payload):
+            print_info(f"    (install 'segno' to show a scannable QR here: {sms_link})")
 
     print()
     print(color("  --- Reachability rules ---", Colors.CYAN))

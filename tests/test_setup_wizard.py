@@ -282,3 +282,57 @@ def test_wait_for_imessage_first_message_greets_back(monkeypatch):
     assert identity.sent[0]["conversation_id"] == "imconv-123"
     assert "@agent" in identity.sent[0]["text"]
     assert identity.marked_read == ["imconv-123"]
+
+
+def test_sms_opt_in_qr_uses_smsto_scheme(monkeypatch):
+    """The summary's SMS opt-in QR encodes SMSTO:<number>:START — scanning it
+    drafts the START text that unlocks outbound SMS in one tap."""
+    identity = types.SimpleNamespace(
+        agent_handle="agent",
+        email_address="agent@inkbox.ai",
+        mailbox=None,
+        phone_number=types.SimpleNamespace(
+            number="+16614031457",
+            type="local",
+            sms_status=None,
+        ),
+    )
+
+    captured = {}
+    # capture the payload handed to the QR renderer; return True so the
+    # plain-text fallback line is skipped
+    monkeypatch.setattr(setup_wizard, "_show_qr",
+                        lambda data: captured.update(payload=data) or True)
+
+    setup_wizard._print_agent_summary(identity)
+
+    assert captured["payload"] == "SMSTO:+16614031457:START"
+
+
+def test_connect_qr_uses_smsto_scheme(monkeypatch):
+    """The scan-to-connect QR encodes SMSTO:<number>:<command> (servers PR #234) —
+    scanners draft that far more reliably than a raw sms: link."""
+    from datetime import datetime, timedelta, timezone
+
+    identity = _FakeIMessageIdentity(enabled=True)
+    client = _FakeIMessageClient(identity)
+    identity._inbox = [
+        types.SimpleNamespace(
+            id="im-1",
+            direction="inbound",
+            conversation_id="imconv-1",
+            remote_number="+15555550101",
+            created_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+        ),
+    ]
+
+    captured = {}
+    # capture the payload handed to the QR renderer; return True so the
+    # plain-text fallback line is skipped
+    monkeypatch.setattr(setup_wizard, "_show_qr",
+                        lambda data: captured.update(payload=data) or True)
+    monkeypatch.setattr(setup_wizard.time, "sleep", lambda _s: None)
+
+    setup_wizard._wait_for_imessage_first_message(client, identity, "agent")
+
+    assert captured["payload"] == "SMSTO:+15550009999:connect @agent"
