@@ -56,7 +56,7 @@ class _FakeBridge:
         self.ran = False
         self.closed = False
 
-    async def run(self, *, inkbox_ws, on_agent_consult):
+    async def run(self, *, inkbox_ws, on_agent_consult, on_post_call_actions, on_call_ended):
         self.ran = True
 
     async def close(self):

@@ -143,7 +143,12 @@ These match only when the whole message is exactly the command, so "please /clea
 
 Calls have two modes, chosen per call:
 
-- **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and only reaches into Claude Code — via the `consult_claude_code` tool — when you ask for real work; that consult runs in the *same* contact-keyed session as your SMS/iMessage, and its answer is spoken back in the model's own voice. Enable it in `inkbox-claude setup` (it validates your OpenAI key live) or via the `INKBOX_REALTIME_*` env vars below.
+- **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and has these tools:
+  - `consult_claude_code` — do real work *now* in the project; runs in the *same* contact-keyed session as your SMS/iMessage and its answer is spoken back.
+  - `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action` — queue, change, or cancel work to run *after* you hang up.
+  - `hang_up_call` — two-step (say goodbye, then end the call).
+
+  When the call ends, queued actions run in your session (and any plain "reflect on the call" follow-up if none were queued) — so "after we hang up, open a PR and text me" actually happens. Enable it in `inkbox-claude setup` (it validates your OpenAI key live) or via the `INKBOX_REALTIME_*` env vars below.
 - **Inkbox STT/TTS** (default / fallback): Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Claude's replies are spoken back. The bridge falls back to this automatically if Realtime is off or OpenAI can't be reached (unless `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS=false`).
 
 ## Config reference

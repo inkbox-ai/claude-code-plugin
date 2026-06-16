@@ -75,6 +75,48 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 logger = logging.getLogger(__name__)
 
+
+def _format_transcript(transcript: Any, limit: int = 30) -> str:
+    """Render the last ``limit`` (role, text) turns as plain lines."""
+    rows = list(transcript or [])[-limit:]
+    return "\n".join(f"  {role}: {text}" for role, text in rows)
+
+
+def _post_call_prompt(actions: List[Dict[str, str]], transcript: Any) -> str:
+    """Build the Claude Code prompt that executes queued after-call work."""
+    action_lines = "\n".join(
+        f"  {i}. {a.get('action', '')}"
+        + (f" — {a.get('details')}" if a.get("details") else "")
+        for i, a in enumerate(actions or [], start=1)
+    )
+    convo = _format_transcript(transcript)
+    parts = [
+        "[voice call ended] You were just on a phone call with your operator and "
+        "agreed to do this work after the call. Do the actions that are still needed:",
+        action_lines or "  (none)",
+        "",
+        "Reconcile against the transcript first — skip anything already done or "
+        "canceled on the call. Use your tools to actually perform the work; if you "
+        "need to reach the operator, use the Inkbox messaging tools.",
+    ]
+    if convo:
+        parts += ["", "Recent call transcript:", convo]
+    return "\n".join(parts)
+
+
+def _call_ended_prompt(transcript: Any) -> str:
+    """Build the Claude Code prompt for a no-actions post-call reflection."""
+    convo = _format_transcript(transcript)
+    parts = [
+        "[voice call ended] Your phone call with the operator just ended. If you "
+        "committed to anything during it (open a PR, run a task, send a summary), "
+        "do that now with your tools. If there's nothing to do, do nothing.",
+    ]
+    if convo:
+        parts += ["", "Recent call transcript:", convo]
+    return "\n".join(parts)
+
+
 WEBHOOK_DEDUP_TTL_SECONDS = 300
 SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
 # Inbound SMS carrier keywords handled entirely by the Inkbox server;
@@ -498,8 +540,26 @@ class InkboxGateway:
                     # Route the model's request into the caller's shared session.
                     return await self.sessions.get(chat_id).run_consult(query)
 
+                async def _post_call(actions: List[Dict[str, str]], transcript: Any) -> None:
+                    # Run the queued after-call work in the caller's session. The
+                    # text reply is discarded; side effects (emails, edits, PRs)
+                    # happen via Claude's tools during the turn.
+                    prompt = _post_call_prompt(actions, transcript)
+                    await self.sessions.get(chat_id).run_consult(prompt)
+
+                async def _call_ended(transcript: Any) -> None:
+                    # No queued actions: let Claude reflect and do any follow-up
+                    # it committed to on the call. Stays silent if nothing to do.
+                    prompt = _call_ended_prompt(transcript)
+                    await self.sessions.get(chat_id).run_consult(prompt)
+
                 try:
-                    await bridge.run(inkbox_ws=ws, on_agent_consult=_consult)
+                    await bridge.run(
+                        inkbox_ws=ws,
+                        on_agent_consult=_consult,
+                        on_post_call_actions=_post_call,
+                        on_call_ended=_call_ended,
+                    )
                 except Exception:
                     logger.exception("[bridge] realtime call failed: %s", call_id)
                 finally:

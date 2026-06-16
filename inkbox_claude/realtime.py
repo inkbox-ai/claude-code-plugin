@@ -22,8 +22,10 @@ the gateway falls back to Inkbox STT/TTS (see ``_handle_call_ws``).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
@@ -49,14 +51,26 @@ AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
 INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 
 CONSULT_TOOL_NAME = "consult_claude_code"
+POST_CALL_ACTION_TOOL_NAME = "register_post_call_action"
+EDIT_POST_CALL_ACTION_TOOL_NAME = "edit_post_call_action"
+DELETE_POST_CALL_ACTION_TOOL_NAME = "delete_post_call_action"
+HANG_UP_CALL_TOOL_NAME = "hang_up_call"
 
 DEFAULT_CONSULT_TIMEOUT_S = 120.0
 DEFAULT_CONNECT_TIMEOUT_S = 8.0
+# hang_up_call is two-step: a second call within this window actually hangs up.
+HANGUP_CONFIRM_WINDOW_S = 60.0
+# Brief grace so the model's spoken goodbye reaches the caller before we drop.
+HANGUP_CLOSE_DELAY_S = 2.0
 
 
 # A consult takes (query, recent_transcript) and returns Claude's spoken-
 # friendly answer. The gateway wires this to the caller's ContactSession.
 AgentConsultCallback = Callable[[str, List[Tuple[str, str]]], Awaitable[str]]
+# After the call ends with queued actions: (actions, transcript) → run them.
+PostCallActionsCallback = Callable[[List[Dict[str, str]], List[Tuple[str, str]]], Awaitable[None]]
+# After a call with no queued actions: (transcript) → reflect / follow up.
+CallEndedCallback = Callable[[List[Tuple[str, str]]], Awaitable[None]]
 
 
 # ----------------------------------------------------------------------
@@ -96,11 +110,16 @@ class RealtimeCallMeta:
 @dataclass
 class _BridgeState:
     transcript: List[Tuple[str, str]] = field(default_factory=list)
+    # Work the model asked to run after the call: [{"action", "details"}].
+    post_call_actions: List[Dict[str, str]] = field(default_factory=list)
     closed: bool = False
     greeting_triggered: bool = False
     # Inkbox-assigned stream id from the `start` event; echoed on outbound
     # media / audio_done frames.
     stream_id: Optional[str] = None
+    # Monotonic time the model first armed hang_up_call. A second call within
+    # HANGUP_CONFIRM_WINDOW_S performs the real hangup. None = not armed.
+    hangup_armed_at: Optional[float] = None
     # In-flight consult dispatches. The consult runs a full Claude Code turn
     # (seconds), so it is dispatched as a background task to keep the
     # OpenAI→Inkbox audio pump flowing; tracked here so call teardown can
@@ -128,14 +147,24 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         "Use natural, concise spoken replies — usually one or two short sentences.",
         "You are a voice; do not read out code, file paths, diffs, or logs verbatim.",
         "",
-        f"To do any real work in the project ({meta.project_dir or 'the working directory'}) "
+        f"To do real work NOW in the project ({meta.project_dir or 'the working directory'}) "
         f"— read or edit files, run commands or tests, check git, search the codebase — "
-        f"call the {CONSULT_TOOL_NAME} tool with a plain-English request. It runs the "
-        "Claude Code agent in the caller's ongoing conversation and returns a "
-        "spoken-friendly answer; read that answer back in your own voice.",
+        f"call {CONSULT_TOOL_NAME} with a plain-English request. It runs the Claude Code "
+        "agent in the caller's ongoing conversation and returns a spoken-friendly answer; "
+        "read that answer back in your own voice.",
+        f"If the caller wants work done AFTER the call (or accepts a deferral), call "
+        f"{POST_CALL_ACTION_TOOL_NAME} to queue it. Tell them it's queued for after the "
+        "call; do not claim it is already done.",
+        f"If the caller changes or cancels queued after-call work, call "
+        f"{EDIT_POST_CALL_ACTION_TOOL_NAME} or {DELETE_POST_CALL_ACTION_TOOL_NAME} with "
+        f"the action_index returned when it was queued. If {CONSULT_TOOL_NAME} already "
+        f"did the work a queued action describes, delete that action so it isn't repeated.",
+        f"When the caller says goodbye or the conversation is clearly done, call "
+        f"{HANG_UP_CALL_TOOL_NAME}: the first call arms hangup and asks you to say a short "
+        "goodbye; after the goodbye, call it once more to actually end the call.",
         f"Do NOT call {CONSULT_TOOL_NAME} for greetings, small talk, or questions you "
         "can answer directly. Use it whenever the caller wants something done in the code.",
-        "While the tool runs you may say a brief 'one moment' so the caller isn't left in silence.",
+        "While a tool runs you may say a brief 'one moment' so the caller isn't left in silence.",
     ]
     if additional.strip():
         lines += ["", additional.strip()]
@@ -182,6 +211,107 @@ def _consult_tool_schema() -> Dict[str, Any]:
     }
 
 
+def _post_call_action_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": POST_CALL_ACTION_TOOL_NAME,
+        "description": (
+            "Queue work for Claude Code to do AFTER this call ends — e.g. open a "
+            "PR, run a long task, email/text the caller a summary. Tell the caller "
+            "it's queued; do NOT claim it is already done."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Plain-English task for Claude Code. Include the outcome wanted.",
+                },
+                "details": {
+                    "type": "string",
+                    "description": "Optional extra context, constraints, or draft text.",
+                },
+            },
+            "required": ["action"],
+        },
+    }
+
+
+def _edit_post_call_action_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": EDIT_POST_CALL_ACTION_TOOL_NAME,
+        "description": (
+            "Edit a queued after-call action by its one-based action_index "
+            "(returned by register_post_call_action) when the caller changes it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action_index": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "One-based index of the queued action to edit.",
+                },
+                "action": {
+                    "type": "string",
+                    "description": "Replacement task. Omit to keep the current task.",
+                },
+                "details": {
+                    "type": "string",
+                    "description": "Replacement details. Empty string clears details.",
+                },
+            },
+            "required": ["action_index"],
+        },
+    }
+
+
+def _delete_post_call_action_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": DELETE_POST_CALL_ACTION_TOOL_NAME,
+        "description": (
+            "Delete a queued after-call action by its one-based action_index "
+            "when the caller cancels it or it's already been handled."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action_index": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "One-based index of the queued action to delete.",
+                },
+            },
+            "required": ["action_index"],
+        },
+    }
+
+
+def _hang_up_call_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "name": HANG_UP_CALL_TOOL_NAME,
+        "description": (
+            "End the live phone call. TWO-STEP: the first call does NOT hang up — "
+            "it prompts you to say a short goodbye. After the goodbye, call "
+            "hang_up_call again to actually end the call. Use only when the caller "
+            "asks to hang up, says goodbye, or the conversation is clearly complete."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Optional short reason for ending the call.",
+                },
+            },
+            "required": [],
+        },
+    }
+
+
 # ----------------------------------------------------------------------
 # Bridge lifecycle
 # ----------------------------------------------------------------------
@@ -206,12 +336,21 @@ class OpenedRealtimeBridge:
     meta: RealtimeCallMeta
     _closed: bool = False
 
-    async def run(self, *, inkbox_ws: Any, on_agent_consult: AgentConsultCallback) -> None:
+    async def run(
+        self,
+        *,
+        inkbox_ws: Any,
+        on_agent_consult: AgentConsultCallback,
+        on_post_call_actions: PostCallActionsCallback,
+        on_call_ended: CallEndedCallback,
+    ) -> None:
         """Bridge the open OpenAI session to ``inkbox_ws`` for the whole call.
 
         Args:
             inkbox_ws (Any): The accepted Inkbox call WebSocket (raw media).
             on_agent_consult (AgentConsultCallback): Runs a consult and returns text.
+            on_post_call_actions (PostCallActionsCallback): Runs queued actions after hangup.
+            on_call_ended (CallEndedCallback): Runs a follow-up reflection when no actions queued.
 
         Returns:
             None: Returns when either side closes the socket.
@@ -243,6 +382,9 @@ class OpenedRealtimeBridge:
             state.closed = True
             await _cancel_consult_tasks(state)
             await self.close()
+
+        # After teardown: run queued after-call work, or a follow-up reflection.
+        await _dispatch_post_call(state, on_post_call_actions, on_call_ended)
 
     async def close(self) -> None:
         if self._closed:
@@ -354,7 +496,13 @@ async def _send_session_update(
                     "voice": config.voice,
                 },
             },
-            "tools": [_consult_tool_schema()],
+            "tools": [
+                _consult_tool_schema(),
+                _post_call_action_tool_schema(),
+                _edit_post_call_action_tool_schema(),
+                _delete_post_call_action_tool_schema(),
+                _hang_up_call_tool_schema(),
+            ],
             "tool_choice": "auto",
         },
     }
@@ -441,6 +589,7 @@ async def _openai_to_inkbox_pump(
         dispatched.add(cid)
         coro = _dispatch_tool_call(
             openai_ws=openai_ws,
+            inkbox_ws=inkbox_ws,
             call_id=cid,
             name=entry.get("name") or "",
             arguments_json=entry.get("args") or "{}",
@@ -559,6 +708,7 @@ async def _openai_to_inkbox_pump(
 async def _dispatch_tool_call(
     *,
     openai_ws: Any,
+    inkbox_ws: Any,
     call_id: str,
     name: str,
     arguments_json: str,
@@ -566,12 +716,28 @@ async def _dispatch_tool_call(
     config: RealtimeConfig,
     on_agent_consult: AgentConsultCallback,
 ) -> None:
-    """Handle a function call from the Realtime model (only the consult tool)."""
+    """Handle a function call from the Realtime model.
+
+    Dispatches the five call tools: consult, register/edit/delete post-call
+    action, and the two-step hang_up_call.
+    """
     try:
         args = json.loads(arguments_json or "{}")
     except (TypeError, ValueError):
         args = {}
 
+    if name == POST_CALL_ACTION_TOOL_NAME:
+        await _handle_register_action(openai_ws, call_id, args, state)
+        return
+    if name == EDIT_POST_CALL_ACTION_TOOL_NAME:
+        await _handle_edit_action(openai_ws, call_id, args, state)
+        return
+    if name == DELETE_POST_CALL_ACTION_TOOL_NAME:
+        await _handle_delete_action(openai_ws, call_id, args, state)
+        return
+    if name == HANG_UP_CALL_TOOL_NAME:
+        await _handle_hang_up(openai_ws, inkbox_ws, call_id, args, state)
+        return
     if name != CONSULT_TOOL_NAME:
         await _submit_tool_result(
             openai_ws, call_id, {"error": f"Tool '{name}' is not available on calls."}
@@ -616,10 +782,166 @@ async def _dispatch_tool_call(
     })
 
 
-async def _submit_tool_result(
-    openai_ws: Any, call_id: str, output: Dict[str, Any]
+async def _handle_register_action(
+    openai_ws: Any, call_id: str, args: Dict[str, Any], state: _BridgeState
 ) -> None:
-    """Submit a function_call_output and trigger the model to speak the result."""
+    """Queue an after-call action; the model is told it's queued, not done."""
+    action = (args.get("action") or "").strip()
+    if not action:
+        await _submit_tool_result(openai_ws, call_id, {"error": "missing action argument"})
+        return
+    state.post_call_actions.append({"action": action, "details": (args.get("details") or "").strip()})
+    await _submit_tool_result(openai_ws, call_id, {
+        "status": "queued",
+        "action_index": len(state.post_call_actions),
+        "action_count": len(state.post_call_actions),
+        "message": "Tell the caller the action is queued for after the call; do not claim it is done.",
+    })
+
+
+async def _handle_edit_action(
+    openai_ws: Any, call_id: str, args: Dict[str, Any], state: _BridgeState
+) -> None:
+    """Edit a queued action in place by its one-based index."""
+    index = _action_index(args)
+    if index < 1 or index > len(state.post_call_actions):
+        await _submit_tool_result(openai_ws, call_id, {
+            "error": "invalid action_index", "action_count": len(state.post_call_actions),
+        })
+        return
+    if "action" not in args and "details" not in args:
+        await _submit_tool_result(openai_ws, call_id, {"error": "missing action or details argument"})
+        return
+    queued = state.post_call_actions[index - 1]
+    if "action" in args:
+        new_action = (args.get("action") or "").strip()
+        if not new_action:
+            await _submit_tool_result(openai_ws, call_id, {"error": "action cannot be empty"})
+            return
+        queued["action"] = new_action
+    if "details" in args:
+        queued["details"] = (args.get("details") or "").strip()
+    await _submit_tool_result(openai_ws, call_id, {
+        "status": "updated", "action_index": index, "action": queued,
+        "message": "If the caller needs to know, confirm briefly the queued work was changed.",
+    })
+
+
+async def _handle_delete_action(
+    openai_ws: Any, call_id: str, args: Dict[str, Any], state: _BridgeState
+) -> None:
+    """Remove a queued action by its one-based index."""
+    index = _action_index(args)
+    if index < 1 or index > len(state.post_call_actions):
+        await _submit_tool_result(openai_ws, call_id, {
+            "error": "invalid action_index", "action_count": len(state.post_call_actions),
+        })
+        return
+    deleted = state.post_call_actions.pop(index - 1)
+    await _submit_tool_result(openai_ws, call_id, {
+        "status": "deleted", "deleted_action": deleted,
+        "action_count": len(state.post_call_actions),
+        "message": "If the caller needs to know, confirm briefly it was canceled.",
+    })
+
+
+async def _handle_hang_up(
+    openai_ws: Any, inkbox_ws: Any, call_id: str, args: Dict[str, Any], state: _BridgeState
+) -> None:
+    """Two-step hangup: arm + goodbye, then drop the line on the second call."""
+    if inkbox_ws is None:
+        await _submit_tool_result(openai_ws, call_id, {"error": "hangup unavailable without Inkbox websocket"})
+        return
+
+    now = time.monotonic()
+    armed = state.hangup_armed_at
+    # First attempt (or a stale arm past the window) → arm and say goodbye
+    # rather than dropping the caller mid-farewell.
+    if armed is None or (now - armed) > HANGUP_CONFIRM_WINDOW_S:
+        state.hangup_armed_at = now
+        await _submit_tool_result(openai_ws, call_id, {
+            "status": "confirm_goodbye",
+            "message": (
+                "Don't hang up yet. Say a brief, natural goodbye now, then call "
+                "hang_up_call once more to actually end the call."
+            ),
+        })
+        return
+
+    # Second attempt within the window → perform the real hangup.
+    reason = (args.get("reason") or "").strip()
+    hangup_frame: Dict[str, Any] = {"event": "hangup"}
+    if reason:
+        hangup_frame["reason"] = reason
+    if state.stream_id:
+        hangup_frame["stream_id"] = state.stream_id
+    # Don't ask the model to speak again — we're ending the call.
+    await _submit_tool_result(
+        openai_ws, call_id,
+        {"status": "hangup_requested", "reason": reason, "message": "The call is ending now."},
+        create_response=False,
+    )
+    try:
+        # Let the spoken goodbye land before we drop the carrier leg.
+        await asyncio.sleep(HANGUP_CLOSE_DELAY_S)
+        await inkbox_ws.send_str(json.dumps(hangup_frame))
+    except Exception as exc:
+        logger.debug("[realtime] hangup frame send failed: %s", exc)
+    state.closed = True
+    await _maybe_close_ws(inkbox_ws)
+    await _maybe_close_ws(openai_ws)
+
+
+def _action_index(args: Dict[str, Any]) -> int:
+    try:
+        return int(args.get("action_index"))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _dispatch_post_call(
+    state: _BridgeState,
+    on_post_call_actions: PostCallActionsCallback,
+    on_call_ended: CallEndedCallback,
+) -> None:
+    """Run exactly one follow-up after the call: queued actions, else a reflection."""
+    if state.post_call_actions:
+        try:
+            await on_post_call_actions(list(state.post_call_actions), list(state.transcript))
+        except Exception as exc:
+            logger.warning("[realtime] post-call action dispatch failed: %s", exc)
+    else:
+        try:
+            await on_call_ended(list(state.transcript))
+        except Exception as exc:
+            logger.warning("[realtime] call-ended dispatch failed: %s", exc)
+
+
+async def _maybe_close_ws(ws: Any) -> None:
+    """Close a WS whether its close() is sync or a coroutine."""
+    close = getattr(ws, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        pass
+
+
+async def _submit_tool_result(
+    openai_ws: Any, call_id: str, output: Dict[str, Any], *, create_response: bool = True
+) -> None:
+    """Submit a function_call_output and (optionally) prompt the model to speak.
+
+    Args:
+        openai_ws (Any): The OpenAI Realtime WebSocket.
+        call_id (str): The function call id being answered.
+        output (dict): The tool result payload.
+        create_response (bool): Whether to ask the model to respond afterward.
+            False on hangup, where we don't want another spoken turn.
+    """
     try:
         await openai_ws.send_str(json.dumps({
             "type": "conversation.item.create",
@@ -629,6 +951,8 @@ async def _submit_tool_result(
                 "output": json.dumps(output),
             },
         }))
+        if not create_response:
+            return
         # Bare response.create — let the session's audio settings apply (GA
         # rejects a modalities field here).
         await openai_ws.send_str(json.dumps({"type": "response.create"}))
