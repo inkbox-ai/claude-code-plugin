@@ -13,6 +13,10 @@ dependencies = [
 [project.scripts]
 inkbox-claude = "inkbox_claude.cli:main"
 
+[tool.setuptools.package-data]
+# Ship the bundled Claude Code avatar attached to agents during setup.
+inkbox_claude = ["assets/*.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

@@ -399,3 +399,54 @@ def test_configure_realtime_skips_without_phone(tmp_path, monkeypatch):
     setup_wizard._configure_realtime_calls(types.SimpleNamespace(phone_number=None))
     # No phone → returns before writing anything to this run's .env file.
     assert not env_file.exists()
+
+
+# ----------------------------------------------------------------------
+# Agent avatar
+# ----------------------------------------------------------------------
+
+
+def test_avatar_auto_attached_on_signup(monkeypatch):
+    # Self-signup agents get the avatar with no prompt.
+    uploaded = {}
+    monkeypatch.setattr(setup_wizard, "_upload_avatar",
+                        lambda b, k, h, img: uploaded.update(handle=h, n=len(img)) or (True, "ok"))
+    # Must not prompt or probe for an existing avatar on the signup path.
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prompt on signup")))
+    monkeypatch.setattr(setup_wizard, "_identity_has_avatar",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no probe on signup")))
+
+    identity = types.SimpleNamespace(agent_handle="dev-agent")
+    setup_wizard._configure_avatar("https://inkbox.ai", "ApiKey_x", identity, is_signup=True)
+    assert uploaded["handle"] == "dev-agent" and uploaded["n"] > 0
+
+
+def test_avatar_skipped_when_existing_agent_already_has_one(monkeypatch):
+    monkeypatch.setattr(setup_wizard, "_identity_has_avatar", lambda *a, **k: True)
+    monkeypatch.setattr(setup_wizard, "_upload_avatar",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not upload")))
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
+    identity = types.SimpleNamespace(agent_handle="dev-agent")
+    setup_wizard._configure_avatar("https://inkbox.ai", "ApiKey_x", identity, is_signup=False)
+
+
+def test_avatar_offered_and_uploaded_for_existing_agent_without_one(monkeypatch):
+    uploaded = {}
+    monkeypatch.setattr(setup_wizard, "_identity_has_avatar", lambda *a, **k: False)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
+    monkeypatch.setattr(setup_wizard, "_upload_avatar",
+                        lambda b, k, h, img: uploaded.update(handle=h) or (True, "ok"))
+    identity = types.SimpleNamespace(agent_handle="dev-agent")
+    setup_wizard._configure_avatar("https://inkbox.ai", "ApiKey_x", identity, is_signup=False)
+    assert uploaded["handle"] == "dev-agent"
+
+
+def test_avatar_declined_for_existing_agent(monkeypatch):
+    monkeypatch.setattr(setup_wizard, "_identity_has_avatar", lambda *a, **k: False)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: False)
+    monkeypatch.setattr(setup_wizard, "_upload_avatar",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("declined → no upload")))
+    identity = types.SimpleNamespace(agent_handle="dev-agent")
+    setup_wizard._configure_avatar("https://inkbox.ai", "ApiKey_x", identity, is_signup=False)

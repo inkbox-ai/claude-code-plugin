@@ -39,6 +39,9 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 INKBOX_REQUIREMENTS = ("inkbox>=0.4.7", "aiohttp>=3.9")
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
+# Bundled avatar attached to the agent's Inkbox contact card during setup.
+_AVATAR_PATH = Path(__file__).resolve().parent / "assets" / "claude_code_avatar.png"
+
 
 # ----------------------------------------------------------------------
 # Terminal output (no host to borrow these from — keep them tiny)
@@ -556,6 +559,128 @@ def _wait_for_sms_opt_in(api_key: str, base_url: str, phone: Any, Inkbox: Any) -
         sys.stdout.flush()
         print()
         print_warning(f"  Skipped. Text START to {phone.number} anytime to enable outbound SMS.")
+
+
+# ----------------------------------------------------------------------
+# Agent avatar
+# ----------------------------------------------------------------------
+
+
+async def _identity_has_avatar_async(base_url: str, api_key: str, handle: str) -> bool | None:
+    """Check whether an identity already has a contact-card avatar.
+
+    Args:
+        base_url (str): Inkbox API base URL.
+        api_key (str): Inkbox API key (agent-scoped or admin).
+        handle (str): Agent handle to check.
+
+    Returns:
+        bool | None: True/False, or None if it couldn't be determined.
+    """
+    import aiohttp
+
+    url = f"{base_url.rstrip('/')}/api/v1/identities/{handle}/avatar"
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers={"X-API-Key": api_key}) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status == 404:
+                    return False
+                return None
+    except Exception:
+        return None
+
+
+async def _upload_avatar_async(
+    base_url: str, api_key: str, handle: str, image: bytes
+) -> tuple[bool, str]:
+    """PUT the avatar image to the identity's avatar endpoint.
+
+    Args:
+        base_url (str): Inkbox API base URL.
+        api_key (str): Inkbox API key (agent-scoped or admin).
+        handle (str): Agent handle to attach the avatar to.
+        image (bytes): PNG bytes to upload.
+
+    Returns:
+        tuple[bool, str]: (ok, human-readable detail).
+    """
+    import aiohttp
+
+    url = f"{base_url.rstrip('/')}/api/v1/identities/{handle}/avatar"
+    timeout = aiohttp.ClientTimeout(total=30)
+    form = aiohttp.FormData()
+    form.add_field("file", image, filename="claude_code_avatar.png", content_type="image/png")
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.put(url, headers={"X-API-Key": api_key}, data=form) as resp:
+                if resp.status in (200, 201):
+                    return True, "ok"
+                return False, f"HTTP {resp.status} {(await resp.text())[:200]}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _identity_has_avatar(base_url: str, api_key: str, handle: str) -> bool | None:
+    try:
+        return asyncio.run(_identity_has_avatar_async(base_url, api_key, handle))
+    except RuntimeError:
+        return None
+
+
+def _upload_avatar(base_url: str, api_key: str, handle: str, image: bytes) -> tuple[bool, str]:
+    try:
+        return asyncio.run(_upload_avatar_async(base_url, api_key, handle, image))
+    except RuntimeError as exc:
+        return False, f"could not run avatar upload from this setup process: {exc}"
+
+
+def _configure_avatar(base_url: str, api_key: str, identity: Any, *, is_signup: bool) -> None:
+    """Attach the bundled Claude Code avatar to the agent's contact card.
+
+    Self-signup agents get it automatically (they're brand new). For an
+    existing agent we only offer it when no avatar is set yet, and never
+    overwrite one. Best-effort: any failure degrades to a warning and never
+    blocks setup.
+
+    Args:
+        base_url (str): Inkbox API base URL.
+        api_key (str): The agent's Inkbox API key the wizard saved.
+        identity (Any): The configured identity (needs ``agent_handle``).
+        is_signup (bool): True when this agent was just created via self-signup.
+
+    Returns:
+        None
+    """
+    handle = getattr(identity, "agent_handle", "") or ""
+    if not handle or not _AVATAR_PATH.exists():
+        return
+
+    if not is_signup:
+        # Existing agent: leave an existing avatar alone; only offer when none.
+        if _identity_has_avatar(base_url, api_key, handle) is True:
+            return
+        print()
+        print(color("  --- Agent avatar ---", Colors.CYAN))
+        print_info("  This agent has no avatar on its Inkbox contact card.")
+        if not prompt_yes_no("  Add the Claude Code avatar?", True):
+            print_info("  Skipped. You can set an avatar later in the Inkbox console.")
+            return
+
+    try:
+        image = _AVATAR_PATH.read_bytes()
+    except Exception as exc:
+        print_warning(f"  Could not read the bundled avatar: {exc}")
+        return
+
+    ok, detail = _upload_avatar(base_url, api_key, handle, image)
+    if ok:
+        print_success("  Attached the Claude Code avatar to this agent.")
+    else:
+        print_warning(f"  Could not attach the avatar: {detail}")
+        print_info("  You can set one later in the Inkbox console.")
 
 
 # ----------------------------------------------------------------------
@@ -1593,6 +1718,11 @@ def interactive_setup() -> None:
     _save("INKBOX_IDENTITY", identity.agent_handle)
     if base_url != INKBOX_BASE_URL_DEFAULT or _env("INKBOX_BASE_URL"):
         _save("INKBOX_BASE_URL", base_url)
+
+    # Right after the key is set: give the agent the Claude Code avatar.
+    # Auto for a freshly self-signed-up agent; opt-in for an existing one
+    # that has no avatar yet (never overwrites an existing avatar).
+    _configure_avatar(base_url, api_key, identity, is_signup=not has_key)
 
     # Authorization is enforced server-side by Inkbox contact rules; there is
     # no second local allowlist to keep in sync.
