@@ -1,8 +1,22 @@
-# Claude Code Inkbox Bridge
+<p align="center">
+  <img src="assets/claude_code_iphone_avatar.png" alt="Claude Code, now with a phone" width="220">
+</p>
 
-[Inkbox](https://inkbox.ai) bridge for [Claude Code](https://claude.com/claude-code). It gives a Claude Code agent its own Inkbox identity — mailbox, phone number, SMS/MMS, iMessage, and voice calls — so you can walk away from the keyboard and keep talking to your agent from your phone.
+<h1 align="center">Claude Code Inkbox Bridge</h1>
 
-Status: **prototype**, but installable in one command and runnable as a boot service. Sibling of [hermes-agent-plugin](https://github.com/inkbox-ai/hermes-agent-plugin), which does the same for Hermes Agent.
+<p align="center">
+  <b>Give your Claude Code agent its own phone number, mailbox, and voice.</b><br>
+  Walk away from the keyboard and keep working with it over SMS, iMessage, email, and calls —<br>
+  powered by <a href="https://inkbox.ai">Inkbox</a>, driving a real <a href="https://claude.com/claude-code">Claude Code</a> session in your project.
+</p>
+
+<p align="center">
+  <code>SMS / MMS</code> · <code>iMessage</code> · <code>Email</code> · <code>Voice</code> · <code>Media</code>
+</p>
+
+---
+
+Status: **prototype** — installable in one command and runnable as a boot service. Sibling of [hermes-agent-plugin](https://github.com/inkbox-ai/hermes-agent-plugin), which does the same for Hermes Agent.
 
 ## Get started — one command
 
@@ -188,12 +202,16 @@ Calls have two modes, chosen per call:
 
 ## Tools exposed to Claude
 
-- `inkbox_whoami`
-- `inkbox_send_email`
-- `inkbox_send_sms`
-- `inkbox_send_imessage`
-- `inkbox_list_text_conversations`
-- `inkbox_get_text_conversation`
+The agent reaches you (or third parties) through an in-process MCP server:
+
+- `inkbox_whoami` — its own identity: handle, mailbox, phone, iMessage status.
+- `inkbox_send_email` — send email; attach local files with `attachment_paths`.
+- `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
+- `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
+- `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
+- `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
+
+On a live call, the OpenAI Realtime voice agent additionally gets `consult_claude_code`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
 ## Smoke test
 
