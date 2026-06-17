@@ -375,6 +375,22 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
+    @tool(
+        "inkbox_delete_contact",
+        "Remove a contact from the address book by its contact id. Look it up "
+        "first to confirm you have the right person.",
+        {"contact_id": str},
+    )
+    async def inkbox_delete_contact(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            client.contacts.delete(str(args["contact_id"]))
+            return {"deleted": str(args["contact_id"])}
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
     tools = [
         inkbox_whoami,
         inkbox_send_email,
@@ -388,6 +404,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_list_contacts,
         inkbox_create_contact,
         inkbox_update_contact,
+        inkbox_delete_contact,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
     tool_names = [
@@ -403,5 +420,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_list_contacts",
         "mcp__inkbox__inkbox_create_contact",
         "mcp__inkbox__inkbox_update_contact",
+        "mcp__inkbox__inkbox_delete_contact",
     ]
     return server, tool_names
