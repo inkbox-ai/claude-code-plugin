@@ -5,18 +5,17 @@
 <h1 align="center">Claude Code Inkbox Bridge</h1>
 
 <p align="center">
-  <b>Give your Claude Code agent its own phone number, mailbox, and voice.</b><br>
-  Walk away from the keyboard and keep working with it over SMS, iMessage, email, and calls —<br>
-  powered by <a href="https://inkbox.ai">Inkbox</a>, driving a real <a href="https://claude.com/claude-code">Claude Code</a> session in your project.
+  <b>Give your Claude Code agent its own Inkbox identity</b> —<br>
+  a mailbox, a phone number for calls and SMS, iMessage, and an internet address —<br>
+  so you can step away from the keyboard and keep working with it from anywhere.<br>
+  <sub>Powered by <a href="https://inkbox.ai">Inkbox</a>, communication infrastructure for AI agents, driving a real <a href="https://claude.com/claude-code">Claude Code</a> session in your project.</sub>
 </p>
 
 <p align="center">
-  <code>SMS / MMS</code> · <code>iMessage</code> · <code>Email</code> · <code>Voice</code> · <code>Media</code>
+  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Media</code>
 </p>
 
 ---
-
-Status: **prototype** — installable in one command and runnable as a boot service. Sibling of [hermes-agent-plugin](https://github.com/inkbox-ai/hermes-agent-plugin), which does the same for Hermes Agent.
 
 ## Get started — one command
 
