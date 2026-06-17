@@ -209,6 +209,8 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
+- `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).
+- `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_export_contact_vcard` — save, edit, and export contacts (vCard 4.0). Reads and writes are filtered server-side to what this identity may see.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_claude_code`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 

@@ -261,6 +261,149 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
+    # ------------------------------------------------------------------
+    # Contacts — the org address book, filtered server-side to what this
+    # identity may see (ported from hermes-agent-plugin's contact-lookup).
+    # ------------------------------------------------------------------
+
+    @tool(
+        "inkbox_lookup_contact",
+        "Reverse-lookup contacts by exactly ONE field. The cheapest way to "
+        "resolve a known email/phone to a person. Pass one of: email, phone, "
+        "email_domain, email_contains, phone_contains.",
+        {"email": str, "phone": str, "email_domain": str,
+         "email_contains": str, "phone_contains": str},
+    )
+    async def inkbox_lookup_contact(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            keys = ("email", "phone", "email_domain", "email_contains", "phone_contains")
+            supplied = {k: str(args[k]) for k in keys if args.get(k)}
+            if len(supplied) != 1:
+                raise ValueError("pass exactly one of: " + ", ".join(keys))
+            return client.contacts.lookup(**supplied)
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_list_contacts",
+        "Search the address book by free text (matches name, company, job "
+        "title, notes). Use for name-based queries like 'find Ada'. "
+        "order is 'recent' or 'name'.",
+        {"q": str, "order": str, "limit": int},
+    )
+    async def inkbox_list_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return client.contacts.list(
+                q=str(args["q"]) if args.get("q") else None,
+                order=str(args["order"]) if args.get("order") else None,
+                limit=int(args.get("limit") or 25),
+            )
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_get_contact",
+        "Fetch one contact's full record (all emails, phones, addresses, notes) "
+        "by its contact id.",
+        {"contact_id": str},
+    )
+    async def inkbox_get_contact(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return client.contacts.get(str(args["contact_id"]))
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_create_contact",
+        "Save a new contact in the address book. Provide any of given_name, "
+        "family_name, preferred_name, company_name, job_title, notes, and "
+        "emails / phones as lists of strings (first entry is marked primary).",
+        {"given_name": str, "family_name": str, "preferred_name": str,
+         "company_name": str, "job_title": str, "notes": str,
+         "emails": list, "phones": list},
+    )
+    async def inkbox_create_contact(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            from inkbox import ContactEmail, ContactPhone
+            emails = [ContactEmail(label=None, value=str(e), is_primary=(i == 0))
+                      for i, e in enumerate(args.get("emails") or [])]
+            phones = [ContactPhone(label=None, value=str(p), is_primary=(i == 0))
+                      for i, p in enumerate(args.get("phones") or [])]
+            return client.contacts.create(
+                given_name=str(args["given_name"]) if args.get("given_name") else None,
+                family_name=str(args["family_name"]) if args.get("family_name") else None,
+                preferred_name=str(args["preferred_name"]) if args.get("preferred_name") else None,
+                company_name=str(args["company_name"]) if args.get("company_name") else None,
+                job_title=str(args["job_title"]) if args.get("job_title") else None,
+                notes=str(args["notes"]) if args.get("notes") else None,
+                emails=emails or None,
+                phones=phones or None,
+            )
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_update_contact",
+        "Update an existing contact by id (look it up first). Only the fields "
+        "you pass change; emails / phones replace the whole list (strings, first "
+        "is primary).",
+        {"contact_id": str, "given_name": str, "family_name": str,
+         "preferred_name": str, "company_name": str, "job_title": str,
+         "notes": str, "emails": list, "phones": list},
+    )
+    async def inkbox_update_contact(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            from inkbox import ContactEmail, ContactPhone
+            # Only forward fields the caller actually supplied (the SDK leaves
+            # omitted fields untouched).
+            kwargs: Dict[str, Any] = {}
+            for field in ("given_name", "family_name", "preferred_name",
+                          "company_name", "job_title", "notes"):
+                if args.get(field):
+                    kwargs[field] = str(args[field])
+            if args.get("emails") is not None and args.get("emails") != "":
+                kwargs["emails"] = [
+                    ContactEmail(label=None, value=str(e), is_primary=(i == 0))
+                    for i, e in enumerate(args.get("emails") or [])
+                ]
+            if args.get("phones") is not None and args.get("phones") != "":
+                kwargs["phones"] = [
+                    ContactPhone(label=None, value=str(p), is_primary=(i == 0))
+                    for i, p in enumerate(args.get("phones") or [])
+                ]
+            return client.contacts.update(str(args["contact_id"]), **kwargs)
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_export_contact_vcard",
+        "Export one contact as a vCard 4.0 string by its contact id.",
+        {"contact_id": str},
+    )
+    async def inkbox_export_contact_vcard(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return {"vcard": client.contacts.vcards.export_vcard(str(args["contact_id"]))}
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
     tools = [
         inkbox_whoami,
         inkbox_send_email,
@@ -270,6 +413,12 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_get_text_conversation,
         inkbox_list_imessage_conversations,
         inkbox_get_imessage_conversation,
+        inkbox_lookup_contact,
+        inkbox_list_contacts,
+        inkbox_get_contact,
+        inkbox_create_contact,
+        inkbox_update_contact,
+        inkbox_export_contact_vcard,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
     tool_names = [
@@ -281,5 +430,11 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_get_text_conversation",
         "mcp__inkbox__inkbox_list_imessage_conversations",
         "mcp__inkbox__inkbox_get_imessage_conversation",
+        "mcp__inkbox__inkbox_lookup_contact",
+        "mcp__inkbox__inkbox_list_contacts",
+        "mcp__inkbox__inkbox_get_contact",
+        "mcp__inkbox__inkbox_create_contact",
+        "mcp__inkbox__inkbox_update_contact",
+        "mcp__inkbox__inkbox_export_contact_vcard",
     ]
     return server, tool_names
