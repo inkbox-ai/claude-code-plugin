@@ -308,21 +308,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return _error(str(exc))
 
     @tool(
-        "inkbox_get_contact",
-        "Fetch one contact's full record (all emails, phones, addresses, notes) "
-        "by its contact id.",
-        {"contact_id": str},
-    )
-    async def inkbox_get_contact(args: Dict[str, Any]) -> Dict[str, Any]:
-        def _run():
-            return client.contacts.get(str(args["contact_id"]))
-
-        try:
-            return _result(await asyncio.to_thread(_run))
-        except Exception as exc:
-            return _error(str(exc))
-
-    @tool(
         "inkbox_create_contact",
         "Save a new contact in the address book. Provide any of given_name, "
         "family_name, preferred_name, company_name, job_title, notes, and "
@@ -390,20 +375,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
-    @tool(
-        "inkbox_export_contact_vcard",
-        "Export one contact as a vCard 4.0 string by its contact id.",
-        {"contact_id": str},
-    )
-    async def inkbox_export_contact_vcard(args: Dict[str, Any]) -> Dict[str, Any]:
-        def _run():
-            return {"vcard": client.contacts.vcards.export_vcard(str(args["contact_id"]))}
-
-        try:
-            return _result(await asyncio.to_thread(_run))
-        except Exception as exc:
-            return _error(str(exc))
-
     tools = [
         inkbox_whoami,
         inkbox_send_email,
@@ -415,10 +386,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_get_imessage_conversation,
         inkbox_lookup_contact,
         inkbox_list_contacts,
-        inkbox_get_contact,
         inkbox_create_contact,
         inkbox_update_contact,
-        inkbox_export_contact_vcard,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
     tool_names = [
@@ -432,9 +401,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_get_imessage_conversation",
         "mcp__inkbox__inkbox_lookup_contact",
         "mcp__inkbox__inkbox_list_contacts",
-        "mcp__inkbox__inkbox_get_contact",
         "mcp__inkbox__inkbox_create_contact",
         "mcp__inkbox__inkbox_update_contact",
-        "mcp__inkbox__inkbox_export_contact_vcard",
     ]
     return server, tool_names
