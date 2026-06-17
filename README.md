@@ -5,14 +5,13 @@
 <h1 align="center">Claude Code Inkbox Bridge</h1>
 
 <p align="center">
-  <b>Give your Claude Code agent its own Inkbox identity</b> —<br>
-  a mailbox, a phone number for calls and SMS, iMessage, and an internet address —<br>
-  so you can step away from the keyboard and keep working with it from anywhere.<br>
-  <sub>Powered by <a href="https://inkbox.ai">Inkbox</a>, communication infrastructure for AI agents, driving a real <a href="https://claude.com/claude-code">Claude Code</a> session in your project.</sub>
+  <b>Give your Claude Code agent its own Inkbox identity:</b><br>
+  a mailbox, iMessage, a phone number for calls and SMS, and an internet address.<br>
+  Step away from the keyboard and keep working with it from anywhere.
 </p>
 
 <p align="center">
-  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Media</code>
+  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Tunnel</code>
 </p>
 
 ---
