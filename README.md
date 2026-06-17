@@ -17,6 +17,13 @@
 
 ---
 
+## Prerequisites
+
+- **Claude Code installed and logged in.** The bridge drives a real Claude Code session, so the `claude` CLI has to be on the machine and authenticated — install it ([claude.com/claude-code](https://claude.com/claude-code)), then either sign in with a Claude Pro/Max subscription or set `ANTHROPIC_API_KEY`. `inkbox-claude doctor` checks for it.
+- **Python 3.10+.** The installer finds one and builds the bridge its own venv.
+- **macOS or Linux.** Boot persistence uses a systemd user unit on Linux and a launchd agent on macOS.
+- **An Inkbox agent** — nothing to set up in advance; the setup wizard self-signs up for you (or takes an existing API key).
+
 ## Get started — one command
 
 This finds a Python 3.10+, installs the bridge in its own venv, puts `inkbox-claude` on your PATH, and runs the setup wizard:
@@ -209,6 +216,8 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
+- `inkbox_lookup_contact` · `inkbox_list_contacts` — resolve and find address-book contacts (reverse-lookup by email/phone, or free-text search by name/company).
+- `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_delete_contact` — save, edit, and remove contacts. Reads and writes are filtered server-side to what this identity may see.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_claude_code`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
