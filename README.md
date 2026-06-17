@@ -1,6 +1,6 @@
-<img src="assets/claude_code_iphone_avatar.png" alt="Claude Code, now with a phone" width="200" align="left">
-
 <h1>Claude Code Inkbox Bridge</h1>
+
+<img src="assets/claude_code_iphone_avatar.png" alt="Claude Code, now with a phone" width="200" align="left">
 
 <p>
   <b>Give your Claude Code agent its own Inkbox identity:</b><br>
