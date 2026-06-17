@@ -3,6 +3,7 @@
 <img src="assets/claude_code_iphone_avatar.png" alt="Claude Code, now with a phone" width="200" align="left">
 
 <p>
+  <br><br>
   <b>Give your Claude Code agent its own Inkbox identity:</b><br>
   a mailbox, iMessage, a phone number for calls and SMS, and an internet address.<br>
   Step away from the keyboard and keep working with it from anywhere.
