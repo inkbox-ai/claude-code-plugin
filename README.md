@@ -1,18 +1,18 @@
-<p align="center">
-  <img src="assets/claude_code_iphone_avatar.png" alt="Claude Code, now with a phone" width="220">
-</p>
+<img src="assets/claude_code_iphone_avatar.png" alt="Claude Code, now with a phone" width="200" align="left">
 
-<h1 align="center">Claude Code Inkbox Bridge</h1>
+<h1>Claude Code Inkbox Bridge</h1>
 
-<p align="center">
+<p>
   <b>Give your Claude Code agent its own Inkbox identity:</b><br>
   a mailbox, iMessage, a phone number for calls and SMS, and an internet address.<br>
   Step away from the keyboard and keep working with it from anywhere.
 </p>
 
-<p align="center">
+<p>
   <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Tunnel</code>
 </p>
+
+<br clear="left">
 
 ---
 
