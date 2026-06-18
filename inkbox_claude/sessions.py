@@ -71,6 +71,12 @@ HealthFn = Callable[[], Awaitable[str]]
 # indicator on this cadence for as long as a turn is running.
 TYPING_REFRESH_SECONDS = 4.0
 
+# Cap on a single stream-json message from the `claude` subprocess. The SDK
+# defaults to 1 MB and kills its message reader if one line exceeds it — a big
+# file read, wide grep, or base64 media payload can blow past that and wedge the
+# session. Give it generous headroom; the buffer is only allocated if actually hit.
+MAX_BUFFER_SIZE = 64 * 1024 * 1024  # 64 MB
+
 
 @dataclass
 class _Turn:
@@ -612,6 +618,14 @@ class ContactSession:
                         self.on_session_id(self.chat_id, message.session_id)
             reply = (final or "\n\n".join(chunks)).strip()
         except Exception as exc:
+            # A failed turn can leave the SDK client wedged — its message reader
+            # dies on errors like an oversized stream-json line, so every later
+            # turn would fail against the same dead client. Drop it (keeping the
+            # resumed session id) so the next turn rebuilds a fresh subprocess
+            # with context intact. An intentional interrupt leaves a healthy
+            # client, so skip the reset there.
+            if not self._interrupting:
+                await self._reset_client()
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.
             if turn.future is not None and not turn.future.done():
@@ -742,6 +756,9 @@ class ContactSession:
             mcp_servers={"inkbox": self.mcp_server},
             can_use_tool=self._can_use_tool,
             resume=self.resume_session_id or None,
+            # Raise the SDK's stream-json line cap so an oversized tool result
+            # doesn't kill the reader and wedge the session (see MAX_BUFFER_SIZE).
+            max_buffer_size=MAX_BUFFER_SIZE,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
@@ -835,6 +852,22 @@ class ContactSession:
 
     async def _reply(self, text: str) -> None:
         await self.send_fn(self.chat_id, text, self.mode, self.reply_meta)
+
+    async def _reset_client(self) -> None:
+        """Tear down the live Claude client so the next turn rebuilds it.
+
+        Called after a turn fails: the SDK's message reader dies on errors like
+        an oversized stream-json line, leaving the client wedged so every later
+        turn fails against it. The resumed session id is kept, so the rebuilt
+        client picks the conversation back up with context intact.
+
+        Returns:
+            None
+        """
+        if self._client is None:
+            return
+        logger.info("[session %s] resetting Claude client after a failed turn", self.chat_id)
+        await self.close()
 
     async def close(self) -> None:
         if self._client is not None:
