@@ -12,8 +12,11 @@ import dataclasses
 import json
 import logging
 import mimetypes
+import secrets
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 try:
     from .media import file_to_email_attachment
@@ -21,9 +24,9 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
-    from .config import INKBOX_WS_PATH
+    from .config import INKBOX_WS_PATH, call_contexts_dir
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_WS_PATH
+    from config import INKBOX_WS_PATH, call_contexts_dir
 
 try:
     from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -80,6 +83,46 @@ def _upload_media_url(identity: Any, path: str) -> str:
         content_type=mimetypes.guess_type(resolved.name)[0],
     )
     return upload.media_url
+
+
+def _append_query_param(raw_url: str, key: str, value: str) -> str:
+    """Append/replace one query param on a URL, preserving the rest. Used to
+    tag the call WS URL with the context token the gateway reads on connect.
+    """
+    parts = urlparse(raw_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query[key] = value
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+
+def _write_call_context(
+    *, purpose: str, opening_message: str, context: str, to_number: str
+) -> str:
+    """Persist an outbound call's purpose/opening for the gateway to load when
+    the call connects, keyed by a fresh opaque token. Mirrors the Hermes
+    plugin's ``inkbox_call_contexts`` handoff.
+
+    Args:
+        purpose (str): Why the agent is placing the call.
+        opening_message (str): Optional exact first line to say on pickup.
+        context (str): Optional extra background for the live session.
+        to_number (str): The E.164 destination (recorded for debugging).
+
+    Returns:
+        str: The token to put on the call WS URL as ``context_token``.
+    """
+    token = secrets.token_urlsafe(18)
+    payload = {
+        "created_at": time.time(),
+        "purpose": purpose,
+        "opening_message": opening_message,
+        "context": context,
+        "to_number": to_number,
+    }
+    (call_contexts_dir() / f"{token}.json").write_text(
+        json.dumps(payload, indent=2) + "\n"
+    )
+    return token
 
 
 def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, List[str]]:
@@ -402,14 +445,23 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "audio bridges to this agent over the running bridge gateway's call-media "
         "WebSocket, so the agent talks the call live (Inkbox STT/TTS, or the "
         "OpenAI Realtime path when enabled). Requires the bridge gateway to be "
-        "running. Pass to_number in E.164, e.g. +15551234567.",
-        {"to_number": str},
+        "running. ALWAYS pass purpose so the live call opens knowing why it's "
+        "calling — without it the voice runtime (especially Realtime) starts with "
+        "no context. Optionally pass opening_message (the exact first line to say) "
+        "and context (extra background). to_number is E.164, e.g. +15551234567.",
+        {"to_number": str, "purpose": str, "opening_message": str, "context": str},
     )
     async def inkbox_place_call(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
             to_number = str(args.get("to_number") or "").strip()
             if not to_number:
                 raise ValueError("to_number is required (E.164, e.g. +15551234567)")
+            purpose = str(args.get("purpose") or "").strip()
+            if not purpose:
+                raise ValueError(
+                    "purpose is required so the live call opens with context — "
+                    "the voice runtime has no other way to know why it's calling"
+                )
             identity = _identity()
             # Reuse the same call-media WebSocket the gateway already serves and
             # registered on this number for inbound calls; otherwise derive it
@@ -426,11 +478,22 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                     "no call-media WebSocket URL available — start the Inkbox "
                     "bridge gateway (it provisions the tunnel + call WS) first"
                 )
+            # Stash purpose/opening to a token file and tag the WS URL with
+            # ?context_token=<token>; the gateway loads it when the call connects
+            # so the live session opens with context (mirrors the Hermes plugin).
+            token = _write_call_context(
+                purpose=purpose,
+                opening_message=str(args.get("opening_message") or "").strip(),
+                context=str(args.get("context") or "").strip(),
+                to_number=to_number,
+            )
+            ws_url = _append_query_param(ws_url, "context_token", token)
             call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
             return {
                 "placed": True,
                 "id": str(getattr(call, "id", "")),
                 "to": to_number,
+                "context_token": token,
                 "status": _json_safe(getattr(call, "status", None)),
             }
 
