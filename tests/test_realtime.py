@@ -1,6 +1,8 @@
 import asyncio
 import json
 
+import aiohttp
+
 from inkbox_claude import realtime
 from inkbox_claude.realtime import (
     CONSULT_TOOL_NAME,
@@ -14,6 +16,7 @@ from inkbox_claude.realtime import (
     _BridgeState,
     _dispatch_post_call,
     _dispatch_tool_call,
+    _openai_to_inkbox_pump,
     _send_session_update,
     build_realtime_instructions,
 )
@@ -267,3 +270,53 @@ def test_post_call_dispatch_reflects_when_no_actions():
 
     asyncio.run(_dispatch_post_call(state, on_actions, on_ended))
     assert seen["transcript"] == [("agent", "bye")]
+
+
+class _FakeOpenAIWS:
+    """Async-iterates a fixed list of OpenAI frames as WS TEXT messages."""
+
+    def __init__(self, frames):
+        self._msgs = [
+            type("Msg", (), {"type": aiohttp.WSMsgType.TEXT, "data": json.dumps(f)})()
+            for f in frames
+        ]
+
+    def __aiter__(self):
+        async def gen():
+            for m in self._msgs:
+                yield m
+        return gen()
+
+
+def test_realtime_transcripts_are_mirrored_into_inkbox():
+    # Raw-media realtime means Inkbox does no STT; the pump must relay each
+    # finalized turn back as a `transcript` event so the call record fills in.
+    openai = _FakeOpenAIWS([
+        {"type": "conversation.item.input_audio_transcription.completed",
+         "transcript": "hey can you check the build"},
+        {"type": "response.output_audio_transcript.done",
+         "transcript": "sure, the build is green"},
+    ])
+    ink = _FakeInkboxWS()
+    state = _BridgeState()
+    state.stream_id = "s1"
+
+    asyncio.run(_openai_to_inkbox_pump(
+        openai_ws=openai,
+        inkbox_ws=ink,
+        state=state,
+        config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
+        on_agent_consult=lambda q, t: (_ for _ in ()).throw(AssertionError("no consult")),
+    ))
+
+    transcripts = [f for f in ink.sent if f.get("event") == "transcript"]
+    assert transcripts == [
+        {"event": "transcript", "party": "remote", "text": "hey can you check the build", "is_final": True},
+        {"event": "transcript", "party": "local", "text": "sure, the build is green", "is_final": True},
+    ]
+    # And still collected in-memory for the post-call reflection.
+    assert state.transcript == [
+        ("caller", "hey can you check the build"),
+        ("agent", "sure, the build is green"),
+    ]

@@ -30,6 +30,7 @@ class _FakeWS:
 class _FakeRequest:
     def __init__(self):
         self.headers = {}  # no X-Call-Context; signature check is off
+        self.query = {}  # no context_token; inbound (no outbound place-call ctx)
 
 
 def test_call_ws_declares_inkbox_stt_tts_headers(monkeypatch):
