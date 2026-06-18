@@ -21,6 +21,11 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
+    from .config import INKBOX_WS_PATH
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from config import INKBOX_WS_PATH
+
+try:
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
     CLAUDE_SDK_AVAILABLE = True
@@ -391,11 +396,55 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
+    @tool(
+        "inkbox_place_call",
+        "Place an outbound phone call from this agent's Inkbox number. The call's "
+        "audio bridges to this agent over the running bridge gateway's call-media "
+        "WebSocket, so the agent talks the call live (Inkbox STT/TTS, or the "
+        "OpenAI Realtime path when enabled). Requires the bridge gateway to be "
+        "running. Pass to_number in E.164, e.g. +15551234567.",
+        {"to_number": str},
+    )
+    async def inkbox_place_call(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            to_number = str(args.get("to_number") or "").strip()
+            if not to_number:
+                raise ValueError("to_number is required (E.164, e.g. +15551234567)")
+            identity = _identity()
+            # Reuse the same call-media WebSocket the gateway already serves and
+            # registered on this number for inbound calls; otherwise derive it
+            # from the identity's tunnel host.
+            phone = identity.phone_number
+            ws_url = str(getattr(phone, "client_websocket_url", "") or "").strip()
+            if not ws_url:
+                tunnel = getattr(identity, "tunnel", None)
+                host = str(getattr(tunnel, "public_host", "") or "").strip()
+                if host:
+                    ws_url = f"wss://{host}{INKBOX_WS_PATH}"
+            if not ws_url:
+                raise RuntimeError(
+                    "no call-media WebSocket URL available — start the Inkbox "
+                    "bridge gateway (it provisions the tunnel + call WS) first"
+                )
+            call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
+            return {
+                "placed": True,
+                "id": str(getattr(call, "id", "")),
+                "to": to_number,
+                "status": _json_safe(getattr(call, "status", None)),
+            }
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
     tools = [
         inkbox_whoami,
         inkbox_send_email,
         inkbox_send_sms,
         inkbox_send_imessage,
+        inkbox_place_call,
         inkbox_list_text_conversations,
         inkbox_get_text_conversation,
         inkbox_list_imessage_conversations,
@@ -412,6 +461,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_send_email",
         "mcp__inkbox__inkbox_send_sms",
         "mcp__inkbox__inkbox_send_imessage",
+        "mcp__inkbox__inkbox_place_call",
         "mcp__inkbox__inkbox_list_text_conversations",
         "mcp__inkbox__inkbox_get_text_conversation",
         "mcp__inkbox__inkbox_list_imessage_conversations",
