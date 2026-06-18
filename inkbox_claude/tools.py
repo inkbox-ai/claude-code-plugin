@@ -502,12 +502,55 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
+    @tool(
+        "inkbox_list_calls",
+        "List recent phone calls on this agent's Inkbox number, newest first "
+        "(inbound + outbound). Each row has the call id, direction, status, the "
+        "remote number, and start/end times. Use this to find a call id to pass "
+        "to inkbox_get_call_transcript — e.g. to recap the last call, list calls "
+        "then read the newest one's transcript.",
+        {"limit": int, "offset": int},
+    )
+    async def inkbox_list_calls(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return _identity().list_calls(
+                limit=int(args.get("limit") or 25),
+                offset=int(args.get("offset") or 0),
+            )
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_get_call_transcript",
+        "Fetch the transcript segments for one phone call by call_id, ordered "
+        "oldest-first. Each segment has party (remote=the other party, "
+        "local=this agent), text, and a timestamp. Returns an empty list if the "
+        "call recorded no speech. Get a call_id from inkbox_list_calls.",
+        {"call_id": str},
+    )
+    async def inkbox_get_call_transcript(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            call_id = str(args.get("call_id") or "").strip()
+            if not call_id:
+                raise ValueError("call_id is required (get one from inkbox_list_calls)")
+            return _identity().list_transcripts(call_id)
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
     tools = [
         inkbox_whoami,
         inkbox_send_email,
         inkbox_send_sms,
         inkbox_send_imessage,
         inkbox_place_call,
+        inkbox_list_calls,
+        inkbox_get_call_transcript,
         inkbox_list_text_conversations,
         inkbox_get_text_conversation,
         inkbox_list_imessage_conversations,
@@ -525,6 +568,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_send_sms",
         "mcp__inkbox__inkbox_send_imessage",
         "mcp__inkbox__inkbox_place_call",
+        "mcp__inkbox__inkbox_list_calls",
+        "mcp__inkbox__inkbox_get_call_transcript",
         "mcp__inkbox__inkbox_list_text_conversations",
         "mcp__inkbox__inkbox_get_text_conversation",
         "mcp__inkbox__inkbox_list_imessage_conversations",
