@@ -224,16 +224,16 @@ def test_hangup_is_two_step(monkeypatch):
     ws, ink, state = _FakeWS(), _FakeInkboxWS(), _BridgeState()
     state.stream_id = "s1"
 
-    # First call: arm + ask for goodbye, no hangup frame yet.
+    # First call: arm + ask for goodbye, no stop frame yet.
     _dispatch(ws, HANG_UP_CALL_TOOL_NAME, {}, state, inkbox_ws=ink)
     assert _last_output(ws)["status"] == "confirm_goodbye"
     assert state.hangup_armed_at is not None
-    assert not any(f.get("event") == "hangup" for f in ink.sent)
+    assert not any(f.get("event") == "stop" for f in ink.sent)
 
-    # Second call: real hangup frame to Inkbox + sockets closed.
+    # Second call: real stop frame to Inkbox + sockets closed.
     _dispatch(ws, HANG_UP_CALL_TOOL_NAME, {"reason": "done"}, state, inkbox_ws=ink)
-    hangup = next(f for f in ink.sent if f.get("event") == "hangup")
-    assert hangup["reason"] == "done" and hangup["stream_id"] == "s1"
+    stop = next(f for f in ink.sent if f.get("event") == "stop")
+    assert stop["reason"] == "done" and stop["stream_id"] == "s1"
     assert ink.closed is True and state.closed is True
 
 
