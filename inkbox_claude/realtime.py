@@ -870,11 +870,12 @@ async def _handle_hang_up(
 
     # Second attempt within the window → perform the real hangup.
     reason = (args.get("reason") or "").strip()
-    hangup_frame: Dict[str, Any] = {"event": "hangup"}
+    # Inkbox ends the call on a `stop` event; `hangup` is ignored server-side.
+    stop_frame: Dict[str, Any] = {"event": "stop"}
     if reason:
-        hangup_frame["reason"] = reason
+        stop_frame["reason"] = reason
     if state.stream_id:
-        hangup_frame["stream_id"] = state.stream_id
+        stop_frame["stream_id"] = state.stream_id
     # Don't ask the model to speak again — we're ending the call.
     await _submit_tool_result(
         openai_ws, call_id,
@@ -884,7 +885,7 @@ async def _handle_hang_up(
     try:
         # Let the spoken goodbye land before we drop the carrier leg.
         await asyncio.sleep(HANGUP_CLOSE_DELAY_S)
-        await inkbox_ws.send_str(json.dumps(hangup_frame))
+        await inkbox_ws.send_str(json.dumps(stop_frame))
     except Exception as exc:
         logger.debug("[realtime] hangup frame send failed: %s", exc)
     state.closed = True
