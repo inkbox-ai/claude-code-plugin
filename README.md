@@ -166,7 +166,7 @@ These match only when the whole message is exactly the command, so "please /clea
 Calls have two modes, chosen per call:
 
 - **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and has these tools:
-  - `consult_claude_code` — do real work *now* in the project; runs in the *same* contact-keyed session as your SMS/iMessage and its answer is spoken back.
+  - `consult_agent` — do real work *now* in the project; runs in the *same* contact-keyed session as your SMS/iMessage and its answer is spoken back.
   - `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action` — queue, change, or cancel work to run *after* you hang up.
   - `hang_up_call` — two-step (say goodbye, then end the call).
 
@@ -219,7 +219,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_lookup_contact` · `inkbox_list_contacts` — resolve and find address-book contacts (reverse-lookup by email/phone, or free-text search by name/company).
 - `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_delete_contact` — save, edit, and remove contacts. Reads and writes are filtered server-side to what this identity may see.
 
-On a live call, the OpenAI Realtime voice agent additionally gets `consult_claude_code`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
+On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
 ## Smoke test
 
