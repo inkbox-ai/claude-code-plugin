@@ -12,7 +12,7 @@ two pumps for the call's duration:
   model's own voice is what the caller hears.
 
 The Realtime model runs the spoken conversation itself. It only reaches
-back to Claude Code through the single ``consult_claude_code`` tool — and
+back to Claude Code through the single ``consult_agent`` tool — and
 only when the caller asks for real work. The consult runs in the caller's
 shared :class:`~inkbox_claude.sessions.ContactSession` and its text answer
 is handed back to the model, which speaks it. If OpenAI can't be reached
@@ -50,13 +50,13 @@ DEFAULT_VOICE = "cedar"
 AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
 INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 
-CONSULT_TOOL_NAME = "consult_claude_code"
+CONSULT_TOOL_NAME = "consult_agent"
 POST_CALL_ACTION_TOOL_NAME = "register_post_call_action"
 EDIT_POST_CALL_ACTION_TOOL_NAME = "edit_post_call_action"
 DELETE_POST_CALL_ACTION_TOOL_NAME = "delete_post_call_action"
 HANG_UP_CALL_TOOL_NAME = "hang_up_call"
 
-DEFAULT_CONSULT_TIMEOUT_S = 120.0
+DEFAULT_CONSULT_TIMEOUT_S = 300.0
 DEFAULT_CONNECT_TIMEOUT_S = 8.0
 # hang_up_call is two-step: a second call within this window actually hangs up.
 HANGUP_CONFIRM_WINDOW_S = 60.0
@@ -575,7 +575,7 @@ async def _openai_to_inkbox_pump(
     meta: RealtimeCallMeta,
     on_agent_consult: AgentConsultCallback,
 ) -> None:
-    """Forward model audio to Inkbox and handle ``consult_claude_code`` calls."""
+    """Forward model audio to Inkbox and handle ``consult_agent`` calls."""
     # Function-call accumulation keyed by item_id. The name arrives on
     # output_item.added; args stream via ...arguments.delta and finalize on
     # ...arguments.done. Dedupe by call_id so a call dispatches at most once.
