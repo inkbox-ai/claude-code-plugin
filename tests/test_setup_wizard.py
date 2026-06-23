@@ -1,5 +1,7 @@
 import types
 
+import pytest
+
 from inkbox_claude import setup_wizard
 
 
@@ -158,16 +160,16 @@ def test_setup_signing_key_mints_new(tmp_path, monkeypatch):
     assert "INKBOX_REQUIRE_SIGNATURE=true" in text
 
 
-def test_setup_signing_key_decline_disables_signature(tmp_path, monkeypatch):
+def test_setup_signing_key_decline_aborts(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
-    # "have a key?" -> no; "generate now?" -> no.
+    # "have a key?" -> no; "generate now?" -> no. A signing key is required, so
+    # declining must abort setup rather than disable signature verification.
     answers = iter([False, False])
     monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
 
-    setup_wizard._setup_signing_key("ApiKey_x", "https://inkbox.ai", lambda **_k: None)
-
-    assert "INKBOX_REQUIRE_SIGNATURE=false" in env_file.read_text()
+    with pytest.raises(SystemExit):
+        setup_wizard._setup_signing_key("ApiKey_x", "https://inkbox.ai", lambda **_k: None)
 
 
 # ----------------------------------------------------------------------
