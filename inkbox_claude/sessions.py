@@ -67,9 +67,7 @@ TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
 # gateway.health_report() signature.
 HealthFn = Callable[[], Awaitable[str]]
 
-# iMessage typing bubbles expire after a few seconds, so we refresh the
-# indicator on this cadence for as long as a turn is running.
-TYPING_REFRESH_SECONDS = 4.0
+TYPING_REFRESH_SECONDS = 40.0
 
 
 @dataclass
