@@ -83,7 +83,7 @@ def test_install_command_prefers_uv_when_available(monkeypatch):
         "install",
         "--python",
         "/tmp/venv/bin/python",
-        "inkbox>=0.4.9",
+        "inkbox>=0.4.10",
         "aiohttp>=3.9",
     ]]
 
@@ -93,10 +93,10 @@ def test_install_command_falls_back_to_pip_and_ensurepip(monkeypatch):
     monkeypatch.setattr(setup_wizard.shutil, "which", lambda _name: None)
 
     assert setup_wizard._install_commands() == [
-        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.9", "aiohttp>=3.9"]],
+        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.10", "aiohttp>=3.9"]],
         [
             ["/tmp/venv/bin/python", "-m", "ensurepip", "--upgrade"],
-            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.9", "aiohttp>=3.9"],
+            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.10", "aiohttp>=3.9"],
         ],
     ]
 
@@ -115,7 +115,7 @@ def test_missing_sdk_guidance_prints_interpreter(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "/tmp/venv/bin/python" in out
     assert "uv pip install --python" in out
-    assert "inkbox>=0.4.9" in out
+    assert "inkbox>=0.4.10" in out
 
 
 # ----------------------------------------------------------------------
