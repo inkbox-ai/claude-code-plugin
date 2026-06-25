@@ -36,7 +36,10 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's other dependency (claude-agent-sdk) is checked by doctor.
-INKBOX_REQUIREMENTS = ("inkbox>=0.4.7", "aiohttp>=3.9")
+# The harness= kwarg on Inkbox.signup landed in inkbox 0.4.9; older SDKs
+# raise TypeError before the request ever reaches the server.
+INKBOX_MIN_VERSION = (0, 4, 9)
+INKBOX_REQUIREMENTS = ("inkbox>=0.4.9", "aiohttp>=3.9")
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
@@ -366,6 +369,28 @@ def _load_inkbox_symbols() -> dict[str, Any]:
     }
 
 
+def _inkbox_version_ok() -> bool:
+    # Guard against an already-installed but too-old SDK that predates the
+    # harness= signup kwarg. Prefer importlib.metadata + packaging; fall back
+    # to a tuple comparison parsed off the version string.
+    try:
+        from importlib.metadata import version
+
+        raw = version("inkbox")
+    except Exception:
+        return True  # can't tell — let the import/runtime path surface it
+    try:
+        from packaging.version import Version
+
+        return Version(raw) >= Version(".".join(str(p) for p in INKBOX_MIN_VERSION))
+    except Exception:
+        parts = []
+        for chunk in raw.split(".")[:3]:
+            digits = "".join(c for c in chunk if c.isdigit())
+            parts.append(int(digits) if digits else 0)
+        return tuple(parts) >= INKBOX_MIN_VERSION
+
+
 def _ensure_inkbox_sdk() -> dict[str, Any] | None:
     """Import the Inkbox SDK, offering to install it into this env if missing.
 
@@ -373,11 +398,19 @@ def _ensure_inkbox_sdk() -> dict[str, Any] | None:
         dict[str, Any] | None: SDK symbols on success, None if unavailable.
     """
     try:
-        return _load_inkbox_symbols()
+        symbols = _load_inkbox_symbols()
+        # A too-old SDK imports fine but lacks the harness= signup kwarg —
+        # treat it like an unsatisfied requirement and route to the upgrade path.
+        if _inkbox_version_ok():
+            return symbols
+        first_error = (
+            "the installed inkbox SDK is older than "
+            f"{'.'.join(str(p) for p in INKBOX_MIN_VERSION)}"
+        )
     except Exception as exc:
         first_error = exc
 
-    print_warning("The Python Inkbox SDK is not available in this environment.")
+    print_warning("The Python Inkbox SDK is missing or too old in this environment.")
     print_info("The setup command is running under:")
     print_info(f"  {sys.executable}")
     print_info("Install or upgrade the SDK in that exact environment with:")
