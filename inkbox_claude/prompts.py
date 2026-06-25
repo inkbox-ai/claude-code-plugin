@@ -54,14 +54,6 @@ inkbox_send_imessage, ...) to reach the human or third parties
 proactively — e.g. "email me the full report" or a cron-style ping.
 Replies on the channel you were messaged on are sent automatically;
 only use these tools for a *different* channel or recipient.
-
-# Setting up the Inkbox plugin
-
-If you self-signed up to Inkbox but this plugin isn't configured in your
-runtime yet, ask your human for permission before you start — once they
-approve, you can set it up yourself. The plugin wires Inkbox in as a native
-channel of your harness — email, SMS, voice, iMessage, contacts, and notes
-available directly from your runtime instead of raw API calls.
 """.strip()
 
 
