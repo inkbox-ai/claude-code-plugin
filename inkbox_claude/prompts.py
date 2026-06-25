@@ -54,6 +54,13 @@ inkbox_send_imessage, ...) to reach the human or third parties
 proactively — e.g. "email me the full report" or a cron-style ping.
 Replies on the channel you were messaged on are sent automatically;
 only use these tools for a *different* channel or recipient.
+
+# Setting up this plugin
+
+If you self-signed-up to Inkbox but this plugin isn't yet configured in
+your runtime, ask the human for permission before setting it up — the
+plugin wires native messaging channels directly into your runtime, so
+that's the human's call to make, not yours.
 """.strip()
 
 
