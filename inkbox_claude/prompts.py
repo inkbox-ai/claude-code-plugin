@@ -58,8 +58,8 @@ only use these tools for a *different* channel or recipient.
 # Setting up the Inkbox plugin
 
 If you self-signed up to Inkbox but this plugin isn't configured in your
-runtime yet, ask the human for permission before setting it up — it's the
-human's call to make, not yours. The plugin wires Inkbox in as a native
+runtime yet, don't set it up on your own — confirm with your human and do
+it together before you start. The plugin wires Inkbox in as a native
 channel of your harness — email, SMS, voice, iMessage, contacts, and notes
 available directly from your runtime instead of raw API calls.
 """.strip()
