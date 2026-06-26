@@ -36,8 +36,6 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's other dependency (claude-agent-sdk) is checked by doctor.
-# The harness= kwarg on Inkbox.signup landed in inkbox 0.4.10; older SDKs
-# raise TypeError before the request ever reaches the server.
 INKBOX_MIN_VERSION = (0, 4, 10)
 INKBOX_REQUIREMENTS = ("inkbox>=0.4.10", "aiohttp>=3.9")
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
@@ -370,9 +368,6 @@ def _load_inkbox_symbols() -> dict[str, Any]:
 
 
 def _inkbox_version_ok() -> bool:
-    # Guard against an already-installed but too-old SDK that predates the
-    # harness= signup kwarg. Prefer importlib.metadata + packaging; fall back
-    # to a tuple comparison parsed off the version string.
     try:
         from importlib.metadata import version
 
@@ -399,8 +394,6 @@ def _ensure_inkbox_sdk() -> dict[str, Any] | None:
     """
     try:
         symbols = _load_inkbox_symbols()
-        # A too-old SDK imports fine but lacks the harness= signup kwarg —
-        # treat it like an unsatisfied requirement and route to the upgrade path.
         if _inkbox_version_ok():
             return symbols
         first_error = (
@@ -1142,7 +1135,7 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
                 note_to_human=note,
                 agent_handle=handle,
                 base_url=base_url,
-                harness="claude-code",  # tag which harness self-signed-up
+                harness="claude-code",
             )
             break
         except InkboxAPIError as exc:

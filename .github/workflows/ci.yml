@@ -17,9 +17,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The inkbox SDK is intentionally not installed here: the tests mock it,
-      # and the pinned inkbox>=0.4.10 (with the harness= signup kwarg) isn't on
-      # PyPI yet. claude-agent-sdk is needed for the gateway-health tests.
+      # inkbox is mocked in the tests, so install only what they import.
       - name: Install test deps
         run: pip install pytest aiohttp segno claude-agent-sdk
 
