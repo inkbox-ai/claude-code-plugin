@@ -68,6 +68,7 @@ TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
 HealthFn = Callable[[], Awaitable[str]]
 
 TYPING_REFRESH_SECONDS = 40.0
+TYPING_MAX_SECONDS = 600.0
 
 
 @dataclass
@@ -695,12 +696,13 @@ class ContactSession:
         """Refresh the channel's typing indicator until the turn ends.
 
         Returns:
-            None: Runs until cancelled by :meth:`_run_turn`.
+            None: Runs until cancelled by :meth:`_run_turn` or the safety cap.
         """
         if self.typing_fn is None:
             return
+        elapsed = 0.0
         try:
-            while True:
+            while elapsed < TYPING_MAX_SECONDS:
                 # Only iMessage has a typing bubble; stay quiet while an
                 # escalation is parked waiting on the human to reply.
                 if self.mode == "imessage" and self.pending is None:
@@ -709,6 +711,7 @@ class ContactSession:
                     except Exception:
                         logger.debug("[session %s] typing ping failed", self.chat_id, exc_info=True)
                 await asyncio.sleep(TYPING_REFRESH_SECONDS)
+                elapsed += TYPING_REFRESH_SECONDS
         except asyncio.CancelledError:
             return
 

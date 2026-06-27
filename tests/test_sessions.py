@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 
+from inkbox_claude import sessions as sessions_mod
 from inkbox_claude.config import BridgeConfig
 from inkbox_claude.sessions import (
     ContactSession,
@@ -183,6 +184,23 @@ def test_typing_loop_skips_non_imessage():
             pass
 
         assert typing == []
+
+    asyncio.run(scenario())
+
+
+def test_typing_loop_stops_at_safety_cap(monkeypatch):
+    monkeypatch.setattr(sessions_mod, "TYPING_REFRESH_SECONDS", 0.01)
+    monkeypatch.setattr(sessions_mod, "TYPING_MAX_SECONDS", 0.025)
+
+    async def scenario():
+        typing = []
+        session = make_session([], typing)
+        session.mode = "imessage"
+        session.reply_meta = {"conversation_id": "c1"}
+
+        await asyncio.wait_for(session._typing_loop(), timeout=0.2)
+
+        assert len(typing) == 3
 
     asyncio.run(scenario())
 
