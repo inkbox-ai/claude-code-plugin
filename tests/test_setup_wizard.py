@@ -10,6 +10,11 @@ from inkbox_claude import setup_wizard
 # ----------------------------------------------------------------------
 
 
+def test_avatar_base_url_defaults_to_public_api():
+    assert setup_wizard._avatar_base_url("") == "https://inkbox.ai"
+    assert setup_wizard._avatar_base_url("https://proxy.example/") == "https://proxy.example"
+
+
 def test_show_qr_renders_block_chars():
     # segno is a declared dependency, so a QR should render to the terminal.
     import io

@@ -192,7 +192,7 @@ Calls have two modes, chosen per call:
 | `CLAUDE_PROJECT_DIR` | yes | cwd | Directory Claude Code works in. |
 | `CLAUDE_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
-| `INKBOX_BASE_URL` | no | `https://inkbox.ai` | Override the Inkbox API base URL. |
+| `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |
 | `INKBOX_ALLOWED_USERS` | no | - | Local allowlist (emails / E.164 numbers). Usually leave empty and use Inkbox contact rules. |

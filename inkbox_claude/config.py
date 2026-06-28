@@ -12,7 +12,8 @@ from .realtime import (
     RealtimeConfig,
 )
 
-INKBOX_BASE_URL_DEFAULT = "https://inkbox.ai"
+# Empty means "do not override"; the Inkbox SDK owns its API default.
+INKBOX_BASE_URL_DEFAULT = ""
 INKBOX_WS_PATH = "/phone/media/ws"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
@@ -65,6 +66,15 @@ class BridgeConfig:
     auto_allowed_tools: List[str] = field(default_factory=lambda: list(DEFAULT_AUTO_ALLOWED_TOOLS))
     # OpenAI Realtime voice (off unless the wizard validated a key)
     realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
+
+
+def inkbox_base_url_kwargs(base_url: str | None = None) -> Dict[str, str]:
+    normalized = str(base_url or "").strip()
+    return {"base_url": normalized} if normalized else {}
+
+
+def inkbox_client_kwargs(api_key: str, base_url: str | None = None) -> Dict[str, str]:
+    return {"api_key": api_key, **inkbox_base_url_kwargs(base_url)}
 
 
 def _read_realtime_config() -> RealtimeConfig:

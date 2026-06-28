@@ -53,7 +53,7 @@ except ImportError:  # pragma: no cover
     INKBOX_TUNNEL_AVAILABLE = False
 
 try:
-    from .config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
+    from .config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, inkbox_client_kwargs
     from .media import download_media, inbound_media_note
     from .prompts import strip_markdown
     from .realtime import (
@@ -64,7 +64,7 @@ try:
     from .sessions import SessionManager
     from .tools import build_inkbox_mcp_server
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
+    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, inkbox_client_kwargs
     from media import download_media, inbound_media_note
     from prompts import strip_markdown
     from realtime import (
@@ -215,7 +215,7 @@ class InkboxGateway:
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
 
-        self._inkbox = Inkbox(api_key=self.cfg.api_key, base_url=self.cfg.base_url)
+        self._inkbox = Inkbox(**inkbox_client_kwargs(self.cfg.api_key, self.cfg.base_url))
         self._identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
 
         mailbox = getattr(self._identity, "mailbox", None)
