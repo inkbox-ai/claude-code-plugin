@@ -1061,14 +1061,19 @@ class InkboxGateway:
             None
         """
         meta = meta or {}
+        if content.strip() == "[SILENT]":
+            logger.debug("[bridge] suppressing exact [SILENT] reply for %s", chat_id)
+            return
         if mode == "voice":
             ws = self._active_call_ws.get(chat_id)
             if ws is not None:
                 await self._speak(ws, strip_markdown(content), str(meta.get("call_id") or ""))
                 return
-            # Call ended while Claude was thinking — fall back to SMS so
-            # the answer isn't lost.
-            mode = "sms" if str(meta.get("to") or chat_id).startswith("+") else "email"
+            logger.info(
+                "[bridge] dropped late voice reply after call ended: %s",
+                chat_id,
+            )
+            return
 
         identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
 

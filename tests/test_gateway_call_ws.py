@@ -33,6 +33,11 @@ class _FakeRequest:
         self.query = {}  # no context_token; inbound (no outbound place-call ctx)
 
 
+class _NoDeliveryInkbox:
+    def get_identity(self, _identity):
+        raise AssertionError("send_to_contact must not reach Inkbox delivery")
+
+
 def test_call_ws_declares_inkbox_stt_tts_headers(monkeypatch):
     """The WS upgrade must advertise platform-side STT/TTS so Inkbox sends us
     transcripts and speaks our text frames — without these it defaults to raw
@@ -50,6 +55,27 @@ def test_call_ws_declares_inkbox_stt_tts_headers(monkeypatch):
     assert fake_ws.prepared is True
     assert fake_ws.headers.get("x-use-inkbox-speech-to-text") == "true"
     assert fake_ws.headers.get("x-use-inkbox-text-to-speech") == "true"
+
+
+def test_send_to_contact_suppresses_exact_silent_reply():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    asyncio.run(gw.send_to_contact("contact-1", "[SILENT]", "sms", {"to": "+15551234567"}))
+
+
+def test_send_to_contact_drops_late_voice_reply_without_channel_fallback():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    asyncio.run(
+        gw.send_to_contact(
+            "+15551234567",
+            "This answer finished after hangup.",
+            "voice",
+            {"call_id": "call-1", "to": "+15551234567"},
+        )
+    )
 
 
 class _FakeBridge:
