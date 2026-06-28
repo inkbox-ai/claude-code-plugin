@@ -34,7 +34,11 @@ class _FakeWS:
 
 
 def _meta():
-    return RealtimeCallMeta(call_id="c1", remote_phone_number="+15551234567", project_dir="/tmp/proj")
+    return RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+    )
 
 
 def test_session_update_configures_telephony_audio_vad_and_all_tools():
@@ -61,16 +65,40 @@ def test_session_update_configures_telephony_audio_vad_and_all_tools():
 
 
 def test_instructions_name_the_consult_tool_and_project():
-    text = build_realtime_instructions(_meta())
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+        agent_identity_handle="claude",
+        agent_identity_email="claude@example.com",
+        agent_identity_phone="+15550001111",
+        contact_known=True,
+        contact_id="contact-1",
+        contact_name="Ada Lovelace",
+        contact_emails=["ada@example.com"],
+        contact_phones=["+15551234567"],
+        contact_company="Inkbox",
+        contact_job_title="Engineer",
+        contact_notes="Prefers calls in the morning.",
+    )
+    text = build_realtime_instructions(meta)
     assert CONSULT_TOOL_NAME in text
     assert "/tmp/proj" in text
+    assert "Your Inkbox identity handle: claude." in text
+    assert "claude@example.com" in text
+    assert "Ada Lovelace" in text
+    assert "ada@example.com" in text
+    assert "Do not perform a context lookup before greeting" in text
 
 
 def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
     meta = RealtimeCallMeta(
         call_id="c1",
         remote_phone_number="+15551234567",
+        direction="outbound",
         project_dir="/tmp/proj",
+        contact_known=True,
+        contact_name="Ada Lovelace",
         outbound_purpose="tell them the deployment is fixed",
         outbound_opening="Hi, this is Claude Code calling with the deployment update.",
         outbound_context="Deployment failed twice before the final fix.",
@@ -78,7 +106,7 @@ def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
 
     text = build_realtime_instructions(meta)
 
-    assert "OUTBOUND call" in text
+    assert "outbound call" in text
     assert "tell them the deployment is fixed" in text
     assert "Deployment failed twice before the final fix." in text
     assert "Hi, this is Claude Code calling with the deployment update." in build_realtime_greeting(meta)

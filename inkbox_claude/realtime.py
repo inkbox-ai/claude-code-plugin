@@ -103,13 +103,27 @@ class RealtimeCallMeta:
 
     call_id: str
     remote_phone_number: Optional[str]
+    direction: str = "inbound"
+    agent_identity_handle: Optional[str] = None
+    agent_identity_email: Optional[str] = None
     agent_identity_phone: Optional[str] = None
     project_dir: Optional[str] = None
+    contact_known: bool = False
+    contact_id: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_emails: List[str] = field(default_factory=list)
+    contact_phones: List[str] = field(default_factory=list)
+    contact_company: Optional[str] = None
+    contact_job_title: Optional[str] = None
+    contact_notes: Optional[str] = None
     # Outbound calls only: why this agent placed the call, threaded from
     # ``inkbox_place_call`` so the live session opens with context, not cold.
     outbound_purpose: Optional[str] = None
     outbound_opening: Optional[str] = None
     outbound_context: Optional[str] = None
+    outbound_reason: Optional[str] = None
+    outbound_scheduled_by: Optional[str] = None
+    outbound_conversation_summary: Optional[str] = None
 
 
 @dataclass
@@ -148,15 +162,67 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         str: The instruction string for the ``session.update``.
     """
     lines = [
-        "You are a Claude Code agent speaking with your operator on a live phone call.",
-        "Use natural, concise spoken replies — usually one or two short sentences.",
+        "You are the configured Claude Code Inkbox agent speaking on a live Inkbox phone call.",
+        "Use natural, concise spoken replies. Keep most answers to one or two short sentences.",
         "You are a voice; do not read out code, file paths, diffs, or logs verbatim.",
-        "",
+        "Do not mention implementation details unless the caller asks.",
+    ]
+    if meta.agent_identity_handle:
+        lines.append(f"Your Inkbox identity handle: {meta.agent_identity_handle}.")
+    if meta.agent_identity_email:
+        lines.append(f"Your Inkbox agent email address: {meta.agent_identity_email}.")
+    if meta.agent_identity_phone:
+        lines.append(f"Your Inkbox agent phone number: {meta.agent_identity_phone}.")
+    if meta.remote_phone_number:
+        lines.append(f"Remote phone number: {meta.remote_phone_number}.")
+    if meta.contact_known:
+        lines.append(
+            "Known Inkbox contact info is already loaded; do not look them up or ask for details you already have.",
+        )
+        if meta.contact_name:
+            lines.append(f"Contact name: {meta.contact_name}.")
+        if meta.contact_id:
+            lines.append(f"Inkbox contact id: {meta.contact_id}.")
+        if meta.contact_company:
+            lines.append(f"Contact company: {meta.contact_company}.")
+        if meta.contact_job_title:
+            lines.append(f"Contact title: {meta.contact_job_title}.")
+        if meta.contact_emails:
+            lines.append(f"Contact email(s): {', '.join(meta.contact_emails)}.")
+        if meta.contact_phones:
+            lines.append(f"Contact phone(s): {', '.join(meta.contact_phones)}.")
+        if meta.contact_notes:
+            lines.append(f"Contact notes: {meta.contact_notes}")
+    else:
+        lines.append(
+            "No matching Inkbox contact record is loaded; use the phone number or a neutral greeting.",
+        )
+    if meta.direction == "outbound":
+        if meta.outbound_purpose:
+            lines.append(f"This is an outbound call you placed. Purpose: {meta.outbound_purpose}")
+        if meta.outbound_reason:
+            lines.append(f"Reason for the call: {meta.outbound_reason}")
+        if meta.outbound_scheduled_by:
+            lines.append(f"This call was scheduled by: {meta.outbound_scheduled_by}")
+        if meta.outbound_conversation_summary:
+            lines.append(
+                f"Summary of the prior conversation that led to this call:\n{meta.outbound_conversation_summary}",
+            )
+        if meta.outbound_context:
+            lines.append(f"Relevant outbound-call context:\n{meta.outbound_context}")
+        if meta.outbound_opening:
+            lines.append(
+                f"Preferred opening message (say this naturally as your first turn): {meta.outbound_opening}",
+            )
+        lines.append(
+            "For outbound calls, do not open with a generic offer to help. Start by explaining why you are calling, then ask the next specific question or give the requested update.",
+        )
+    lines.extend([
+        "Do not perform a context lookup before greeting the caller. Do not say you are waiting on a lookup or checking context.",
         f"To do real work NOW in the project ({meta.project_dir or 'the working directory'}) "
-        f"— read or edit files, run commands or tests, check git, search the codebase — "
+        f"- read or edit files, run commands or tests, check git, search the codebase, or use Inkbox tools - "
         f"call {CONSULT_TOOL_NAME} with a plain-English request. It runs the Claude Code "
-        "agent in the caller's ongoing conversation and returns a spoken-friendly answer; "
-        "read that answer back in your own voice.",
+        "agent in the caller's ongoing conversation and returns a spoken-friendly answer; read that answer back in your own voice.",
         f"If the caller wants work done AFTER the call (or accepts a deferral), call "
         f"{POST_CALL_ACTION_TOOL_NAME} to queue it. Tell them it's queued for after the "
         "call; do not claim it is already done.",
@@ -170,19 +236,7 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         f"Do NOT call {CONSULT_TOOL_NAME} for greetings, small talk, or questions you "
         "can answer directly. Use it whenever the caller wants something done in the code.",
         "While a tool runs you may say a brief 'one moment' so the caller isn't left in silence.",
-    ]
-    if meta.outbound_purpose:
-        lines += [
-            "",
-            "This is an OUTBOUND call you placed; the callee did not call you. "
-            f"You are calling because: {meta.outbound_purpose}",
-        ]
-        if meta.outbound_context:
-            lines.append(f"Background: {meta.outbound_context}")
-        lines.append(
-            "Open by greeting them, saying who you are, and stating why you're "
-            "calling in one short sentence, then let them respond."
-        )
+    ])
     if additional.strip():
         lines += ["", additional.strip()]
     return "\n".join(lines)
@@ -190,20 +244,21 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
 
 def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
     """Instructions for the proactive opening line spoken at pickup."""
-    if meta.outbound_opening:
+    first_name = meta.contact_name.split()[0] if meta.contact_known and meta.contact_name else "there"
+    if meta.direction == "outbound" and meta.outbound_opening:
         return (
-            "Open the call by saying, naturally and in one short sentence: "
-            f"\"{meta.outbound_opening}\" Then stop and let them respond."
+            "Open the call by saying this naturally as the very first thing, with no greeting before it:\n"
+            f"{meta.outbound_opening}"
         )
-    if meta.outbound_purpose:
+    if meta.direction == "outbound" and meta.outbound_purpose:
         return (
-            "You placed this call. Open by greeting them, saying you're their "
-            f"Claude Code agent, and stating why you're calling: {meta.outbound_purpose}. "
-            "Keep it to one short sentence, then stop."
+            f"Greet {first_name} briefly, then immediately explain that you are calling because: "
+            f"{meta.outbound_purpose}. Do not ask a generic how-can-I-help question."
         )
     return (
-        "Greet the caller briefly and naturally, e.g. \"Hey, it's your Claude Code "
-        "agent — what do you need?\" Keep it to one short sentence and then stop."
+        f"Greet the caller now as the very first thing you say. Say something like "
+        f"'Hi {first_name}, this is your Claude Code Inkbox agent - how can I help?' "
+        f"Keep it to one short sentence and then wait for them to respond."
     )
 
 

@@ -433,6 +433,92 @@ class InkboxGateway:
             return str(contacts[0]["id"])
         return fallback
 
+    @staticmethod
+    def _field(obj: Any, *names: str) -> Any:
+        """Read a field from either an SDK object or webhook dict."""
+        if obj is None:
+            return None
+        for name in names:
+            if isinstance(obj, dict):
+                value = obj.get(name)
+            else:
+                value = getattr(obj, name, None)
+            if value not in (None, ""):
+                return value
+        return None
+
+    @classmethod
+    def _contact_values(cls, entries: Any) -> List[str]:
+        rows = list(entries or [])
+        rows.sort(
+            key=lambda item: not bool(cls._field(item, "is_primary", "isPrimary")),
+        )
+        values: List[str] = []
+        for item in rows:
+            value = item if isinstance(item, str) else cls._field(item, "value", "address", "email", "phone")
+            if value:
+                values.append(str(value))
+        return values
+
+    @classmethod
+    def _contact_summary(cls, contact: Any) -> Optional[Dict[str, Any]]:
+        if not contact:
+            return None
+        given = cls._field(contact, "given_name", "givenName")
+        family = cls._field(contact, "family_name", "familyName")
+        full_name = " ".join(str(part) for part in (given, family) if part).strip()
+        name = (
+            cls._field(contact, "preferred_name", "preferredName")
+            or cls._field(contact, "name", "display_name", "displayName")
+            or full_name
+            or None
+        )
+        summary = {
+            "id": str(cls._field(contact, "id") or ""),
+            "name": str(name) if name else None,
+            "emails": cls._contact_values(cls._field(contact, "emails", "email_addresses", "emailAddresses")),
+            "phones": cls._contact_values(cls._field(contact, "phones", "phone_numbers", "phoneNumbers")),
+            "company": cls._field(contact, "company_name", "companyName", "company"),
+            "job_title": cls._field(contact, "job_title", "jobTitle", "title"),
+            "notes": ((str(cls._field(contact, "notes") or "")[:200]).strip() or None),
+        }
+        if any(summary.get(key) for key in ("id", "name", "emails", "phones")):
+            return summary
+        return None
+
+    async def _hydrate_contact(self, contact: Any) -> Optional[Dict[str, Any]]:
+        summary = self._contact_summary(contact)
+        contact_id = (summary or {}).get("id")
+        if not contact_id or self._inkbox is None:
+            return summary
+        try:
+            return self._contact_summary(await asyncio.to_thread(self._inkbox.contacts.get, contact_id)) or summary
+        except Exception:
+            return summary
+
+    async def _resolve_call_contact(
+        self, call_context: Dict[str, Any], remote: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve the call's remote party before Realtime greets."""
+        direct = call_context.get("contact")
+        if direct:
+            return await self._hydrate_contact(direct)
+
+        contacts = call_context.get("contacts") or call_context.get("contact_list") or []
+        if len(contacts) == 1:
+            return await self._hydrate_contact(contacts[0])
+
+        if not remote or self._inkbox is None:
+            return None
+        try:
+            matches = await asyncio.to_thread(self._inkbox.contacts.lookup, phone=remote)
+        except Exception:
+            logger.debug("[bridge] contacts.lookup(phone=%s) failed for call", remote, exc_info=True)
+            return None
+        if len(matches) != 1:
+            return None
+        return self._contact_summary(matches[0])
+
     async def _on_mail_received(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("message") or {}
@@ -683,7 +769,12 @@ class InkboxGateway:
     # ------------------------------------------------------------------
 
     async def _open_realtime_bridge(
-        self, remote: str, call_id: str, outbound: Optional[Dict[str, Any]] = None
+        self,
+        remote: str,
+        call_id: str,
+        outbound: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
+        direction: str = "inbound",
     ) -> Any:
         """Preflight an OpenAI Realtime session for an incoming call.
 
@@ -695,16 +786,45 @@ class InkboxGateway:
             Any: An OpenedRealtimeBridge on success, or None if the connect
             failed (the caller then falls back to Inkbox STT/TTS).
         """
-        phone = getattr(self._identity, "phone_number", None)
+        identity = self._identity
+        mailbox = getattr(identity, "mailbox", None)
+        phone = getattr(identity, "phone_number", None)
         oc = outbound or {}
+        contact = contact or {}
         meta = RealtimeCallMeta(
             call_id=call_id or "unknown",
             remote_phone_number=remote or None,
-            agent_identity_phone=getattr(phone, "number", None),
+            direction=direction or "inbound",
+            agent_identity_handle=(
+                getattr(identity, "agent_handle", None)
+                or getattr(identity, "handle", None)
+                or self.cfg.identity
+                or None
+            ),
+            agent_identity_email=(
+                getattr(mailbox, "email_address", None)
+                or getattr(identity, "email_address", None)
+            ),
+            agent_identity_phone=(
+                getattr(phone, "number", None)
+                if not isinstance(phone, str)
+                else phone
+            ),
             project_dir=self.cfg.project_dir,
+            contact_known=bool(contact.get("id")),
+            contact_id=contact.get("id"),
+            contact_name=contact.get("name"),
+            contact_emails=list(contact.get("emails") or []),
+            contact_phones=list(contact.get("phones") or []),
+            contact_company=contact.get("company"),
+            contact_job_title=contact.get("job_title"),
+            contact_notes=contact.get("notes"),
             outbound_purpose=(oc.get("purpose") or None),
             outbound_opening=(oc.get("opening_message") or None),
             outbound_context=(oc.get("context") or None),
+            outbound_reason=(oc.get("reason") or None),
+            outbound_scheduled_by=(oc.get("scheduled_by") or None),
+            outbound_conversation_summary=(oc.get("conversation_summary") or None),
         )
         try:
             return await open_inkbox_realtime_bridge(config=self.cfg.realtime, meta=meta)
@@ -748,10 +868,20 @@ class InkboxGateway:
             call_context = json.loads(call_context_raw) if call_context_raw else {}
         except json.JSONDecodeError:
             call_context = {}
-        remote = str(call_context.get("remote_phone_number") or "").strip()
         call_id = str(call_context.get("id") or call_context.get("call_id") or "")
-        chat_id = remote or f"call:{call_id}"
         outbound = self._load_outbound_context(request.query.get("context_token"))
+        remote = str(
+            call_context.get("remote_phone_number")
+            or call_context.get("from_number")
+            or call_context.get("to_number")
+            or (outbound or {}).get("to_number")
+            or ""
+        ).strip()
+        direction = str(
+            call_context.get("direction") or ("outbound" if outbound else "inbound")
+        ).strip().lower() or "inbound"
+        contact = await self._resolve_call_contact(call_context, remote)
+        chat_id = (contact or {}).get("id") or remote or f"call:{call_id}"
 
         ws = web.WebSocketResponse()
 
@@ -761,7 +891,7 @@ class InkboxGateway:
         # Code via run_consult. If the preflight fails, fall through to Inkbox
         # STT/TTS below (unless fallback is disabled, then refuse the call).
         if self.cfg.realtime.enabled:
-            bridge = await self._open_realtime_bridge(remote, call_id, outbound)
+            bridge = await self._open_realtime_bridge(remote, call_id, outbound, contact, direction)
             if bridge is None and not self.cfg.realtime.fallback_to_inkbox_stt_tts:
                 return web.Response(status=503, text="realtime bridge unavailable")
             if bridge is not None:
@@ -832,7 +962,12 @@ class InkboxGateway:
                     text = str(payload.get("text") or "").strip()
                     if not text:
                         continue
-                    meta = {"call_id": call_id, "sender": remote}
+                    meta = {
+                        "call_id": call_id,
+                        "sender": remote,
+                        "contact": contact,
+                        "direction": direction,
+                    }
                     session = self.sessions.get(chat_id)
                     await session.handle_inbound(text, "voice", meta)
                 elif event == "stop":
