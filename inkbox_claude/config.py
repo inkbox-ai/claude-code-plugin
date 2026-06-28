@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List
 
 from .realtime import (
@@ -31,6 +32,14 @@ DEFAULT_AUTO_ALLOWED_TOOLS = [
     "Task",
     "NotebookRead",
 ]
+
+
+def call_contexts_dir() -> Path:
+    """Directory where ``inkbox_place_call`` stashes per-call context."""
+    root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
+    path = root / "call_contexts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def env_flag(name: str, default: bool = False) -> bool:

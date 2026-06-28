@@ -53,7 +53,13 @@ except ImportError:  # pragma: no cover
     INKBOX_TUNNEL_AVAILABLE = False
 
 try:
-    from .config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, inkbox_client_kwargs
+    from .config import (
+        DEFAULT_WEBHOOK_PATH,
+        INKBOX_WS_PATH,
+        BridgeConfig,
+        call_contexts_dir,
+        inkbox_client_kwargs,
+    )
     from .media import download_media, inbound_media_note
     from .prompts import strip_markdown
     from .realtime import (
@@ -64,7 +70,7 @@ try:
     from .sessions import SessionManager
     from .tools import build_inkbox_mcp_server
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, inkbox_client_kwargs
+    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, call_contexts_dir, inkbox_client_kwargs
     from media import download_media, inbound_media_note
     from prompts import strip_markdown
     from realtime import (
@@ -676,7 +682,9 @@ class InkboxGateway:
     # Inbound: live calls (Inkbox STT/TTS text-frame bridge)
     # ------------------------------------------------------------------
 
-    async def _open_realtime_bridge(self, remote: str, call_id: str) -> Any:
+    async def _open_realtime_bridge(
+        self, remote: str, call_id: str, outbound: Optional[Dict[str, Any]] = None
+    ) -> Any:
         """Preflight an OpenAI Realtime session for an incoming call.
 
         Args:
@@ -688,11 +696,15 @@ class InkboxGateway:
             failed (the caller then falls back to Inkbox STT/TTS).
         """
         phone = getattr(self._identity, "phone_number", None)
+        oc = outbound or {}
         meta = RealtimeCallMeta(
             call_id=call_id or "unknown",
             remote_phone_number=remote or None,
             agent_identity_phone=getattr(phone, "number", None),
             project_dir=self.cfg.project_dir,
+            outbound_purpose=(oc.get("purpose") or None),
+            outbound_opening=(oc.get("opening_message") or None),
+            outbound_context=(oc.get("context") or None),
         )
         try:
             return await open_inkbox_realtime_bridge(config=self.cfg.realtime, meta=meta)
@@ -702,6 +714,21 @@ class InkboxGateway:
                 "falling back to Inkbox STT/TTS unless disabled",
                 call_id, exc.cause,
             )
+            return None
+
+    @staticmethod
+    def _load_outbound_context(token: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Load the purpose/opening an outbound call was placed with."""
+        token = (token or "").strip()
+        # Token rides in off the URL; never let it escape the contexts dir.
+        if not token or "/" in token or "\\" in token or token in {".", ".."}:
+            return None
+        path = call_contexts_dir() / f"{token}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
             return None
 
     async def _handle_call_ws(self, request: "web.Request") -> Any:
@@ -724,6 +751,7 @@ class InkboxGateway:
         remote = str(call_context.get("remote_phone_number") or "").strip()
         call_id = str(call_context.get("id") or call_context.get("call_id") or "")
         chat_id = remote or f"call:{call_id}"
+        outbound = self._load_outbound_context(request.query.get("context_token"))
 
         ws = web.WebSocketResponse()
 
@@ -733,7 +761,7 @@ class InkboxGateway:
         # Code via run_consult. If the preflight fails, fall through to Inkbox
         # STT/TTS below (unless fallback is disabled, then refuse the call).
         if self.cfg.realtime.enabled:
-            bridge = await self._open_realtime_bridge(remote, call_id)
+            bridge = await self._open_realtime_bridge(remote, call_id, outbound)
             if bridge is None and not self.cfg.realtime.fallback_to_inkbox_stt_tts:
                 return web.Response(status=503, text="realtime bridge unavailable")
             if bridge is not None:

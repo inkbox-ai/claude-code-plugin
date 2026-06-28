@@ -214,6 +214,8 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
+- `inkbox_place_call` — place an outbound phone call through the running gateway with purpose/opening/context.
+- `inkbox_list_calls` · `inkbox_get_call_transcript` — browse recent calls and fetch transcript segments.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
 - `inkbox_lookup_contact` · `inkbox_list_contacts` — resolve and find address-book contacts (reverse-lookup by email/phone, or free-text search by name/company).

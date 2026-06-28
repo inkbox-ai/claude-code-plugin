@@ -15,6 +15,7 @@ from inkbox_claude.realtime import (
     _dispatch_post_call,
     _dispatch_tool_call,
     _send_session_update,
+    build_realtime_greeting,
     build_realtime_instructions,
 )
 
@@ -63,6 +64,24 @@ def test_instructions_name_the_consult_tool_and_project():
     text = build_realtime_instructions(_meta())
     assert CONSULT_TOOL_NAME in text
     assert "/tmp/proj" in text
+
+
+def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+        outbound_purpose="tell them the deployment is fixed",
+        outbound_opening="Hi, this is Claude Code calling with the deployment update.",
+        outbound_context="Deployment failed twice before the final fix.",
+    )
+
+    text = build_realtime_instructions(meta)
+
+    assert "OUTBOUND call" in text
+    assert "tell them the deployment is fixed" in text
+    assert "Deployment failed twice before the final fix." in text
+    assert "Hi, this is Claude Code calling with the deployment update." in build_realtime_greeting(meta)
 
 
 def test_dispatch_consult_runs_agent_and_speaks_answer():

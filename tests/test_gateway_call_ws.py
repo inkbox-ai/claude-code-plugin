@@ -30,6 +30,7 @@ class _FakeWS:
 class _FakeRequest:
     def __init__(self):
         self.headers = {}  # no X-Call-Context; signature check is off
+        self.query = {}  # no context_token; inbound (no outbound place-call ctx)
 
 
 def test_call_ws_declares_inkbox_stt_tts_headers(monkeypatch):
@@ -84,6 +85,38 @@ def test_call_ws_realtime_path_sets_rawmedia_headers_and_runs_bridge(monkeypatch
     assert fake_ws.headers.get("x-use-inkbox-speech-to-text") == "false"
     assert fake_ws.headers.get("x-use-inkbox-text-to-speech") == "false"
     assert bridge.ran is True and bridge.closed is True
+
+
+def test_call_ws_passes_outbound_context_to_realtime(monkeypatch, tmp_path):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    bridge = _FakeBridge()
+    seen = {}
+
+    context_dir = tmp_path / "call_contexts"
+    context_dir.mkdir()
+    (context_dir / "tok-123.json").write_text(
+        '{"purpose":"tell them the deploy is fixed","opening_message":"Hi there","context":"PR 12"}'
+    )
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_claude.realtime import RealtimeConfig
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    request = _FakeRequest()
+    request.query = {"context_token": "tok-123"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert seen["meta"].outbound_purpose == "tell them the deploy is fixed"
+    assert seen["meta"].outbound_opening == "Hi there"
+    assert seen["meta"].outbound_context == "PR 12"
 
 
 def test_call_ws_realtime_falls_back_to_stt_tts_on_connect_failure(monkeypatch):
