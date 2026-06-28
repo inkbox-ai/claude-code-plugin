@@ -145,7 +145,9 @@ def _call_ended_prompt(transcript: Any) -> str:
     parts = [
         "[voice call ended] Your phone call with the operator just ended. If you "
         "committed to anything during it (open a PR, run a task, send a summary), "
-        "do that now with your tools. If there's nothing to do, do nothing.",
+        "do that now with your tools. First reconcile against the transcript: do "
+        "not redo work that was already completed, queued, canceled, or superseded "
+        "during the call. If there's nothing still needed, do nothing.",
     ]
     if convo:
         parts += ["", "Recent call transcript:", convo]
@@ -946,6 +948,7 @@ class InkboxGateway:
         await ws.prepare(request)
         self._active_call_ws[chat_id] = ws
         logger.info("[bridge] call connected: %s", chat_id or call_id)
+        transcript: List[Tuple[str, str]] = []
 
         try:
             async for msg in ws:
@@ -962,6 +965,7 @@ class InkboxGateway:
                     text = str(payload.get("text") or "").strip()
                     if not text:
                         continue
+                    transcript.append(("user", text))
                     meta = {
                         "call_id": call_id,
                         "sender": remote,
@@ -974,6 +978,9 @@ class InkboxGateway:
                     break
         finally:
             self._active_call_ws.pop(chat_id, None)
+            if transcript:
+                prompt = _call_ended_prompt(transcript)
+                await self.sessions.get(chat_id).run_consult(prompt)
             logger.info("[bridge] call ended: %s", chat_id or call_id)
         return ws
 

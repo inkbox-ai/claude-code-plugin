@@ -27,6 +27,27 @@ class _FakeWS:
         raise StopAsyncIteration
 
 
+class _FakeTextMsg:
+    def __init__(self, data):
+        self.type = "text"
+        self.data = data
+
+
+class _ScriptedWS(_FakeWS):
+    def __init__(self, messages):
+        super().__init__()
+        self._messages = list(messages)
+        self.sent = []
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+    async def send_str(self, data):
+        self.sent.append(data)
+
+
 class _FakeRequest:
     def __init__(self):
         self.headers = {}  # no X-Call-Context; signature check is off
@@ -36,6 +57,27 @@ class _FakeRequest:
 class _NoDeliveryInkbox:
     def get_identity(self, _identity):
         raise AssertionError("send_to_contact must not reach Inkbox delivery")
+
+
+class _FakeContactSession:
+    def __init__(self):
+        self.inbound = []
+        self.consults = []
+
+    async def handle_inbound(self, text, mode, meta):
+        self.inbound.append((text, mode, meta))
+
+    async def run_consult(self, prompt):
+        self.consults.append(prompt)
+        return ""
+
+
+class _FakeSessions:
+    def __init__(self, session):
+        self.session = session
+
+    def get(self, _chat_id):
+        return self.session
 
 
 def test_call_ws_declares_inkbox_stt_tts_headers(monkeypatch):
@@ -76,6 +118,39 @@ def test_send_to_contact_drops_late_voice_reply_without_channel_fallback():
             {"call_id": "call-1", "to": "+15551234567"},
         )
     )
+
+
+def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"start"}'),
+        _FakeTextMsg('{"event":"transcript","text":"Please send the summary after this.","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    session = _FakeContactSession()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw.sessions = _FakeSessions(session)
+
+    asyncio.run(gw._handle_call_ws(_FakeRequest()))
+
+    assert session.inbound == [
+        (
+            "Please send the summary after this.",
+            "voice",
+            {
+                "call_id": "",
+                "sender": "",
+                "contact": None,
+                "direction": "inbound",
+            },
+        )
+    ]
+    assert len(session.consults) == 1
+    assert "[voice call ended]" in session.consults[0]
+    assert "do not redo work that was already completed" in session.consults[0]
+    assert "Please send the summary after this." in session.consults[0]
 
 
 class _FakeBridge:
