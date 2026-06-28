@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - doctor reports this cleanly
 
 logger = logging.getLogger(__name__)
 
+SMS_MAX_LENGTH = 1600
 IMESSAGE_MAX_LENGTH = 18995
 
 
@@ -193,13 +194,22 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "with conversation_id, or start one with to (E.164). To send images/files "
         "(MMS), pass media_paths as a list of LOCAL file paths — they're uploaded "
         "and attached for you (each up to 10 MB). Already-hosted URLs may instead "
-        "be passed as media_urls.",
+        "be passed as media_urls. Text is limited to 1600 characters.",
         {"to": str, "text": str, "media_paths": list, "media_urls": list},
     )
     async def inkbox_send_sms(args: Dict[str, Any]) -> Dict[str, Any]:
+        text = str(args.get("text") or "")
+        if len(text) > SMS_MAX_LENGTH:
+            return _error(
+                _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
+                error_code="sms_too_long",
+                char_count=len(text),
+                max_chars=SMS_MAX_LENGTH,
+            )
+
         def _run():
             identity = _identity()
-            kwargs: Dict[str, Any] = {"text": str(args.get("text") or "")}
+            kwargs: Dict[str, Any] = {"text": text}
             target = str(args.get("to") or "").strip()
             if target.startswith("+"):
                 kwargs["to"] = target

@@ -122,6 +122,25 @@ def test_send_to_contact_drops_late_voice_reply_without_channel_fallback():
     )
 
 
+def test_send_to_contact_rejects_over_limit_sms_without_delivery():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    try:
+        asyncio.run(
+            gw.send_to_contact(
+                "+15551234567",
+                "x" * (gateway.SMS_MAX_LENGTH + 1),
+                "sms",
+                {"to": "+15551234567"},
+            )
+        )
+    except ValueError as exc:
+        assert "SMS text is 1601 characters" in str(exc)
+    else:
+        raise AssertionError("expected over-limit SMS reply to be rejected")
+
+
 def test_send_to_contact_rejects_over_limit_imessage_without_delivery():
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
     gw._inkbox = _NoDeliveryInkbox()

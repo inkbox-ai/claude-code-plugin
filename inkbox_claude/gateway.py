@@ -1375,7 +1375,7 @@ class InkboxGateway:
         if mode == "sms":
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:
-                text = text[: SMS_MAX_LENGTH - 1] + "…"
+                raise ValueError(_message_too_long_reason("SMS", text, SMS_MAX_LENGTH))
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             kwargs: Dict[str, Any] = {"text": text}
             if meta.get("conversation_id"):
