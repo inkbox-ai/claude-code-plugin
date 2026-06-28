@@ -122,6 +122,25 @@ def test_send_to_contact_drops_late_voice_reply_without_channel_fallback():
     )
 
 
+def test_send_to_contact_rejects_over_limit_imessage_without_delivery():
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    try:
+        asyncio.run(
+            gw.send_to_contact(
+                "contact-1",
+                "x" * (gateway.IMESSAGE_MAX_LENGTH + 1),
+                "imessage",
+                {"conversation_id": "imconv-123"},
+            )
+        )
+    except ValueError as exc:
+        assert "iMessage text is 18996 characters" in str(exc)
+    else:
+        raise AssertionError("expected over-limit iMessage reply to be rejected")
+
+
 def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
     fake_ws = _ScriptedWS([
         _FakeTextMsg('{"event":"start"}'),

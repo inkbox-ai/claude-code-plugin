@@ -38,6 +38,8 @@ except ImportError:  # pragma: no cover - doctor reports this cleanly
 
 logger = logging.getLogger(__name__)
 
+IMESSAGE_MAX_LENGTH = 18995
+
 
 def _json_safe(value: Any) -> Any:
     """Convert SDK dataclasses (UUIDs, datetimes, enums) into JSON-safe data."""
@@ -59,8 +61,20 @@ def _result(data: Any) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(_json_safe(data), ensure_ascii=False)}]}
 
 
-def _error(message: str) -> Dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps({"error": message})}], "is_error": True}
+def _error(message: str, **fields: Any) -> Dict[str, Any]:
+    payload = {"error": message, **fields}
+    return {
+        "content": [{"type": "text", "text": json.dumps(_json_safe(payload), ensure_ascii=False)}],
+        "is_error": True,
+    }
+
+
+def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
+    char_count = len(content or "")
+    return (
+        f"{channel} text is {char_count} characters; maximum is {max_chars}. "
+        f"Shorten it or split it into smaller {channel} messages."
+    )
 
 
 def _upload_media_url(identity: Any, path: str) -> str:
@@ -211,15 +225,24 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "inkbox_list_imessage_conversations (iMessage is recipient-first: a "
         "conversation exists only after the person has messaged this agent). To "
         "attach an image/file, pass media_path as a local file path (uploaded "
-        "automatically, max 10 MB).",
+        "automatically, max 10 MB). Text is limited to 18995 characters.",
         {"conversation_id": str, "text": str, "media_path": str},
     )
     async def inkbox_send_imessage(args: Dict[str, Any]) -> Dict[str, Any]:
+        text = str(args.get("text") or "")
+        if len(text) > IMESSAGE_MAX_LENGTH:
+            return _error(
+                _message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH),
+                error_code="imessage_too_long",
+                char_count=len(text),
+                max_chars=IMESSAGE_MAX_LENGTH,
+            )
+
         def _run():
             identity = _identity()
             kwargs: Dict[str, Any] = {
                 "conversation_id": str(args["conversation_id"]),
-                "text": str(args.get("text") or ""),
+                "text": text,
             }
             media_path = str(args.get("media_path") or "").strip()
             if media_path:

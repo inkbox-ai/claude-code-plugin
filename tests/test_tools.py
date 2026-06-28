@@ -62,6 +62,7 @@ class _FakeIdentity:
         self.place_call_kwargs = None
         self.list_calls_kwargs = None
         self.transcript_call_id = None
+        self.sent_imessages = []
 
     def place_call(self, **kwargs):
         self.place_call_kwargs = kwargs
@@ -77,6 +78,10 @@ class _FakeIdentity:
             _FakeTranscript("remote", "hey can you check the build", 1),
             _FakeTranscript("local", "sure, it's green", 2),
         ]
+
+    def send_imessage(self, **kwargs):
+        self.sent_imessages.append(kwargs)
+        return type("Message", (), {"id": "im-1"})()
 
 
 class _FakeClient:
@@ -173,3 +178,19 @@ def test_get_call_transcript_requires_call_id():
     data = _call(_FakeClient(), "inkbox_get_call_transcript", {"call_id": "  "})
 
     assert "call_id is required" in data["error"]
+
+
+def test_send_imessage_rejects_text_over_limit():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {
+            "conversation_id": "imconv-123",
+            "text": "x" * (tools_mod.IMESSAGE_MAX_LENGTH + 1),
+        },
+    )
+
+    assert data["error_code"] == "imessage_too_long"
+    assert data["char_count"] == tools_mod.IMESSAGE_MAX_LENGTH + 1
+    assert client.identity.sent_imessages == []

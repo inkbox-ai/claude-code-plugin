@@ -157,11 +157,20 @@ def _call_ended_prompt(transcript: Any) -> str:
 
 WEBHOOK_DEDUP_TTL_SECONDS = 300
 SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
+IMESSAGE_MAX_LENGTH = 18995  # Sendblue-compatible iMessage text cap
 # Inbound SMS carrier keywords handled entirely by the Inkbox server;
 # never wake the agent for them.
 SMS_CONTROL_WORDS = {"stop", "start", "help", "unstop", "unsubscribe", "cancel", "end", "quit"}
 TEXT_EVENTS = ["text.received"]
 IMESSAGE_EVENTS = ["imessage.received", "imessage.reaction_received"]
+
+
+def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
+    char_count = len(content or "")
+    return (
+        f"{channel} text is {char_count} characters; maximum is {max_chars}. "
+        f"Shorten it or split it into smaller {channel} messages."
+    )
 
 
 def _claude_health() -> str:
@@ -1363,12 +1372,11 @@ class InkboxGateway:
             )
             return
 
-        identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
-
         if mode == "sms":
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:
                 text = text[: SMS_MAX_LENGTH - 1] + "…"
+            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             kwargs: Dict[str, Any] = {"text": text}
             if meta.get("conversation_id"):
                 kwargs["conversation_id"] = str(meta["conversation_id"])
@@ -1376,12 +1384,17 @@ class InkboxGateway:
                 kwargs["to"] = str(meta.get("to") or chat_id)
             await asyncio.to_thread(identity.send_text, **kwargs)
         elif mode == "imessage":
+            text = strip_markdown(content)
+            if len(text) > IMESSAGE_MAX_LENGTH:
+                raise ValueError(_message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH))
+            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             await asyncio.to_thread(
                 identity.send_imessage,
                 conversation_id=str(meta.get("conversation_id") or ""),
-                text=strip_markdown(content),
+                text=text,
             )
         else:  # email
+            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             subject = str(meta.get("subject") or "").strip()
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Claude Code agent"
             await asyncio.to_thread(
