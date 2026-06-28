@@ -75,8 +75,10 @@ class _FakeContactSession:
 class _FakeSessions:
     def __init__(self, session):
         self.session = session
+        self.requested_ids = []
 
-    def get(self, _chat_id):
+    def get(self, chat_id):
+        self.requested_ids.append(chat_id)
         return self.session
 
 
@@ -151,6 +153,37 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
     assert "[voice call ended]" in session.consults[0]
     assert "do not redo work that was already completed" in session.consults[0]
     assert "Please send the summary after this." in session.consults[0]
+
+
+def test_call_ws_uses_stored_call_contact_session_for_stt_tts(monkeypatch):
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"transcript","text":"Can you see my earlier texts?","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    session = _FakeContactSession()
+    sessions = _FakeSessions(session)
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw.sessions = sessions
+    gw._call_meta_by_id["call-1"] = {
+        "id": "call-1",
+        "direction": "inbound",
+        "remotePhoneNumber": "+15551234567",
+        "local_phone_number": "+15550001111",
+        "contacts": [{"bucket": "from", "contactId": "contact-1", "name": "Ada Lovelace"}],
+    }
+    request = _FakeRequest()
+    request.query = {"call_id": "call-1"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert sessions.requested_ids == ["contact-1", "contact-1"]
+    assert session.inbound[0][2]["sender"] == "+15551234567"
+    assert session.inbound[0][2]["contact"]["id"] == "contact-1"
+    assert session.inbound[0][2]["contact"]["name"] == "Ada Lovelace"
+    assert "call-1" not in gw._call_meta_by_id
 
 
 class _FakeBridge:

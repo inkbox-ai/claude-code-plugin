@@ -402,9 +402,18 @@ class InkboxGateway:
             return web.Response(status=400, text="invalid json")
 
         event_type = str(envelope.get("event_type") or "")
-        if not event_type and envelope.get("direction") == "inbound" and envelope.get("local_phone_number"):
+        if not event_type and (
+            self._call_context_id(envelope)
+            or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
+        ):
             # Incoming-call payloads are flat (no envelope); with
-            # auto_accept this is informational — the WS is the channel.
+            # auto_accept this is informational, but it can carry resolved
+            # contact context before the WS starts.
+            call_id = self._call_context_id(envelope)
+            if call_id:
+                self._call_meta_by_id[call_id] = envelope
+                if len(self._call_meta_by_id) > 100:
+                    self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
             return web.json_response({"ok": True})
 
         if event_type == "message.received":
@@ -450,8 +459,29 @@ class InkboxGateway:
         return None
 
     @classmethod
+    def _call_context_id(cls, call_context: Dict[str, Any]) -> str:
+        return str(cls._field(call_context, "id", "call_id", "callId") or "").strip()
+
+    @classmethod
+    def _merge_call_context(
+        cls, primary: Dict[str, Any], fallback: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        merged = dict(fallback or {})
+        for key, value in (primary or {}).items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+        return merged
+
+    @classmethod
     def _contact_values(cls, entries: Any) -> List[str]:
-        rows = list(entries or [])
+        if not entries:
+            return []
+        if isinstance(entries, str):
+            rows = [entries]
+        elif isinstance(entries, (list, tuple)):
+            rows = list(entries)
+        else:
+            rows = [entries]
         rows.sort(
             key=lambda item: not bool(cls._field(item, "is_primary", "isPrimary")),
         )
@@ -476,10 +506,30 @@ class InkboxGateway:
             or None
         )
         summary = {
-            "id": str(cls._field(contact, "id") or ""),
+            "id": str(cls._field(contact, "id", "contact_id", "contactId") or ""),
             "name": str(name) if name else None,
-            "emails": cls._contact_values(cls._field(contact, "emails", "email_addresses", "emailAddresses")),
-            "phones": cls._contact_values(cls._field(contact, "phones", "phone_numbers", "phoneNumbers")),
+            "emails": cls._contact_values(
+                cls._field(
+                    contact,
+                    "emails",
+                    "email_addresses",
+                    "emailAddresses",
+                    "email",
+                    "email_address",
+                    "emailAddress",
+                )
+            ),
+            "phones": cls._contact_values(
+                cls._field(
+                    contact,
+                    "phones",
+                    "phone_numbers",
+                    "phoneNumbers",
+                    "phone",
+                    "phone_number",
+                    "phoneNumber",
+                )
+            ),
             "company": cls._field(contact, "company_name", "companyName", "company"),
             "job_title": cls._field(contact, "job_title", "jobTitle", "title"),
             "notes": ((str(cls._field(contact, "notes") or "")[:200]).strip() or None),
@@ -502,13 +552,41 @@ class InkboxGateway:
         self, call_context: Dict[str, Any], remote: str
     ) -> Optional[Dict[str, Any]]:
         """Resolve the call's remote party before Realtime greets."""
-        direct = call_context.get("contact")
+        direct = (
+            call_context.get("contact")
+            or call_context.get("remote_contact")
+            or call_context.get("remoteContact")
+        )
         if direct:
             return await self._hydrate_contact(direct)
 
-        contacts = call_context.get("contacts") or call_context.get("contact_list") or []
+        contact_id = self._field(
+            call_context, "contact_id", "contactId", "remote_contact_id", "remoteContactId"
+        )
+        if contact_id:
+            return await self._hydrate_contact({
+                "id": contact_id,
+                "name": self._field(
+                    call_context, "contact_name", "contactName", "remote_name", "remoteName"
+                ),
+            })
+
+        contacts = (
+            call_context.get("contacts")
+            or call_context.get("contact_list")
+            or call_context.get("contactList")
+            or []
+        )
+        if isinstance(contacts, dict):
+            contacts = [contacts]
         if len(contacts) == 1:
             return await self._hydrate_contact(contacts[0])
+        for entry in contacts:
+            bucket = str(self._field(entry, "bucket", "role", "type") or "").lower()
+            if bucket in {"from", "remote", "caller", "callee", "to"} and self._field(
+                entry, "id", "contact_id", "contactId"
+            ):
+                return await self._hydrate_contact(entry)
 
         if not remote or self._inkbox is None:
             return None
@@ -870,17 +948,29 @@ class InkboxGateway:
             call_context = json.loads(call_context_raw) if call_context_raw else {}
         except json.JSONDecodeError:
             call_context = {}
-        call_id = str(call_context.get("id") or call_context.get("call_id") or "")
+        call_id = self._call_context_id(call_context) or str(request.query.get("call_id") or "").strip()
+        stored_call_context = self._call_meta_by_id.pop(call_id, None) if call_id else None
+        if stored_call_context:
+            call_context = self._merge_call_context(call_context, stored_call_context)
+        if call_id and not self._call_context_id(call_context):
+            call_context["id"] = call_id
+        call_id = self._call_context_id(call_context) or call_id
         outbound = self._load_outbound_context(request.query.get("context_token"))
         remote = str(
-            call_context.get("remote_phone_number")
-            or call_context.get("from_number")
-            or call_context.get("to_number")
+            self._field(
+                call_context,
+                "remote_phone_number",
+                "remotePhoneNumber",
+                "from_number",
+                "fromNumber",
+                "to_number",
+                "toNumber",
+            )
             or (outbound or {}).get("to_number")
             or ""
         ).strip()
         direction = str(
-            call_context.get("direction") or ("outbound" if outbound else "inbound")
+            self._field(call_context, "direction") or ("outbound" if outbound else "inbound")
         ).strip().lower() or "inbound"
         contact = await self._resolve_call_contact(call_context, remote)
         chat_id = (contact or {}).get("id") or remote or f"call:{call_id}"
