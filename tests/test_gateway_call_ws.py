@@ -59,6 +59,26 @@ class _NoDeliveryInkbox:
         raise AssertionError("send_to_contact must not reach Inkbox delivery")
 
 
+class _FakeIdentity:
+    def __init__(self):
+        self.sent_texts = []
+        self.sent_imessages = []
+
+    def send_text(self, **kwargs):
+        self.sent_texts.append(kwargs)
+
+    def send_imessage(self, **kwargs):
+        self.sent_imessages.append(kwargs)
+
+
+class _DeliveryInkbox:
+    def __init__(self, identity):
+        self.identity = identity
+
+    def get_identity(self, _identity):
+        return self.identity
+
+
 class _FakeContactSession:
     def __init__(self):
         self.inbound = []
@@ -158,6 +178,26 @@ def test_send_to_contact_rejects_over_limit_imessage_without_delivery():
         assert "iMessage text is 18996 characters" in str(exc)
     else:
         raise AssertionError("expected over-limit iMessage reply to be rejected")
+
+
+def test_send_to_contact_uses_prefixed_sms_conversation_chat_id():
+    identity = _FakeIdentity()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _DeliveryInkbox(identity)
+
+    asyncio.run(gw.send_to_contact("sms:conv-123", "reply", "sms", {}))
+
+    assert identity.sent_texts == [{"text": "reply", "conversation_id": "conv-123"}]
+
+
+def test_send_to_contact_uses_prefixed_imessage_conversation_chat_id():
+    identity = _FakeIdentity()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _DeliveryInkbox(identity)
+
+    asyncio.run(gw.send_to_contact("imessage:imconv-123", "reply", "imessage", {}))
+
+    assert identity.sent_imessages == [{"conversation_id": "imconv-123", "text": "reply"}]
 
 
 def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):

@@ -450,12 +450,25 @@ class InkboxGateway:
         return web.json_response({"ok": True, "ignored": event_type})
 
     @staticmethod
-    def _chat_key(data: Dict[str, Any], fallback: str) -> str:
+    def _thread_key(prefix: str, value: Any) -> Optional[str]:
+        raw = str(value or "").strip()
+        return f"{prefix}:{raw}" if raw else None
+
+    @staticmethod
+    def _chat_key(
+        data: Dict[str, Any],
+        fallback: str,
+        thread_key: Optional[str] = None,
+    ) -> str:
         # Webhook payloads carry resolved contacts — key the session by
-        # contact id so email/SMS/iMessage/voice converge on one session.
+        # contact id so email/SMS/iMessage/voice converge on one session. If
+        # Inkbox cannot resolve a contact, keep channel conversations stable
+        # before falling back to the raw address/number.
         contacts = data.get("contacts") or []
         if len(contacts) == 1 and contacts[0].get("id"):
             return str(contacts[0]["id"])
+        if thread_key:
+            return thread_key
         return fallback
 
     @staticmethod
@@ -646,7 +659,8 @@ class InkboxGateway:
         if message.get("has_attachments"):
             saved = await self._fetch_mail_attachments(message)
             body_text = (body_text + inbound_media_note(saved)).strip()
-        chat_id = self._chat_key(data, sender)
+        thread_key = self._thread_key("email", message.get("thread_id"))
+        chat_id = self._chat_key(data, sender, thread_key)
         meta = {
             "to": sender,
             "sender": sender,
@@ -856,7 +870,8 @@ class InkboxGateway:
                 local_phone=local_phone,
                 participants=participants,
             )
-        chat_id = f"sms:{conversation_id}" if is_group and conversation_id else self._chat_key(data, sender)
+        thread_key = self._thread_key("sms", conversation_id)
+        chat_id = thread_key if is_group and thread_key else self._chat_key(data, sender, thread_key)
         meta = {
             "conversation_id": conversation_id or None,
             "to": sender,
@@ -880,8 +895,9 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
         body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
-        chat_id = self._chat_key(data, sender)
-        meta = {"conversation_id": message.get("conversation_id"), "sender": sender}
+        conversation_id = str(message.get("conversation_id") or "").strip()
+        chat_id = self._chat_key(data, sender, self._thread_key("imessage", conversation_id))
+        meta = {"conversation_id": conversation_id or None, "sender": sender}
         await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
         return web.json_response({"ok": True})
 
@@ -915,7 +931,7 @@ class InkboxGateway:
             target_message_id=target_message_id,
             reaction_label=reaction_label,
         )
-        chat_id = self._chat_key(data, sender)
+        chat_id = self._chat_key(data, sender, self._thread_key("imessage", conversation_id))
         meta = {
             "conversation_id": conversation_id or None,
             "sender": sender,
@@ -1006,7 +1022,8 @@ class InkboxGateway:
         reason = str(message.get("error_detail") or message.get("error_code") or "").strip()
         if event_type == "text.delivery_unconfirmed" and not reason:
             reason = "carrier could not confirm delivery"
-        chat_id = self._chat_key(data, recipient)
+        conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
+        chat_id = self._chat_key(data, recipient, self._thread_key("sms", conversation_id))
         logger.info("[bridge] SMS delivery failed to %s: %s", recipient, reason or event_type)
         return await self._notify_delivery_failure(chat_id, "SMS", recipient, body, reason or event_type)
 
@@ -1025,7 +1042,8 @@ class InkboxGateway:
             or message.get("status")
             or ""
         ).strip()
-        chat_id = self._chat_key(data, recipient)
+        conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
+        chat_id = self._chat_key(data, recipient, self._thread_key("imessage", conversation_id))
         logger.info("[bridge] iMessage delivery failed to %s: %s", recipient, reason)
         return await self._notify_delivery_failure(chat_id, "iMessage", recipient, body, reason)
 
@@ -1039,7 +1057,7 @@ class InkboxGateway:
         recipient = str(to_addresses[0] if to_addresses else "").strip()
         subject = str(message.get("subject") or "").strip()
         reason = "bounced" if event_type == "message.bounced" else "permanent send failure"
-        chat_id = self._chat_key(data, recipient)
+        chat_id = self._chat_key(data, recipient, self._thread_key("email", message.get("thread_id")))
         logger.info("[bridge] email %s to %s (subject: %s)", reason, recipient, subject)
         body = f"(email, subject: {subject})" if subject else ""
         return await self._notify_delivery_failure(chat_id, "email", recipient, body, reason)
@@ -1378,8 +1396,11 @@ class InkboxGateway:
                 raise ValueError(_message_too_long_reason("SMS", text, SMS_MAX_LENGTH))
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             kwargs: Dict[str, Any] = {"text": text}
-            if meta.get("conversation_id"):
-                kwargs["conversation_id"] = str(meta["conversation_id"])
+            conversation_id = str(meta.get("conversation_id") or "").strip()
+            if not conversation_id and str(chat_id).startswith("sms:"):
+                conversation_id = str(chat_id).split(":", 1)[1]
+            if conversation_id:
+                kwargs["conversation_id"] = conversation_id
             else:
                 kwargs["to"] = str(meta.get("to") or chat_id)
             await asyncio.to_thread(identity.send_text, **kwargs)
@@ -1388,9 +1409,14 @@ class InkboxGateway:
             if len(text) > IMESSAGE_MAX_LENGTH:
                 raise ValueError(_message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH))
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            conversation_id = str(meta.get("conversation_id") or "").strip()
+            if not conversation_id and str(chat_id).startswith("imessage:"):
+                conversation_id = str(chat_id).split(":", 1)[1]
+            if not conversation_id:
+                raise ValueError(f"No iMessage conversation id for chat {chat_id}")
             await asyncio.to_thread(
                 identity.send_imessage,
-                conversation_id=str(meta.get("conversation_id") or ""),
+                conversation_id=conversation_id,
                 text=text,
             )
         else:  # email

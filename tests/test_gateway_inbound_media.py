@@ -71,6 +71,62 @@ def test_inbound_imessage_with_text_and_media_appends_note(monkeypatch):
     assert "/m/imsg-0.png (image/png)" in body
 
 
+def test_unknown_inbound_email_uses_thread_session_key(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {"message": {
+        "id": "m1",
+        "from_address": "person@example.com",
+        "thread_id": "thread-123",
+        "subject": "Project",
+        "snippet": "Can you check this?",
+    }}}
+
+    asyncio.run(gw._on_mail_received(envelope))
+
+    body, mode, meta = gw.sessions.by_id["email:thread-123"].inbound[0]
+    assert body == "Can you check this?"
+    assert mode == "email"
+    assert meta["to"] == "person@example.com"
+    assert meta["thread_id"] == "thread-123"
+
+
+def test_unknown_direct_sms_uses_conversation_session_key(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {"text_message": {
+        "id": "t-direct",
+        "direction": "inbound",
+        "remote_phone_number": "+15550000000",
+        "conversation_id": "conv-direct",
+        "text": "direct text",
+    }}}
+
+    asyncio.run(gw._on_text_received(envelope))
+
+    body, mode, meta = gw.sessions.by_id["sms:conv-direct"].inbound[0]
+    assert body == "direct text"
+    assert mode == "sms"
+    assert meta["conversation_id"] == "conv-direct"
+    assert meta["conversation_kind"] == "direct"
+
+
+def test_unknown_inbound_imessage_uses_conversation_session_key(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {"message": {
+        "id": "i2",
+        "direction": "inbound",
+        "remote_number": "+15551112222",
+        "conversation_id": "imconv-123",
+        "content": "hello",
+    }}}
+
+    asyncio.run(gw._on_imessage_received(envelope))
+
+    body, mode, meta = gw.sessions.by_id["imessage:imconv-123"].inbound[0]
+    assert body == "hello"
+    assert mode == "imessage"
+    assert meta["conversation_id"] == "imconv-123"
+
+
 def test_inbound_text_without_media_is_unchanged(monkeypatch):
     gw = _gw(monkeypatch, [])
     envelope = {"data": {"text_message": {
@@ -134,6 +190,27 @@ def test_imessage_reaction_injects_silent_policy(monkeypatch):
     assert "return exactly [SILENT]" in body
     assert meta["conversation_id"] == "imconv-123"
     assert meta["typing"] is True
+
+
+def test_imessage_reaction_without_contact_uses_conversation_session_key(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {
+        "reaction": {
+            "id": "react-2",
+            "direction": "inbound",
+            "remote_number": "+15551112222",
+            "conversation_id": "imconv-456",
+            "target_message_id": "im-target-10",
+            "reaction": "like",
+        },
+    }}
+
+    asyncio.run(gw._on_imessage_reaction_received(envelope))
+
+    body, mode, meta = gw.sessions.by_id["imessage:imconv-456"].inbound[0]
+    assert mode == "imessage"
+    assert "reaction=like" in body
+    assert meta["conversation_id"] == "imconv-456"
 
 
 def test_outbound_imessage_reaction_echo_is_ignored(monkeypatch):
