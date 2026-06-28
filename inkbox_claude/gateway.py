@@ -6,8 +6,9 @@ adapter:
 1. On startup, bring up the identity's Inkbox tunnel (or use
    ``INKBOX_PUBLIC_URL``), reconcile webhook subscriptions for the
    identity's mailbox (``message.received``), phone number
-   (``text.received``), and — when iMessage-enabled — the identity
-   itself (``imessage.received``), and patch the phone number's
+   (``text.received``), and - when iMessage-enabled - the identity
+   itself (``imessage.received`` and ``imessage.reaction_received``),
+   and patch the phone number's
    incoming-call channel to auto-accept onto our call WebSocket.
 2. Serve ``POST /webhook`` (HMAC-verified) and ``WS /phone/media/ws``.
 3. Map every inbound event to a contact-keyed Claude Code session:
@@ -159,6 +160,8 @@ SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
 # Inbound SMS carrier keywords handled entirely by the Inkbox server;
 # never wake the agent for them.
 SMS_CONTROL_WORDS = {"stop", "start", "help", "unstop", "unsubscribe", "cancel", "end", "quit"}
+TEXT_EVENTS = ["text.received"]
+IMESSAGE_EVENTS = ["imessage.received", "imessage.reaction_received"]
 
 
 def _claude_health() -> str:
@@ -332,7 +335,7 @@ class InkboxGateway:
             _reconcile({"mailbox_id": identity.mailbox.id}, ["message.received"])
             logger.info("[bridge] mailbox %s → %s", identity.mailbox.email_address, webhook_url)
         if identity.phone_number is not None:
-            _reconcile({"phone_number_id": identity.phone_number.id}, ["text.received"])
+            _reconcile({"phone_number_id": identity.phone_number.id}, TEXT_EVENTS)
             # auto_accept: Inkbox answers and opens the call WS directly.
             self._inkbox.phone_numbers.update(
                 identity.phone_number.id,
@@ -342,7 +345,7 @@ class InkboxGateway:
             )
             logger.info("[bridge] phone %s → %s + %s", identity.phone_number.number, webhook_url, ws_url)
         if getattr(identity, "imessage_enabled", False):
-            _reconcile({"agent_identity_id": identity.id}, ["imessage.received"])
+            _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
             logger.info("[bridge] iMessage for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
@@ -422,6 +425,8 @@ class InkboxGateway:
             return await self._on_text_received(envelope)
         if event_type == "imessage.received":
             return await self._on_imessage_received(envelope)
+        if event_type == "imessage.reaction_received":
+            return await self._on_imessage_reaction_received(envelope)
         # Outbound delivery failures: tell the agent its message didn't land so
         # it can retry or reach the human another way.
         if event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
@@ -457,6 +462,25 @@ class InkboxGateway:
             if value not in (None, ""):
                 return value
         return None
+
+    @classmethod
+    def _webhook_list(cls, obj: Any, *names: str) -> List[Any]:
+        if obj is None:
+            return []
+        for name in names:
+            value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+            if isinstance(value, (list, tuple)):
+                return list(value)
+        return []
+
+    @classmethod
+    def _string_list_field(cls, obj: Any, *names: str) -> List[str]:
+        values = cls._webhook_list(obj, *names)
+        return [str(value).strip() for value in values if str(value).strip()]
+
+    @classmethod
+    def _conversation_summary_is_group(cls, summary: Any) -> bool:
+        return bool(cls._field(summary, "isGroup", "is_group", "is_group_conversation"))
 
     @classmethod
     def _call_context_id(cls, call_context: Dict[str, Any]) -> str:
@@ -679,6 +703,94 @@ class InkboxGateway:
             logger.debug("[bridge] full-body fetch failed; using snippet", exc_info=True)
         return str(message.get("snippet") or "")
 
+    async def _lookup_text_conversation_summary(self, conversation_id: str) -> Any:
+        if not conversation_id:
+            return None
+
+        def _lookup() -> Any:
+            identity = self._identity
+            if identity is None and self._inkbox is not None:
+                identity = self._inkbox.get_identity(self.cfg.identity)
+            if identity is None:
+                return None
+            method = getattr(identity, "list_text_conversations", None)
+            if callable(method):
+                try:
+                    conversations = method(limit=200, offset=0, include_groups=True)
+                except TypeError:
+                    conversations = method({"limit": 200, "offset": 0, "includeGroups": True})
+            else:
+                method = getattr(identity, "listTextConversations", None)
+                if not callable(method):
+                    return None
+                conversations = method({"limit": 200, "offset": 0, "includeGroups": True})
+            for entry in conversations or []:
+                if str(self._field(entry, "id", "conversation_id", "conversationId") or "") == conversation_id:
+                    return entry
+            return None
+
+        try:
+            return await asyncio.to_thread(_lookup)
+        except Exception:
+            logger.debug(
+                "[bridge] text conversation summary lookup failed for %s",
+                conversation_id,
+                exc_info=True,
+            )
+            return None
+
+    @classmethod
+    def _group_sms_prompt(
+        cls,
+        body: str,
+        *,
+        sender: str,
+        conversation_id: str,
+        local_phone: str,
+        participants: List[str],
+    ) -> str:
+        marker_parts = [
+            f"[inkbox:group_sms conversation_id={conversation_id or 'unknown'}",
+            f"from={sender}",
+            f"local={local_phone}" if local_phone else None,
+            f"participants={','.join(participants)}" if participants else None,
+            "reply_mode=conversation_id]",
+        ]
+        marker = " ".join(part for part in marker_parts if part)
+        policy = "\n".join([
+            "Group SMS response policy: you receive every message in this group so you can track context.",
+            "Reply only when the latest message clearly addresses this Inkbox agent, asks it to act, or a visible answer would be expected from the agent.",
+            "Treat ordinary group chatter as context only.",
+            "If no visible reply is warranted, return exactly [SILENT].",
+        ])
+        return "\n".join(part for part in [marker, policy, body] if part)
+
+    @classmethod
+    def _imessage_reaction_prompt(
+        cls,
+        *,
+        sender: str,
+        conversation_id: str,
+        target_message_id: str,
+        reaction_label: str,
+    ) -> str:
+        conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
+        target_part = f" target_message_id={target_message_id}" if target_message_id else ""
+        marker = (
+            f"[inkbox:imessage_reaction from={sender} reaction={reaction_label}"
+            f"{conversation_part}{target_part}]"
+        )
+        policy = "\n".join([
+            f"{sender} reacted with a '{reaction_label}' tapback to your message.",
+            "A reaction is a lightweight signal, not always a request for a reply.",
+            "Reply only when the reaction plausibly warrants one - e.g. a 'question' "
+            "tapback usually asks for clarification or a follow-up, 'emphasize' may "
+            "invite one, while 'love'/'like'/'laugh'/'dislike' are usually just "
+            "acknowledgements that need no response.",
+            "If no visible reply is warranted, return exactly [SILENT].",
+        ])
+        return f"{marker}\n{policy}"
+
     async def _on_text_received(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("text_message") or {}
@@ -699,11 +811,48 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
         body = await self._with_media(text, media, prefix=f"sms-{message.get('id', '')}")
-        chat_id = self._chat_key(data, sender)
+        conversation_id = str(
+            message.get("conversation_id") or message.get("conversationId") or ""
+        ).strip()
+        local_phone = str(
+            message.get("local_phone_number") or message.get("localPhoneNumber") or ""
+        ).strip()
+        conversation_summary = await self._lookup_text_conversation_summary(conversation_id)
+        participants: List[str] = []
+        for entry in (
+            self._string_list_field(conversation_summary, "participants")
+            + self._string_list_field(message, "participants")
+        ):
+            if entry not in participants:
+                participants.append(entry)
+        contacts = self._webhook_list(data, "contacts", "contact_list")
+        agent_identities = self._webhook_list(
+            data,
+            "agent_identities",
+            "agentIdentities",
+            "identity_agents",
+        )
+        is_group = (
+            self._conversation_summary_is_group(conversation_summary)
+            or bool(self._field(message, "isGroup", "is_group"))
+            or len(participants) > 1
+            or len(contacts) > 1
+            or len(agent_identities) > 1
+        )
+        if is_group:
+            body = self._group_sms_prompt(
+                body,
+                sender=sender,
+                conversation_id=conversation_id,
+                local_phone=local_phone,
+                participants=participants,
+            )
+        chat_id = f"sms:{conversation_id}" if is_group and conversation_id else self._chat_key(data, sender)
         meta = {
-            "conversation_id": message.get("conversation_id"),
+            "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
+            "conversation_kind": "group" if is_group else "direct",
         }
         await self.sessions.get(chat_id).handle_inbound(body, "sms", meta)
         return web.json_response({"ok": True})
@@ -724,6 +873,48 @@ class InkboxGateway:
         body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         chat_id = self._chat_key(data, sender)
         meta = {"conversation_id": message.get("conversation_id"), "sender": sender}
+        await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+        return web.json_response({"ok": True})
+
+    async def _on_imessage_reaction_received(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data") or {}
+        reaction = data.get("reaction") or {}
+        reaction_id = str(reaction.get("id") or "").strip()
+        if reaction_id and self._is_duplicate(f"imessage_reaction:{reaction_id}"):
+            return web.json_response({"ok": True, "deduped": True})
+        direction = str(reaction.get("direction") or "").strip().lower()
+        if direction and direction != "inbound":
+            return web.json_response({"ok": True, "ignored": "outbound-reaction"})
+        sender = str(reaction.get("remote_number") or "").strip()
+        if not sender:
+            return web.json_response({"ok": True, "ignored": "empty"})
+        if not self._sender_allowed(sender):
+            return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
+
+        conversation_id = str(reaction.get("conversation_id") or "").strip()
+        target_message_id = str(reaction.get("target_message_id") or "").strip()
+        reaction_type = str(reaction.get("reaction") or "").strip().lower()
+        custom_emoji = str(reaction.get("custom_emoji") or "").strip()
+        reaction_label = (
+            f"{reaction_type}:{custom_emoji}"
+            if reaction_type == "custom" and custom_emoji
+            else reaction_type
+        ) or "unknown"
+        body = self._imessage_reaction_prompt(
+            sender=sender,
+            conversation_id=conversation_id,
+            target_message_id=target_message_id,
+            reaction_label=reaction_label,
+        )
+        chat_id = self._chat_key(data, sender)
+        meta = {
+            "conversation_id": conversation_id or None,
+            "sender": sender,
+            "message_id": reaction_id or target_message_id,
+            "reply_to_id": target_message_id or reaction_id,
+            "reaction": reaction_label,
+            "typing": reaction_label == "question",
+        }
         await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
         return web.json_response({"ok": True})
 

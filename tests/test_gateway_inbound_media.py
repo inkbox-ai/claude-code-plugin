@@ -82,6 +82,79 @@ def test_inbound_text_without_media_is_unchanged(monkeypatch):
     assert body == "just text"
 
 
+def test_group_sms_injects_silent_policy(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {
+        "text_message": {
+            "id": "t-group",
+            "direction": "inbound",
+            "remote_phone_number": "+15550000000",
+            "local_phone_number": "+15550000001",
+            "conversation_id": "conv-123",
+            "participants": ["+15550000000", "+15550000002"],
+            "text": "Dinner moved to 7.",
+        },
+    }}
+
+    asyncio.run(gw._on_text_received(envelope))
+
+    session = gw.sessions.by_id["sms:conv-123"]
+    body, mode, meta = session.inbound[0]
+    assert mode == "sms"
+    assert body.startswith("[inkbox:group_sms conversation_id=conv-123")
+    assert "participants=+15550000000,+15550000002" in body
+    assert "Group SMS response policy" in body
+    assert "return exactly [SILENT]" in body
+    assert meta["conversation_id"] == "conv-123"
+    assert meta["conversation_kind"] == "group"
+
+
+def test_imessage_reaction_injects_silent_policy(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {
+        "reaction": {
+            "id": "react-1",
+            "direction": "inbound",
+            "remote_number": "+15551112222",
+            "conversation_id": "imconv-123",
+            "target_message_id": "im-target-9",
+            "reaction": "question",
+        },
+        "contacts": [{"id": "contact-9"}],
+    }}
+
+    asyncio.run(gw._on_imessage_reaction_received(envelope))
+
+    session = gw.sessions.by_id["contact-9"]
+    body, mode, meta = session.inbound[0]
+    assert mode == "imessage"
+    assert body.startswith("[inkbox:imessage_reaction from=+15551112222 reaction=question")
+    assert "conversation_id=imconv-123" in body
+    assert "target_message_id=im-target-9" in body
+    assert "return exactly [SILENT]" in body
+    assert meta["conversation_id"] == "imconv-123"
+    assert meta["typing"] is True
+
+
+def test_outbound_imessage_reaction_echo_is_ignored(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {"reaction": {
+        "id": "react-out",
+        "direction": "outbound",
+        "remote_number": "+15551112222",
+        "reaction": "like",
+    }}}
+
+    resp = asyncio.run(gw._on_imessage_reaction_received(envelope))
+
+    assert json.loads(resp.text)["ignored"] == "outbound-reaction"
+    assert gw.sessions.by_id == {}
+
+
+def test_imessage_reaction_subscribed():
+    assert "imessage.reaction_received" in gateway.IMESSAGE_EVENTS
+
+
 def test_empty_message_no_text_no_media_is_ignored(monkeypatch):
     gw = _gw(monkeypatch, [])
     envelope = {"data": {"text_message": {

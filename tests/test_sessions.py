@@ -188,6 +188,20 @@ def test_typing_loop_skips_non_imessage():
     asyncio.run(scenario())
 
 
+def test_typing_loop_skips_reaction_policy_without_visible_reply():
+    async def scenario():
+        typing = []
+        session = make_session([], typing)
+        session.mode = "imessage"
+        session.reply_meta = {"conversation_id": "c1", "typing": False}
+
+        await session._typing_loop()
+
+        assert typing == []
+
+    asyncio.run(scenario())
+
+
 def test_typing_loop_stops_at_safety_cap(monkeypatch):
     monkeypatch.setattr(sessions_mod, "TYPING_REFRESH_SECONDS", 0.01)
     monkeypatch.setattr(sessions_mod, "TYPING_MAX_SECONDS", 0.025)

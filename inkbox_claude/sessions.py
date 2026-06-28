@@ -700,6 +700,8 @@ class ContactSession:
         """
         if self.typing_fn is None:
             return
+        if self.reply_meta.get("typing") is False:
+            return
         elapsed = 0.0
         try:
             while elapsed < TYPING_MAX_SECONDS:
