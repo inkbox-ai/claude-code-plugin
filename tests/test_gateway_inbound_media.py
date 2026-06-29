@@ -57,6 +57,23 @@ def test_inbound_mms_media_only_wakes_agent_with_note(monkeypatch):
     assert "Read tool" in body
 
 
+def test_duplicate_inbound_sms_event_id_does_not_double_enqueue(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {"text_message": {
+        "id": "t1",
+        "direction": "inbound",
+        "remote_phone_number": "+15551234567",
+        "text": "hello",
+    }}}
+
+    first = asyncio.run(gw._on_text_received(envelope))
+    second = asyncio.run(gw._on_text_received(envelope))
+
+    assert json.loads(first.text)["ok"] is True
+    assert json.loads(second.text)["deduped"] is True
+    assert len(gw.sessions.by_id["+15551234567"].inbound) == 1
+
+
 def test_inbound_imessage_with_text_and_media_appends_note(monkeypatch):
     gw = _gw(monkeypatch, [{"path": "/m/imsg-0.png", "content_type": "image/png"}])
     envelope = {"data": {"message": {
@@ -69,6 +86,23 @@ def test_inbound_imessage_with_text_and_media_appends_note(monkeypatch):
     assert mode == "imessage"
     assert body.startswith("check this out")
     assert "/m/imsg-0.png (image/png)" in body
+
+
+def test_duplicate_inbound_imessage_event_id_does_not_double_enqueue(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {"message": {
+        "id": "i1",
+        "direction": "inbound",
+        "remote_number": "+15551112222",
+        "content": "hello",
+    }}}
+
+    first = asyncio.run(gw._on_imessage_received(envelope))
+    second = asyncio.run(gw._on_imessage_received(envelope))
+
+    assert json.loads(first.text)["ok"] is True
+    assert json.loads(second.text)["deduped"] is True
+    assert len(gw.sessions.by_id["+15551112222"].inbound) == 1
 
 
 def test_unknown_inbound_email_uses_thread_session_key(monkeypatch):

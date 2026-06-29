@@ -89,9 +89,31 @@ class _FakeIdentity:
         return type("Message", (), {"id": "sms-1"})()
 
 
+class _FakeVcards:
+    def __init__(self):
+        self.exported = []
+
+    def export_vcard(self, contact_id):
+        self.exported.append(contact_id)
+        return "BEGIN:VCARD\nVERSION:4.0\nFN:Ada Lovelace\nEND:VCARD"
+
+
+class _FakeContacts:
+    def __init__(self):
+        self.vcards = _FakeVcards()
+        self.deleted = []
+
+    def get(self, contact_id):
+        return {"id": contact_id, "given_name": "Ada"}
+
+    def delete(self, contact_id):
+        self.deleted.append(contact_id)
+
+
 class _FakeClient:
     def __init__(self):
         self.identity = _FakeIdentity()
+        self.contacts = _FakeContacts()
 
     def get_identity(self, _handle):
         return self.identity
@@ -117,6 +139,44 @@ def test_call_tools_are_registered():
     assert "mcp__inkbox__inkbox_place_call" in tool_names
     assert "mcp__inkbox__inkbox_list_calls" in tool_names
     assert "mcp__inkbox__inkbox_get_call_transcript" in tool_names
+
+
+def test_coding_agent_tool_tier_is_registered():
+    tools, tool_names = _tool_map(_FakeClient())
+    expected = {
+        "inkbox_whoami",
+        "inkbox_send_email",
+        "inkbox_send_sms",
+        "inkbox_send_imessage",
+        "inkbox_place_call",
+        "inkbox_list_calls",
+        "inkbox_get_call_transcript",
+        "inkbox_list_text_conversations",
+        "inkbox_get_text_conversation",
+        "inkbox_list_imessage_conversations",
+        "inkbox_get_imessage_conversation",
+        "inkbox_lookup_contact",
+        "inkbox_list_contacts",
+        "inkbox_get_contact",
+        "inkbox_create_contact",
+        "inkbox_update_contact",
+        "inkbox_export_contact_vcard",
+        "inkbox_delete_contact",
+    }
+
+    assert set(tools) == expected
+    assert set(tool_names) == {f"mcp__inkbox__{name}" for name in expected}
+
+
+def test_get_contact_and_export_vcard_tools():
+    client = _FakeClient()
+
+    contact = _call(client, "inkbox_get_contact", {"contact_id": "contact-1"})
+    vcard = _call(client, "inkbox_export_contact_vcard", {"contact_id": "contact-1"})
+
+    assert contact["id"] == "contact-1"
+    assert vcard["vcard"].startswith("BEGIN:VCARD")
+    assert client.contacts.vcards.exported == ["contact-1"]
 
 
 def test_place_call_writes_context_and_tags_websocket_url(tmp_path, monkeypatch):

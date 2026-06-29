@@ -211,6 +211,7 @@ class InkboxGateway:
 
         self._self_addresses: set[str] = set()
         self._recent_request_ids: Dict[str, float] = {}
+        self._inflight_request_ids: Dict[str, float] = {}
         self._active_call_ws: Dict[str, Any] = {}
         self._call_meta_by_id: Dict[str, Dict[str, Any]] = {}
         # Failed outbound message ids we've already told the agent about, so a
@@ -375,16 +376,43 @@ class InkboxGateway:
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"ok": True, "identity": self.cfg.identity})
 
-    def _is_duplicate(self, request_id: str) -> bool:
+    def _prune_dedup_ids(self) -> None:
         now = time.time()
-        # Opportunistic TTL sweep keeps the dict bounded.
-        for key, seen_at in list(self._recent_request_ids.items()):
-            if now - seen_at > WEBHOOK_DEDUP_TTL_SECONDS:
+        for store in (self._recent_request_ids, self._inflight_request_ids):
+            for key, seen_at in list(store.items()):
+                if now - seen_at > WEBHOOK_DEDUP_TTL_SECONDS:
+                    store.pop(key, None)
+        if len(self._recent_request_ids) > 2000:
+            oldest = sorted(self._recent_request_ids.items(), key=lambda item: item[1])
+            for key, _seen_at in oldest[: len(self._recent_request_ids) - 2000]:
                 self._recent_request_ids.pop(key, None)
+
+    def _dedup_begin(self, request_id: str) -> bool:
+        if not request_id:
+            return False
+        self._prune_dedup_ids()
         if request_id and request_id in self._recent_request_ids:
             return True
+        if request_id and request_id in self._inflight_request_ids:
+            return True
+        self._inflight_request_ids[request_id] = time.time()
+        return False
+
+    def _dedup_commit(self, request_id: str) -> None:
+        if not request_id:
+            return
+        self._prune_dedup_ids()
+        self._inflight_request_ids.pop(request_id, None)
+        self._recent_request_ids[request_id] = time.time()
+
+    def _dedup_rollback(self, request_id: str) -> None:
         if request_id:
-            self._recent_request_ids[request_id] = now
+            self._inflight_request_ids.pop(request_id, None)
+
+    def _is_duplicate(self, request_id: str) -> bool:
+        if self._dedup_begin(request_id):
+            return True
+        self._dedup_commit(request_id)
         return False
 
     def _sender_allowed(self, *candidates: str) -> bool:
@@ -405,49 +433,57 @@ class InkboxGateway:
             if not ok:
                 return web.Response(status=401, text="invalid signature")
 
-        if self._is_duplicate(request.headers.get("X-Inkbox-Request-Id", "")):
+        request_id = request.headers.get("X-Inkbox-Request-Id", "")
+        if self._dedup_begin(request_id):
             return web.json_response({"ok": True, "deduped": True})
 
         try:
             envelope = json.loads(body)
         except json.JSONDecodeError:
+            self._dedup_rollback(request_id)
             return web.Response(status=400, text="invalid json")
 
-        event_type = str(envelope.get("event_type") or "")
-        if not event_type and (
-            self._call_context_id(envelope)
-            or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
-        ):
-            # Incoming-call payloads are flat (no envelope); with
-            # auto_accept this is informational, but it can carry resolved
-            # contact context before the WS starts.
-            call_id = self._call_context_id(envelope)
-            if call_id:
-                self._call_meta_by_id[call_id] = envelope
-                if len(self._call_meta_by_id) > 100:
-                    self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
-            return web.json_response({"ok": True})
-
-        if event_type == "message.received":
-            return await self._on_mail_received(envelope)
-        if event_type == "text.received":
-            return await self._on_text_received(envelope)
-        if event_type == "imessage.received":
-            return await self._on_imessage_received(envelope)
-        if event_type == "imessage.reaction_received":
-            return await self._on_imessage_reaction_received(envelope)
-        # Outbound delivery failures: tell the agent its message didn't land so
-        # it can retry or reach the human another way.
-        if event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
-            return await self._on_text_delivery_failed(envelope, event_type)
-        if event_type == "imessage.delivery_failed":
-            return await self._on_imessage_delivery_failed(envelope)
-        if event_type in ("message.bounced", "message.failed"):
-            return await self._on_mail_delivery_failed(envelope, event_type)
-        # Other delivery lifecycle (text.sent/delivered, imessage.sent/...) is
-        # logged without waking the agent, matching the hermes plugin.
-        logger.debug("[bridge] lifecycle event %s", event_type)
-        return web.json_response({"ok": True, "ignored": event_type})
+        try:
+            event_type = str(envelope.get("event_type") or "")
+            if not event_type and (
+                self._call_context_id(envelope)
+                or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
+            ):
+                # Incoming-call payloads are flat (no envelope); with
+                # auto_accept this is informational, but it can carry resolved
+                # contact context before the WS starts.
+                call_id = self._call_context_id(envelope)
+                if call_id:
+                    self._call_meta_by_id[call_id] = envelope
+                    if len(self._call_meta_by_id) > 100:
+                        self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
+                response = web.json_response({"ok": True})
+            elif event_type == "message.received":
+                response = await self._on_mail_received(envelope)
+            elif event_type == "text.received":
+                response = await self._on_text_received(envelope)
+            elif event_type == "imessage.received":
+                response = await self._on_imessage_received(envelope)
+            elif event_type == "imessage.reaction_received":
+                response = await self._on_imessage_reaction_received(envelope)
+            # Outbound delivery failures: tell the agent its message didn't land so
+            # it can retry or reach the human another way.
+            elif event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
+                response = await self._on_text_delivery_failed(envelope, event_type)
+            elif event_type == "imessage.delivery_failed":
+                response = await self._on_imessage_delivery_failed(envelope)
+            elif event_type in ("message.bounced", "message.failed"):
+                response = await self._on_mail_delivery_failed(envelope, event_type)
+            else:
+                # Other delivery lifecycle (text.sent/delivered, imessage.sent/...) is
+                # logged without waking the agent, matching the hermes plugin.
+                logger.debug("[bridge] lifecycle event %s", event_type)
+                response = web.json_response({"ok": True, "ignored": event_type})
+        except Exception:
+            self._dedup_rollback(request_id)
+            raise
+        self._dedup_commit(request_id)
+        return response
 
     @staticmethod
     def _thread_key(prefix: str, value: Any) -> Optional[str]:
@@ -817,6 +853,21 @@ class InkboxGateway:
     async def _on_text_received(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("text_message") or {}
+        message_id = str(message.get("id") or "").strip()
+        event_key = f"text:{message_id}" if message_id else ""
+        if self._dedup_begin(event_key):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            response = await self._on_text_received_once(envelope)
+        except Exception:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return response
+
+    async def _on_text_received_once(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data") or {}
+        message = data.get("text_message") or {}
         if message.get("direction") == "outbound":
             return web.json_response({"ok": True, "ignored": "outbound"})
         sender = str(
@@ -884,6 +935,21 @@ class InkboxGateway:
     async def _on_imessage_received(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("message") or {}
+        message_id = str(message.get("id") or "").strip()
+        event_key = f"imessage:{message_id}" if message_id else ""
+        if self._dedup_begin(event_key):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            response = await self._on_imessage_received_once(envelope)
+        except Exception:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return response
+
+    async def _on_imessage_received_once(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data") or {}
+        message = data.get("message") or {}
         if not message or message.get("direction") == "outbound":
             return web.json_response({"ok": True, "ignored": "outbound-or-reaction"})
         sender = str(message.get("remote_number") or "").strip()
@@ -905,43 +971,51 @@ class InkboxGateway:
         data = envelope.get("data") or {}
         reaction = data.get("reaction") or {}
         reaction_id = str(reaction.get("id") or "").strip()
-        if reaction_id and self._is_duplicate(f"imessage_reaction:{reaction_id}"):
+        event_key = f"imessage_reaction:{reaction_id}" if reaction_id else ""
+        if self._dedup_begin(event_key):
             return web.json_response({"ok": True, "deduped": True})
-        direction = str(reaction.get("direction") or "").strip().lower()
-        if direction and direction != "inbound":
-            return web.json_response({"ok": True, "ignored": "outbound-reaction"})
-        sender = str(reaction.get("remote_number") or "").strip()
-        if not sender:
-            return web.json_response({"ok": True, "ignored": "empty"})
-        if not self._sender_allowed(sender):
-            return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
-
-        conversation_id = str(reaction.get("conversation_id") or "").strip()
-        target_message_id = str(reaction.get("target_message_id") or "").strip()
-        reaction_type = str(reaction.get("reaction") or "").strip().lower()
-        custom_emoji = str(reaction.get("custom_emoji") or "").strip()
-        reaction_label = (
-            f"{reaction_type}:{custom_emoji}"
-            if reaction_type == "custom" and custom_emoji
-            else reaction_type
-        ) or "unknown"
-        body = self._imessage_reaction_prompt(
-            sender=sender,
-            conversation_id=conversation_id,
-            target_message_id=target_message_id,
-            reaction_label=reaction_label,
-        )
-        chat_id = self._chat_key(data, sender, self._thread_key("imessage", conversation_id))
-        meta = {
-            "conversation_id": conversation_id or None,
-            "sender": sender,
-            "message_id": reaction_id or target_message_id,
-            "reply_to_id": target_message_id or reaction_id,
-            "reaction": reaction_label,
-            "typing": reaction_label == "question",
-        }
-        await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
-        return web.json_response({"ok": True})
+        try:
+            direction = str(reaction.get("direction") or "").strip().lower()
+            if direction and direction != "inbound":
+                response = web.json_response({"ok": True, "ignored": "outbound-reaction"})
+            else:
+                sender = str(reaction.get("remote_number") or "").strip()
+                if not sender:
+                    response = web.json_response({"ok": True, "ignored": "empty"})
+                elif not self._sender_allowed(sender):
+                    response = web.json_response({"ok": True, "ignored": "sender-not-allowed"})
+                else:
+                    conversation_id = str(reaction.get("conversation_id") or "").strip()
+                    target_message_id = str(reaction.get("target_message_id") or "").strip()
+                    reaction_type = str(reaction.get("reaction") or "").strip().lower()
+                    custom_emoji = str(reaction.get("custom_emoji") or "").strip()
+                    reaction_label = (
+                        f"{reaction_type}:{custom_emoji}"
+                        if reaction_type == "custom" and custom_emoji
+                        else reaction_type
+                    ) or "unknown"
+                    body = self._imessage_reaction_prompt(
+                        sender=sender,
+                        conversation_id=conversation_id,
+                        target_message_id=target_message_id,
+                        reaction_label=reaction_label,
+                    )
+                    chat_id = self._chat_key(data, sender, self._thread_key("imessage", conversation_id))
+                    meta = {
+                        "conversation_id": conversation_id or None,
+                        "sender": sender,
+                        "message_id": reaction_id or target_message_id,
+                        "reply_to_id": target_message_id or reaction_id,
+                        "reaction": reaction_label,
+                        "typing": reaction_label == "question",
+                    }
+                    await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+                    response = web.json_response({"ok": True})
+        except Exception:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return response
 
     async def _with_media(self, text: str, media: List[Dict[str, Any]], *, prefix: str) -> str:
         """Download inbound media and append a note pointing Claude at the files.
