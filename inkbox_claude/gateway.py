@@ -6,8 +6,9 @@ adapter:
 1. On startup, bring up the identity's Inkbox tunnel (or use
    ``INKBOX_PUBLIC_URL``), reconcile webhook subscriptions for the
    identity's mailbox (``message.received``), phone number
-   (``text.received``), and — when iMessage-enabled — the identity
-   itself (``imessage.received``), and patch the phone number's
+   (``text.received``), and - when iMessage-enabled - the identity
+   itself (``imessage.received`` and ``imessage.reaction_received``),
+   and patch the phone number's
    incoming-call channel to auto-accept onto our call WebSocket.
 2. Serve ``POST /webhook`` (HMAC-verified) and ``WS /phone/media/ws``.
 3. Map every inbound event to a contact-keyed Claude Code session:
@@ -26,7 +27,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from aiohttp import WSMsgType, web
@@ -53,9 +54,15 @@ except ImportError:  # pragma: no cover
     INKBOX_TUNNEL_AVAILABLE = False
 
 try:
-    from .config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
+    from .config import (
+        DEFAULT_WEBHOOK_PATH,
+        INKBOX_WS_PATH,
+        BridgeConfig,
+        call_contexts_dir,
+        inkbox_client_kwargs,
+    )
     from .media import download_media, inbound_media_note
-    from .prompts import strip_markdown
+    from .prompts import contact_marker, strip_markdown
     from .realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -64,9 +71,9 @@ try:
     from .sessions import SessionManager
     from .tools import build_inkbox_mcp_server
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig
+    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, call_contexts_dir, inkbox_client_kwargs
     from media import download_media, inbound_media_note
-    from prompts import strip_markdown
+    from prompts import contact_marker, strip_markdown
     from realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -139,7 +146,9 @@ def _call_ended_prompt(transcript: Any) -> str:
     parts = [
         "[voice call ended] Your phone call with the operator just ended. If you "
         "committed to anything during it (open a PR, run a task, send a summary), "
-        "do that now with your tools. If there's nothing to do, do nothing.",
+        "do that now with your tools. First reconcile against the transcript: do "
+        "not redo work that was already completed, queued, canceled, or superseded "
+        "during the call. If there's nothing still needed, do nothing.",
     ]
     if convo:
         parts += ["", "Recent call transcript:", convo]
@@ -147,10 +156,22 @@ def _call_ended_prompt(transcript: Any) -> str:
 
 
 WEBHOOK_DEDUP_TTL_SECONDS = 300
+CONTACT_CACHE_TTL_SECONDS = 300
 SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
+IMESSAGE_MAX_LENGTH = 18995  # Sendblue-compatible iMessage text cap
 # Inbound SMS carrier keywords handled entirely by the Inkbox server;
 # never wake the agent for them.
 SMS_CONTROL_WORDS = {"stop", "start", "help", "unstop", "unsubscribe", "cancel", "end", "quit"}
+TEXT_EVENTS = ["text.received"]
+IMESSAGE_EVENTS = ["imessage.received", "imessage.reaction_received"]
+
+
+def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
+    char_count = len(content or "")
+    return (
+        f"{channel} text is {char_count} characters; maximum is {max_chars}. "
+        f"Shorten it or split it into smaller {channel} messages."
+    )
 
 
 def _claude_health() -> str:
@@ -191,8 +212,12 @@ class InkboxGateway:
 
         self._self_addresses: set[str] = set()
         self._recent_request_ids: Dict[str, float] = {}
+        self._inflight_request_ids: Dict[str, float] = {}
         self._active_call_ws: Dict[str, Any] = {}
         self._call_meta_by_id: Dict[str, Dict[str, Any]] = {}
+        # ((kind, value) -> (contact summary, expires_at)); mirrors Hermes'
+        # per-inbound lookup cache for repeated remote phone/email events.
+        self._contact_cache: Dict[Tuple[str, str], Tuple[Optional[Dict[str, Any]], float]] = {}
         # Failed outbound message ids we've already told the agent about, so a
         # webhook retry (or a second failure event for the same message) doesn't
         # re-notify and spin the agent in a loop.
@@ -215,7 +240,7 @@ class InkboxGateway:
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
 
-        self._inkbox = Inkbox(api_key=self.cfg.api_key, base_url=self.cfg.base_url)
+        self._inkbox = Inkbox(**inkbox_client_kwargs(self.cfg.api_key, self.cfg.base_url))
         self._identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
 
         mailbox = getattr(self._identity, "mailbox", None)
@@ -324,7 +349,7 @@ class InkboxGateway:
             _reconcile({"mailbox_id": identity.mailbox.id}, ["message.received"])
             logger.info("[bridge] mailbox %s → %s", identity.mailbox.email_address, webhook_url)
         if identity.phone_number is not None:
-            _reconcile({"phone_number_id": identity.phone_number.id}, ["text.received"])
+            _reconcile({"phone_number_id": identity.phone_number.id}, TEXT_EVENTS)
             # auto_accept: Inkbox answers and opens the call WS directly.
             self._inkbox.phone_numbers.update(
                 identity.phone_number.id,
@@ -334,7 +359,7 @@ class InkboxGateway:
             )
             logger.info("[bridge] phone %s → %s + %s", identity.phone_number.number, webhook_url, ws_url)
         if getattr(identity, "imessage_enabled", False):
-            _reconcile({"agent_identity_id": identity.id}, ["imessage.received"])
+            _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
             logger.info("[bridge] iMessage for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
@@ -355,16 +380,43 @@ class InkboxGateway:
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"ok": True, "identity": self.cfg.identity})
 
-    def _is_duplicate(self, request_id: str) -> bool:
+    def _prune_dedup_ids(self) -> None:
         now = time.time()
-        # Opportunistic TTL sweep keeps the dict bounded.
-        for key, seen_at in list(self._recent_request_ids.items()):
-            if now - seen_at > WEBHOOK_DEDUP_TTL_SECONDS:
+        for store in (self._recent_request_ids, self._inflight_request_ids):
+            for key, seen_at in list(store.items()):
+                if now - seen_at > WEBHOOK_DEDUP_TTL_SECONDS:
+                    store.pop(key, None)
+        if len(self._recent_request_ids) > 2000:
+            oldest = sorted(self._recent_request_ids.items(), key=lambda item: item[1])
+            for key, _seen_at in oldest[: len(self._recent_request_ids) - 2000]:
                 self._recent_request_ids.pop(key, None)
+
+    def _dedup_begin(self, request_id: str) -> bool:
+        if not request_id:
+            return False
+        self._prune_dedup_ids()
         if request_id and request_id in self._recent_request_ids:
             return True
+        if request_id and request_id in self._inflight_request_ids:
+            return True
+        self._inflight_request_ids[request_id] = time.time()
+        return False
+
+    def _dedup_commit(self, request_id: str) -> None:
+        if not request_id:
+            return
+        self._prune_dedup_ids()
+        self._inflight_request_ids.pop(request_id, None)
+        self._recent_request_ids[request_id] = time.time()
+
+    def _dedup_rollback(self, request_id: str) -> None:
         if request_id:
-            self._recent_request_ids[request_id] = now
+            self._inflight_request_ids.pop(request_id, None)
+
+    def _is_duplicate(self, request_id: str) -> bool:
+        if self._dedup_begin(request_id):
+            return True
+        self._dedup_commit(request_id)
         return False
 
     def _sender_allowed(self, *candidates: str) -> bool:
@@ -385,47 +437,291 @@ class InkboxGateway:
             if not ok:
                 return web.Response(status=401, text="invalid signature")
 
-        if self._is_duplicate(request.headers.get("X-Inkbox-Request-Id", "")):
+        request_id = request.headers.get("X-Inkbox-Request-Id", "")
+        if self._dedup_begin(request_id):
             return web.json_response({"ok": True, "deduped": True})
 
         try:
             envelope = json.loads(body)
         except json.JSONDecodeError:
+            self._dedup_rollback(request_id)
             return web.Response(status=400, text="invalid json")
 
-        event_type = str(envelope.get("event_type") or "")
-        if not event_type and envelope.get("direction") == "inbound" and envelope.get("local_phone_number"):
-            # Incoming-call payloads are flat (no envelope); with
-            # auto_accept this is informational — the WS is the channel.
-            return web.json_response({"ok": True})
-
-        if event_type == "message.received":
-            return await self._on_mail_received(envelope)
-        if event_type == "text.received":
-            return await self._on_text_received(envelope)
-        if event_type == "imessage.received":
-            return await self._on_imessage_received(envelope)
-        # Outbound delivery failures: tell the agent its message didn't land so
-        # it can retry or reach the human another way.
-        if event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
-            return await self._on_text_delivery_failed(envelope, event_type)
-        if event_type == "imessage.delivery_failed":
-            return await self._on_imessage_delivery_failed(envelope)
-        if event_type in ("message.bounced", "message.failed"):
-            return await self._on_mail_delivery_failed(envelope, event_type)
-        # Other delivery lifecycle (text.sent/delivered, imessage.sent/...) is
-        # logged without waking the agent, matching the hermes plugin.
-        logger.debug("[bridge] lifecycle event %s", event_type)
-        return web.json_response({"ok": True, "ignored": event_type})
+        try:
+            event_type = str(envelope.get("event_type") or "")
+            if not event_type and (
+                self._call_context_id(envelope)
+                or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
+            ):
+                # Incoming-call payloads are flat (no envelope); with
+                # auto_accept this is informational, but it can carry resolved
+                # contact context before the WS starts.
+                call_id = self._call_context_id(envelope)
+                if call_id:
+                    self._call_meta_by_id[call_id] = envelope
+                    if len(self._call_meta_by_id) > 100:
+                        self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
+                response = web.json_response({"ok": True})
+            elif event_type == "message.received":
+                response = await self._on_mail_received(envelope)
+            elif event_type == "text.received":
+                response = await self._on_text_received(envelope)
+            elif event_type == "imessage.received":
+                response = await self._on_imessage_received(envelope)
+            elif event_type == "imessage.reaction_received":
+                response = await self._on_imessage_reaction_received(envelope)
+            # Outbound delivery failures: tell the agent its message didn't land so
+            # it can retry or reach the human another way.
+            elif event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
+                response = await self._on_text_delivery_failed(envelope, event_type)
+            elif event_type == "imessage.delivery_failed":
+                response = await self._on_imessage_delivery_failed(envelope)
+            elif event_type in ("message.bounced", "message.failed"):
+                response = await self._on_mail_delivery_failed(envelope, event_type)
+            else:
+                # Other delivery lifecycle (text.sent/delivered, imessage.sent/...) is
+                # logged without waking the agent, matching the hermes plugin.
+                logger.debug("[bridge] lifecycle event %s", event_type)
+                response = web.json_response({"ok": True, "ignored": event_type})
+        except Exception:
+            self._dedup_rollback(request_id)
+            raise
+        self._dedup_commit(request_id)
+        return response
 
     @staticmethod
-    def _chat_key(data: Dict[str, Any], fallback: str) -> str:
+    def _thread_key(prefix: str, value: Any) -> Optional[str]:
+        raw = str(value or "").strip()
+        return f"{prefix}:{raw}" if raw else None
+
+    @staticmethod
+    def _chat_key(
+        data: Dict[str, Any],
+        fallback: str,
+        thread_key: Optional[str] = None,
+        contact: Optional[Dict[str, Any]] = None,
+        *,
+        allow_webhook_contact: bool = True,
+    ) -> str:
         # Webhook payloads carry resolved contacts — key the session by
-        # contact id so email/SMS/iMessage/voice converge on one session.
-        contacts = data.get("contacts") or []
-        if len(contacts) == 1 and contacts[0].get("id"):
-            return str(contacts[0]["id"])
+        # contact id so email/SMS/iMessage/voice converge on one session. If
+        # Inkbox cannot resolve a contact, keep channel conversations stable
+        # before falling back to the raw address/number.
+        if contact and contact.get("id"):
+            return str(contact["id"])
+        if allow_webhook_contact:
+            contacts = data.get("contacts") or []
+            if len(contacts) == 1:
+                contact_id = (
+                    contacts[0].get("id")
+                    or contacts[0].get("contact_id")
+                    or contacts[0].get("contactId")
+                )
+                if contact_id:
+                    return str(contact_id)
+        if thread_key:
+            return thread_key
         return fallback
+
+    @staticmethod
+    def _field(obj: Any, *names: str) -> Any:
+        """Read a field from either an SDK object or webhook dict."""
+        if obj is None:
+            return None
+        for name in names:
+            if isinstance(obj, dict):
+                value = obj.get(name)
+            else:
+                value = getattr(obj, name, None)
+            if value not in (None, ""):
+                return value
+        return None
+
+    @classmethod
+    def _webhook_list(cls, obj: Any, *names: str) -> List[Any]:
+        if obj is None:
+            return []
+        for name in names:
+            value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+            if isinstance(value, (list, tuple)):
+                return list(value)
+        return []
+
+    @classmethod
+    def _string_list_field(cls, obj: Any, *names: str) -> List[str]:
+        values = cls._webhook_list(obj, *names)
+        return [str(value).strip() for value in values if str(value).strip()]
+
+    @classmethod
+    def _conversation_summary_is_group(cls, summary: Any) -> bool:
+        return bool(cls._field(summary, "isGroup", "is_group", "is_group_conversation"))
+
+    @classmethod
+    def _call_context_id(cls, call_context: Dict[str, Any]) -> str:
+        return str(cls._field(call_context, "id", "call_id", "callId") or "").strip()
+
+    @classmethod
+    def _merge_call_context(
+        cls, primary: Dict[str, Any], fallback: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        merged = dict(fallback or {})
+        for key, value in (primary or {}).items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+        return merged
+
+    @classmethod
+    def _contact_values(cls, entries: Any) -> List[str]:
+        if not entries:
+            return []
+        if isinstance(entries, str):
+            rows = [entries]
+        elif isinstance(entries, (list, tuple)):
+            rows = list(entries)
+        else:
+            rows = [entries]
+        rows.sort(
+            key=lambda item: not bool(cls._field(item, "is_primary", "isPrimary")),
+        )
+        values: List[str] = []
+        for item in rows:
+            value = item if isinstance(item, str) else cls._field(item, "value", "address", "email", "phone")
+            if value:
+                values.append(str(value))
+        return values
+
+    @classmethod
+    def _contact_summary(cls, contact: Any) -> Optional[Dict[str, Any]]:
+        if not contact:
+            return None
+        given = cls._field(contact, "given_name", "givenName")
+        family = cls._field(contact, "family_name", "familyName")
+        full_name = " ".join(str(part) for part in (given, family) if part).strip()
+        name = (
+            cls._field(contact, "preferred_name", "preferredName")
+            or cls._field(contact, "name", "display_name", "displayName")
+            or full_name
+            or None
+        )
+        summary = {
+            "id": str(cls._field(contact, "id", "contact_id", "contactId") or ""),
+            "name": str(name) if name else None,
+            "emails": cls._contact_values(
+                cls._field(
+                    contact,
+                    "emails",
+                    "email_addresses",
+                    "emailAddresses",
+                    "email",
+                    "email_address",
+                    "emailAddress",
+                )
+            ),
+            "phones": cls._contact_values(
+                cls._field(
+                    contact,
+                    "phones",
+                    "phone_numbers",
+                    "phoneNumbers",
+                    "phone",
+                    "phone_number",
+                    "phoneNumber",
+                )
+            ),
+            "company": cls._field(contact, "company_name", "companyName", "company"),
+            "job_title": cls._field(contact, "job_title", "jobTitle", "title"),
+            "notes": ((str(cls._field(contact, "notes") or "")[:200]).strip() or None),
+        }
+        if any(summary.get(key) for key in ("id", "name", "emails", "phones")):
+            return summary
+        return None
+
+    async def _hydrate_contact(self, contact: Any) -> Optional[Dict[str, Any]]:
+        summary = self._contact_summary(contact)
+        contact_id = (summary or {}).get("id")
+        if not contact_id or self._inkbox is None:
+            return summary
+        try:
+            return self._contact_summary(await asyncio.to_thread(self._inkbox.contacts.get, contact_id)) or summary
+        except Exception:
+            return summary
+
+    async def _resolve_contact_full(
+        self, *, kind: str, value: str
+    ) -> Optional[Dict[str, Any]]:
+        if not value:
+            return None
+        cache_key = (kind, value.lower())
+        now = time.time()
+        cached = self._contact_cache.get(cache_key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+        if self._inkbox is None:
+            return None
+        try:
+            matches = await asyncio.to_thread(self._inkbox.contacts.lookup, **{kind: value})
+        except Exception:
+            logger.debug("[bridge] contacts.lookup(%s=%s) failed", kind, value, exc_info=True)
+            self._contact_cache[cache_key] = (None, now + CONTACT_CACHE_TTL_SECONDS)
+            return None
+        if len(matches) != 1:
+            self._contact_cache[cache_key] = (None, now + CONTACT_CACHE_TTL_SECONDS)
+            return None
+        contact = self._contact_summary(matches[0])
+        self._contact_cache[cache_key] = (contact, now + CONTACT_CACHE_TTL_SECONDS)
+        return contact
+
+    async def _resolve_call_contact(
+        self, call_context: Dict[str, Any], remote: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve the call's remote party before Realtime greets."""
+        direct = (
+            call_context.get("contact")
+            or call_context.get("remote_contact")
+            or call_context.get("remoteContact")
+        )
+        if direct:
+            return await self._hydrate_contact(direct)
+
+        contact_id = self._field(
+            call_context, "contact_id", "contactId", "remote_contact_id", "remoteContactId"
+        )
+        if contact_id:
+            return await self._hydrate_contact({
+                "id": contact_id,
+                "name": self._field(
+                    call_context, "contact_name", "contactName", "remote_name", "remoteName"
+                ),
+            })
+
+        contacts = (
+            call_context.get("contacts")
+            or call_context.get("contact_list")
+            or call_context.get("contactList")
+            or []
+        )
+        if isinstance(contacts, dict):
+            contacts = [contacts]
+        if len(contacts) == 1:
+            return await self._hydrate_contact(contacts[0])
+        for entry in contacts:
+            bucket = str(self._field(entry, "bucket", "role", "type") or "").lower()
+            if bucket in {"from", "remote", "caller", "callee", "to"} and self._field(
+                entry, "id", "contact_id", "contactId"
+            ):
+                return await self._hydrate_contact(entry)
+
+        if not remote or self._inkbox is None:
+            return None
+        try:
+            matches = await asyncio.to_thread(self._inkbox.contacts.lookup, phone=remote)
+        except Exception:
+            logger.debug("[bridge] contacts.lookup(phone=%s) failed for call", remote, exc_info=True)
+            return None
+        if len(matches) != 1:
+            return None
+        return self._contact_summary(matches[0])
 
     async def _on_mail_received(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
@@ -441,12 +737,21 @@ class InkboxGateway:
         if message.get("has_attachments"):
             saved = await self._fetch_mail_attachments(message)
             body_text = (body_text + inbound_media_note(saved)).strip()
-        chat_id = self._chat_key(data, sender)
+        thread_key = self._thread_key("email", message.get("thread_id"))
+        contact = await self._resolve_contact_full(kind="email", value=sender)
+        chat_id = self._chat_key(
+            data,
+            sender,
+            thread_key,
+            contact=contact,
+            allow_webhook_contact=False,
+        )
         meta = {
             "to": sender,
             "sender": sender,
             "subject": subject,
             "thread_id": message.get("thread_id"),
+            "contact": contact,
         }
         # The channel tag (Subject included) is added by frame_inbound.
         await self.sessions.get(chat_id).handle_inbound(body_text, "email", meta)
@@ -507,7 +812,113 @@ class InkboxGateway:
             logger.debug("[bridge] full-body fetch failed; using snippet", exc_info=True)
         return str(message.get("snippet") or "")
 
+    async def _lookup_text_conversation_summary(self, conversation_id: str) -> Any:
+        if not conversation_id:
+            return None
+
+        def _lookup() -> Any:
+            identity = self._identity
+            if identity is None and self._inkbox is not None:
+                identity = self._inkbox.get_identity(self.cfg.identity)
+            if identity is None:
+                return None
+            method = getattr(identity, "list_text_conversations", None)
+            if callable(method):
+                try:
+                    conversations = method(limit=200, offset=0, include_groups=True)
+                except TypeError:
+                    conversations = method({"limit": 200, "offset": 0, "includeGroups": True})
+            else:
+                method = getattr(identity, "listTextConversations", None)
+                if not callable(method):
+                    return None
+                conversations = method({"limit": 200, "offset": 0, "includeGroups": True})
+            for entry in conversations or []:
+                if str(self._field(entry, "id", "conversation_id", "conversationId") or "") == conversation_id:
+                    return entry
+            return None
+
+        try:
+            return await asyncio.to_thread(_lookup)
+        except Exception:
+            logger.debug(
+                "[bridge] text conversation summary lookup failed for %s",
+                conversation_id,
+                exc_info=True,
+            )
+            return None
+
+    @classmethod
+    def _group_sms_prompt(
+        cls,
+        body: str,
+        *,
+        sender: str,
+        conversation_id: str,
+        local_phone: str,
+        participants: List[str],
+        contact: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        marker_parts = [
+            f"[inkbox:group_sms conversation_id={conversation_id or 'unknown'}",
+            f"from={sender}",
+            f"local={local_phone}" if local_phone else None,
+            f"participants={','.join(participants)}" if participants else None,
+            "reply_mode=conversation_id",
+            f"| {contact_marker(contact)}]",
+        ]
+        marker = " ".join(part for part in marker_parts if part)
+        policy = "\n".join([
+            "Group SMS response policy: you receive every message in this group so you can track context.",
+            "Reply only when the latest message clearly addresses this Inkbox agent, asks it to act, or a visible answer would be expected from the agent.",
+            "Treat ordinary group chatter as context only.",
+            "If no visible reply is warranted, return exactly [SILENT].",
+        ])
+        return "\n".join(part for part in [marker, policy, body] if part)
+
+    @classmethod
+    def _imessage_reaction_prompt(
+        cls,
+        *,
+        sender: str,
+        conversation_id: str,
+        target_message_id: str,
+        reaction_label: str,
+        contact: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
+        target_part = f" target_message_id={target_message_id}" if target_message_id else ""
+        marker = (
+            f"[inkbox:imessage_reaction from={sender} reaction={reaction_label}"
+            f"{conversation_part}{target_part} | {contact_marker(contact)}]"
+        )
+        policy = "\n".join([
+            f"{sender} reacted with a '{reaction_label}' tapback to your message.",
+            "A reaction is a lightweight signal, not always a request for a reply.",
+            "Reply only when the reaction plausibly warrants one - e.g. a 'question' "
+            "tapback usually asks for clarification or a follow-up, 'emphasize' may "
+            "invite one, while 'love'/'like'/'laugh'/'dislike' are usually just "
+            "acknowledgements that need no response.",
+            "If no visible reply is warranted, return exactly [SILENT].",
+        ])
+        return f"{marker}\n{policy}"
+
     async def _on_text_received(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data") or {}
+        message = data.get("text_message") or {}
+        message_id = str(message.get("id") or "").strip()
+        event_key = f"text:{message_id}" if message_id else ""
+        if self._dedup_begin(event_key):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            response = await self._on_text_received_once(envelope)
+        except Exception:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return response
+
+    async def _on_text_received_once(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("text_message") or {}
         if message.get("direction") == "outbound":
@@ -527,16 +938,78 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
         body = await self._with_media(text, media, prefix=f"sms-{message.get('id', '')}")
-        chat_id = self._chat_key(data, sender)
+        conversation_id = str(
+            message.get("conversation_id") or message.get("conversationId") or ""
+        ).strip()
+        local_phone = str(
+            message.get("local_phone_number") or message.get("localPhoneNumber") or ""
+        ).strip()
+        conversation_summary = await self._lookup_text_conversation_summary(conversation_id)
+        participants: List[str] = []
+        for entry in (
+            self._string_list_field(conversation_summary, "participants")
+            + self._string_list_field(message, "participants")
+        ):
+            if entry not in participants:
+                participants.append(entry)
+        contacts = self._webhook_list(data, "contacts", "contact_list")
+        agent_identities = self._webhook_list(
+            data,
+            "agent_identities",
+            "agentIdentities",
+            "identity_agents",
+        )
+        is_group = (
+            self._conversation_summary_is_group(conversation_summary)
+            or bool(self._field(message, "isGroup", "is_group"))
+            or len(participants) > 1
+            or len(contacts) > 1
+            or len(agent_identities) > 1
+        )
+        contact = await self._resolve_contact_full(kind="phone", value=sender)
+        if is_group:
+            body = self._group_sms_prompt(
+                body,
+                sender=sender,
+                conversation_id=conversation_id,
+                local_phone=local_phone,
+                participants=participants,
+                contact=contact,
+            )
+        thread_key = self._thread_key("sms", conversation_id)
+        chat_id = self._chat_key(
+            data,
+            sender,
+            thread_key,
+            contact=contact,
+            allow_webhook_contact=False,
+        )
         meta = {
-            "conversation_id": message.get("conversation_id"),
+            "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
+            "conversation_kind": "group" if is_group else "direct",
+            "contact": contact,
         }
         await self.sessions.get(chat_id).handle_inbound(body, "sms", meta)
         return web.json_response({"ok": True})
 
     async def _on_imessage_received(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data") or {}
+        message = data.get("message") or {}
+        message_id = str(message.get("id") or "").strip()
+        event_key = f"imessage:{message_id}" if message_id else ""
+        if self._dedup_begin(event_key):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            response = await self._on_imessage_received_once(envelope)
+        except Exception:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return response
+
+    async def _on_imessage_received_once(self, envelope: Dict[str, Any]) -> "web.Response":
         data = envelope.get("data") or {}
         message = data.get("message") or {}
         if not message or message.get("direction") == "outbound":
@@ -550,10 +1023,77 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
         body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
-        chat_id = self._chat_key(data, sender)
-        meta = {"conversation_id": message.get("conversation_id"), "sender": sender}
+        conversation_id = str(message.get("conversation_id") or "").strip()
+        contact = await self._resolve_contact_full(kind="phone", value=sender)
+        chat_id = self._chat_key(
+            data,
+            sender,
+            self._thread_key("imessage", conversation_id),
+            contact=contact,
+            allow_webhook_contact=False,
+        )
+        meta = {"conversation_id": conversation_id or None, "sender": sender, "contact": contact}
         await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
         return web.json_response({"ok": True})
+
+    async def _on_imessage_reaction_received(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data") or {}
+        reaction = data.get("reaction") or {}
+        reaction_id = str(reaction.get("id") or "").strip()
+        event_key = f"imessage_reaction:{reaction_id}" if reaction_id else ""
+        if self._dedup_begin(event_key):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            direction = str(reaction.get("direction") or "").strip().lower()
+            if direction and direction != "inbound":
+                response = web.json_response({"ok": True, "ignored": "outbound-reaction"})
+            else:
+                sender = str(reaction.get("remote_number") or "").strip()
+                if not sender:
+                    response = web.json_response({"ok": True, "ignored": "empty"})
+                elif not self._sender_allowed(sender):
+                    response = web.json_response({"ok": True, "ignored": "sender-not-allowed"})
+                else:
+                    conversation_id = str(reaction.get("conversation_id") or "").strip()
+                    target_message_id = str(reaction.get("target_message_id") or "").strip()
+                    reaction_type = str(reaction.get("reaction") or "").strip().lower()
+                    custom_emoji = str(reaction.get("custom_emoji") or "").strip()
+                    reaction_label = (
+                        f"{reaction_type}:{custom_emoji}"
+                        if reaction_type == "custom" and custom_emoji
+                        else reaction_type
+                    ) or "unknown"
+                    contact = await self._resolve_contact_full(kind="phone", value=sender)
+                    body = self._imessage_reaction_prompt(
+                        sender=sender,
+                        conversation_id=conversation_id,
+                        target_message_id=target_message_id,
+                        reaction_label=reaction_label,
+                        contact=contact,
+                    )
+                    chat_id = self._chat_key(
+                        data,
+                        sender,
+                        self._thread_key("imessage", conversation_id),
+                        contact=contact,
+                        allow_webhook_contact=False,
+                    )
+                    meta = {
+                        "conversation_id": conversation_id or None,
+                        "sender": sender,
+                        "message_id": reaction_id or target_message_id,
+                        "reply_to_id": target_message_id or reaction_id,
+                        "reaction": reaction_label,
+                        "typing": reaction_label == "question",
+                        "contact": contact,
+                    }
+                    await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+                    response = web.json_response({"ok": True})
+        except Exception:
+            self._dedup_rollback(event_key)
+            raise
+        self._dedup_commit(event_key)
+        return response
 
     async def _with_media(self, text: str, media: List[Dict[str, Any]], *, prefix: str) -> str:
         """Download inbound media and append a note pointing Claude at the files.
@@ -634,7 +1174,8 @@ class InkboxGateway:
         reason = str(message.get("error_detail") or message.get("error_code") or "").strip()
         if event_type == "text.delivery_unconfirmed" and not reason:
             reason = "carrier could not confirm delivery"
-        chat_id = self._chat_key(data, recipient)
+        conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
+        chat_id = self._chat_key(data, recipient, self._thread_key("sms", conversation_id))
         logger.info("[bridge] SMS delivery failed to %s: %s", recipient, reason or event_type)
         return await self._notify_delivery_failure(chat_id, "SMS", recipient, body, reason or event_type)
 
@@ -653,7 +1194,8 @@ class InkboxGateway:
             or message.get("status")
             or ""
         ).strip()
-        chat_id = self._chat_key(data, recipient)
+        conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
+        chat_id = self._chat_key(data, recipient, self._thread_key("imessage", conversation_id))
         logger.info("[bridge] iMessage delivery failed to %s: %s", recipient, reason)
         return await self._notify_delivery_failure(chat_id, "iMessage", recipient, body, reason)
 
@@ -667,7 +1209,7 @@ class InkboxGateway:
         recipient = str(to_addresses[0] if to_addresses else "").strip()
         subject = str(message.get("subject") or "").strip()
         reason = "bounced" if event_type == "message.bounced" else "permanent send failure"
-        chat_id = self._chat_key(data, recipient)
+        chat_id = self._chat_key(data, recipient, self._thread_key("email", message.get("thread_id")))
         logger.info("[bridge] email %s to %s (subject: %s)", reason, recipient, subject)
         body = f"(email, subject: {subject})" if subject else ""
         return await self._notify_delivery_failure(chat_id, "email", recipient, body, reason)
@@ -676,7 +1218,14 @@ class InkboxGateway:
     # Inbound: live calls (Inkbox STT/TTS text-frame bridge)
     # ------------------------------------------------------------------
 
-    async def _open_realtime_bridge(self, remote: str, call_id: str) -> Any:
+    async def _open_realtime_bridge(
+        self,
+        remote: str,
+        call_id: str,
+        outbound: Optional[Dict[str, Any]] = None,
+        contact: Optional[Dict[str, Any]] = None,
+        direction: str = "inbound",
+    ) -> Any:
         """Preflight an OpenAI Realtime session for an incoming call.
 
         Args:
@@ -687,12 +1236,45 @@ class InkboxGateway:
             Any: An OpenedRealtimeBridge on success, or None if the connect
             failed (the caller then falls back to Inkbox STT/TTS).
         """
-        phone = getattr(self._identity, "phone_number", None)
+        identity = self._identity
+        mailbox = getattr(identity, "mailbox", None)
+        phone = getattr(identity, "phone_number", None)
+        oc = outbound or {}
+        contact = contact or {}
         meta = RealtimeCallMeta(
             call_id=call_id or "unknown",
             remote_phone_number=remote or None,
-            agent_identity_phone=getattr(phone, "number", None),
+            direction=direction or "inbound",
+            agent_identity_handle=(
+                getattr(identity, "agent_handle", None)
+                or getattr(identity, "handle", None)
+                or self.cfg.identity
+                or None
+            ),
+            agent_identity_email=(
+                getattr(mailbox, "email_address", None)
+                or getattr(identity, "email_address", None)
+            ),
+            agent_identity_phone=(
+                getattr(phone, "number", None)
+                if not isinstance(phone, str)
+                else phone
+            ),
             project_dir=self.cfg.project_dir,
+            contact_known=bool(contact.get("id")),
+            contact_id=contact.get("id"),
+            contact_name=contact.get("name"),
+            contact_emails=list(contact.get("emails") or []),
+            contact_phones=list(contact.get("phones") or []),
+            contact_company=contact.get("company"),
+            contact_job_title=contact.get("job_title"),
+            contact_notes=contact.get("notes"),
+            outbound_purpose=(oc.get("purpose") or None),
+            outbound_opening=(oc.get("opening_message") or None),
+            outbound_context=(oc.get("context") or None),
+            outbound_reason=(oc.get("reason") or None),
+            outbound_scheduled_by=(oc.get("scheduled_by") or None),
+            outbound_conversation_summary=(oc.get("conversation_summary") or None),
         )
         try:
             return await open_inkbox_realtime_bridge(config=self.cfg.realtime, meta=meta)
@@ -702,6 +1284,21 @@ class InkboxGateway:
                 "falling back to Inkbox STT/TTS unless disabled",
                 call_id, exc.cause,
             )
+            return None
+
+    @staticmethod
+    def _load_outbound_context(token: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Load the purpose/opening an outbound call was placed with."""
+        token = (token or "").strip()
+        # Token rides in off the URL; never let it escape the contexts dir.
+        if not token or "/" in token or "\\" in token or token in {".", ".."}:
+            return None
+        path = call_contexts_dir() / f"{token}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
             return None
 
     async def _handle_call_ws(self, request: "web.Request") -> Any:
@@ -721,9 +1318,32 @@ class InkboxGateway:
             call_context = json.loads(call_context_raw) if call_context_raw else {}
         except json.JSONDecodeError:
             call_context = {}
-        remote = str(call_context.get("remote_phone_number") or "").strip()
-        call_id = str(call_context.get("id") or call_context.get("call_id") or "")
-        chat_id = remote or f"call:{call_id}"
+        call_id = self._call_context_id(call_context) or str(request.query.get("call_id") or "").strip()
+        stored_call_context = self._call_meta_by_id.pop(call_id, None) if call_id else None
+        if stored_call_context:
+            call_context = self._merge_call_context(call_context, stored_call_context)
+        if call_id and not self._call_context_id(call_context):
+            call_context["id"] = call_id
+        call_id = self._call_context_id(call_context) or call_id
+        outbound = self._load_outbound_context(request.query.get("context_token"))
+        remote = str(
+            self._field(
+                call_context,
+                "remote_phone_number",
+                "remotePhoneNumber",
+                "from_number",
+                "fromNumber",
+                "to_number",
+                "toNumber",
+            )
+            or (outbound or {}).get("to_number")
+            or ""
+        ).strip()
+        direction = str(
+            self._field(call_context, "direction") or ("outbound" if outbound else "inbound")
+        ).strip().lower() or "inbound"
+        contact = await self._resolve_call_contact(call_context, remote)
+        chat_id = (contact or {}).get("id") or remote or f"call:{call_id}"
 
         ws = web.WebSocketResponse()
 
@@ -733,7 +1353,7 @@ class InkboxGateway:
         # Code via run_consult. If the preflight fails, fall through to Inkbox
         # STT/TTS below (unless fallback is disabled, then refuse the call).
         if self.cfg.realtime.enabled:
-            bridge = await self._open_realtime_bridge(remote, call_id)
+            bridge = await self._open_realtime_bridge(remote, call_id, outbound, contact, direction)
             if bridge is None and not self.cfg.realtime.fallback_to_inkbox_stt_tts:
                 return web.Response(status=503, text="realtime bridge unavailable")
             if bridge is not None:
@@ -788,6 +1408,7 @@ class InkboxGateway:
         await ws.prepare(request)
         self._active_call_ws[chat_id] = ws
         logger.info("[bridge] call connected: %s", chat_id or call_id)
+        transcript: List[Tuple[str, str]] = []
 
         try:
             async for msg in ws:
@@ -804,13 +1425,22 @@ class InkboxGateway:
                     text = str(payload.get("text") or "").strip()
                     if not text:
                         continue
-                    meta = {"call_id": call_id, "sender": remote}
+                    transcript.append(("user", text))
+                    meta = {
+                        "call_id": call_id,
+                        "sender": remote,
+                        "contact": contact,
+                        "direction": direction,
+                    }
                     session = self.sessions.get(chat_id)
                     await session.handle_inbound(text, "voice", meta)
                 elif event == "stop":
                     break
         finally:
             self._active_call_ws.pop(chat_id, None)
+            if transcript:
+                prompt = _call_ended_prompt(transcript)
+                await self.sessions.get(chat_id).run_consult(prompt)
             logger.info("[bridge] call ended: %s", chat_id or call_id)
         return ws
 
@@ -898,34 +1528,51 @@ class InkboxGateway:
             None
         """
         meta = meta or {}
+        if content.strip() == "[SILENT]":
+            logger.debug("[bridge] suppressing exact [SILENT] reply for %s", chat_id)
+            return
         if mode == "voice":
             ws = self._active_call_ws.get(chat_id)
             if ws is not None:
                 await self._speak(ws, strip_markdown(content), str(meta.get("call_id") or ""))
                 return
-            # Call ended while Claude was thinking — fall back to SMS so
-            # the answer isn't lost.
-            mode = "sms" if str(meta.get("to") or chat_id).startswith("+") else "email"
-
-        identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            logger.info(
+                "[bridge] dropped late voice reply after call ended: %s",
+                chat_id,
+            )
+            return
 
         if mode == "sms":
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:
-                text = text[: SMS_MAX_LENGTH - 1] + "…"
+                raise ValueError(_message_too_long_reason("SMS", text, SMS_MAX_LENGTH))
+            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             kwargs: Dict[str, Any] = {"text": text}
-            if meta.get("conversation_id"):
-                kwargs["conversation_id"] = str(meta["conversation_id"])
+            conversation_id = str(meta.get("conversation_id") or "").strip()
+            if not conversation_id and str(chat_id).startswith("sms:"):
+                conversation_id = str(chat_id).split(":", 1)[1]
+            if conversation_id:
+                kwargs["conversation_id"] = conversation_id
             else:
                 kwargs["to"] = str(meta.get("to") or chat_id)
             await asyncio.to_thread(identity.send_text, **kwargs)
         elif mode == "imessage":
+            text = strip_markdown(content)
+            if len(text) > IMESSAGE_MAX_LENGTH:
+                raise ValueError(_message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH))
+            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            conversation_id = str(meta.get("conversation_id") or "").strip()
+            if not conversation_id and str(chat_id).startswith("imessage:"):
+                conversation_id = str(chat_id).split(":", 1)[1]
+            if not conversation_id:
+                raise ValueError(f"No iMessage conversation id for chat {chat_id}")
             await asyncio.to_thread(
                 identity.send_imessage,
-                conversation_id=str(meta.get("conversation_id") or ""),
-                text=strip_markdown(content),
+                conversation_id=conversation_id,
+                text=text,
             )
         else:  # email
+            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
             subject = str(meta.get("subject") or "").strip()
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Claude Code agent"
             await asyncio.to_thread(

@@ -12,13 +12,21 @@ import dataclasses
 import json
 import logging
 import mimetypes
+import secrets
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 try:
     from .media import file_to_email_attachment
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
+
+try:
+    from .config import INKBOX_WS_PATH, call_contexts_dir
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from config import INKBOX_WS_PATH, call_contexts_dir
 
 try:
     from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -29,6 +37,9 @@ except ImportError:  # pragma: no cover - doctor reports this cleanly
     CLAUDE_SDK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+SMS_MAX_LENGTH = 1600
+IMESSAGE_MAX_LENGTH = 18995
 
 
 def _json_safe(value: Any) -> Any:
@@ -51,8 +62,20 @@ def _result(data: Any) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(_json_safe(data), ensure_ascii=False)}]}
 
 
-def _error(message: str) -> Dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps({"error": message})}], "is_error": True}
+def _error(message: str, **fields: Any) -> Dict[str, Any]:
+    payload = {"error": message, **fields}
+    return {
+        "content": [{"type": "text", "text": json.dumps(_json_safe(payload), ensure_ascii=False)}],
+        "is_error": True,
+    }
+
+
+def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
+    char_count = len(content or "")
+    return (
+        f"{channel} text is {char_count} characters; maximum is {max_chars}. "
+        f"Shorten it or split it into smaller {channel} messages."
+    )
 
 
 def _upload_media_url(identity: Any, path: str) -> str:
@@ -75,6 +98,32 @@ def _upload_media_url(identity: Any, path: str) -> str:
         content_type=mimetypes.guess_type(resolved.name)[0],
     )
     return upload.media_url
+
+
+def _append_query_param(raw_url: str, key: str, value: str) -> str:
+    """Append or replace one query param while preserving the rest."""
+    parts = urlparse(raw_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query[key] = value
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+
+def _write_call_context(
+    *, purpose: str, opening_message: str, context: str, to_number: str
+) -> str:
+    """Persist outbound-call context for the gateway to load on connect."""
+    token = secrets.token_urlsafe(18)
+    payload = {
+        "created_at": time.time(),
+        "purpose": purpose,
+        "opening_message": opening_message,
+        "context": context,
+        "to_number": to_number,
+    }
+    (call_contexts_dir() / f"{token}.json").write_text(
+        json.dumps(payload, indent=2) + "\n"
+    )
+    return token
 
 
 def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, List[str]]:
@@ -145,13 +194,22 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "with conversation_id, or start one with to (E.164). To send images/files "
         "(MMS), pass media_paths as a list of LOCAL file paths — they're uploaded "
         "and attached for you (each up to 10 MB). Already-hosted URLs may instead "
-        "be passed as media_urls.",
+        "be passed as media_urls. Text is limited to 1600 characters.",
         {"to": str, "text": str, "media_paths": list, "media_urls": list},
     )
     async def inkbox_send_sms(args: Dict[str, Any]) -> Dict[str, Any]:
+        text = str(args.get("text") or "")
+        if len(text) > SMS_MAX_LENGTH:
+            return _error(
+                _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
+                error_code="sms_too_long",
+                char_count=len(text),
+                max_chars=SMS_MAX_LENGTH,
+            )
+
         def _run():
             identity = _identity()
-            kwargs: Dict[str, Any] = {"text": str(args.get("text") or "")}
+            kwargs: Dict[str, Any] = {"text": text}
             target = str(args.get("to") or "").strip()
             if target.startswith("+"):
                 kwargs["to"] = target
@@ -177,15 +235,24 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "inkbox_list_imessage_conversations (iMessage is recipient-first: a "
         "conversation exists only after the person has messaged this agent). To "
         "attach an image/file, pass media_path as a local file path (uploaded "
-        "automatically, max 10 MB).",
+        "automatically, max 10 MB). Text is limited to 18995 characters.",
         {"conversation_id": str, "text": str, "media_path": str},
     )
     async def inkbox_send_imessage(args: Dict[str, Any]) -> Dict[str, Any]:
+        text = str(args.get("text") or "")
+        if len(text) > IMESSAGE_MAX_LENGTH:
+            return _error(
+                _message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH),
+                error_code="imessage_too_long",
+                char_count=len(text),
+                max_chars=IMESSAGE_MAX_LENGTH,
+            )
+
         def _run():
             identity = _identity()
             kwargs: Dict[str, Any] = {
                 "conversation_id": str(args["conversation_id"]),
-                "text": str(args.get("text") or ""),
+                "text": text,
             }
             media_path = str(args.get("media_path") or "").strip()
             if media_path:
@@ -193,6 +260,91 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                 kwargs["media_urls"] = [_upload_media_url(identity, media_path)]
             msg = identity.send_imessage(**kwargs)
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_place_call",
+        "Place an outbound phone call from this agent's Inkbox number. The call's audio "
+        "bridges to the running gateway. Always pass purpose so the live call opens "
+        "with context; optionally pass opening_message and context.",
+        {"to_number": str, "purpose": str, "opening_message": str, "context": str},
+    )
+    async def inkbox_place_call(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            to_number = str(args.get("to_number") or "").strip()
+            if not to_number:
+                raise ValueError("to_number is required (E.164, e.g. +15551234567)")
+            purpose = str(args.get("purpose") or "").strip()
+            if not purpose:
+                raise ValueError(
+                    "purpose is required so the live call opens with context"
+                )
+            identity = _identity()
+            phone = getattr(identity, "phone_number", None)
+            ws_url = str(getattr(phone, "client_websocket_url", "") or "").strip()
+            if not ws_url:
+                tunnel = getattr(identity, "tunnel", None)
+                host = str(getattr(tunnel, "public_host", "") or "").strip()
+                if host:
+                    ws_url = f"wss://{host}{INKBOX_WS_PATH}"
+            if not ws_url:
+                raise RuntimeError(
+                    "no call-media WebSocket URL available; start the Inkbox "
+                    "Claude gateway first"
+                )
+            token = _write_call_context(
+                purpose=purpose,
+                opening_message=str(args.get("opening_message") or "").strip(),
+                context=str(args.get("context") or "").strip(),
+                to_number=to_number,
+            )
+            ws_url = _append_query_param(ws_url, "context_token", token)
+            call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
+            return {
+                "placed": True,
+                "id": str(getattr(call, "id", "")),
+                "to": to_number,
+                "context_token": token,
+                "status": _json_safe(getattr(call, "status", None)),
+            }
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_list_calls",
+        "List recent phone calls on this agent's Inkbox number, newest first.",
+        {"limit": int, "offset": int},
+    )
+    async def inkbox_list_calls(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return _identity().list_calls(
+                limit=int(args.get("limit") or 25),
+                offset=int(args.get("offset") or 0),
+            )
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_get_call_transcript",
+        "Fetch transcript segments for one phone call by call_id.",
+        {"call_id": str},
+    )
+    async def inkbox_get_call_transcript(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            call_id = str(args.get("call_id") or "").strip()
+            if not call_id:
+                raise ValueError("call_id is required (get one from inkbox_list_calls)")
+            return _identity().list_transcripts(call_id)
 
         try:
             return _result(await asyncio.to_thread(_run))
@@ -308,6 +460,20 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return _error(str(exc))
 
     @tool(
+        "inkbox_get_contact",
+        "Fetch one contact's full record by contact id.",
+        {"contact_id": str},
+    )
+    async def inkbox_get_contact(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            return client.contacts.get(str(args["contact_id"]))
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
         "inkbox_create_contact",
         "Save a new contact in the address book. Provide any of given_name, "
         "family_name, preferred_name, company_name, job_title, notes, and "
@@ -396,12 +562,16 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_send_email,
         inkbox_send_sms,
         inkbox_send_imessage,
+        inkbox_place_call,
+        inkbox_list_calls,
+        inkbox_get_call_transcript,
         inkbox_list_text_conversations,
         inkbox_get_text_conversation,
         inkbox_list_imessage_conversations,
         inkbox_get_imessage_conversation,
         inkbox_lookup_contact,
         inkbox_list_contacts,
+        inkbox_get_contact,
         inkbox_create_contact,
         inkbox_update_contact,
         inkbox_delete_contact,
@@ -412,12 +582,16 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_send_email",
         "mcp__inkbox__inkbox_send_sms",
         "mcp__inkbox__inkbox_send_imessage",
+        "mcp__inkbox__inkbox_place_call",
+        "mcp__inkbox__inkbox_list_calls",
+        "mcp__inkbox__inkbox_get_call_transcript",
         "mcp__inkbox__inkbox_list_text_conversations",
         "mcp__inkbox__inkbox_get_text_conversation",
         "mcp__inkbox__inkbox_list_imessage_conversations",
         "mcp__inkbox__inkbox_get_imessage_conversation",
         "mcp__inkbox__inkbox_lookup_contact",
         "mcp__inkbox__inkbox_list_contacts",
+        "mcp__inkbox__inkbox_get_contact",
         "mcp__inkbox__inkbox_create_contact",
         "mcp__inkbox__inkbox_update_contact",
         "mcp__inkbox__inkbox_delete_contact",

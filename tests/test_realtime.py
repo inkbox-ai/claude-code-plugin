@@ -1,5 +1,6 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 from inkbox_claude import realtime
 from inkbox_claude.realtime import (
@@ -12,9 +13,11 @@ from inkbox_claude.realtime import (
     RealtimeCallMeta,
     RealtimeConfig,
     _BridgeState,
+    _openai_to_inkbox_pump,
     _dispatch_post_call,
     _dispatch_tool_call,
     _send_session_update,
+    build_realtime_greeting,
     build_realtime_instructions,
 )
 
@@ -32,8 +35,36 @@ class _FakeWS:
         return [f.get("type") for f in self.sent]
 
 
+class _FakeMsg:
+    def __init__(self, data):
+        self.type = realtime.aiohttp.WSMsgType.TEXT
+        self.data = data
+
+
+class _ScriptedOpenAIWS(_FakeWS):
+    """Async-iterable fake yielding Realtime frames and recording writes."""
+
+    def __init__(self, frames):
+        super().__init__()
+        self._frames = [_FakeMsg(json.dumps(frame)) for frame in frames]
+
+    def __aiter__(self):
+        self._iter = iter(self._frames)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
 def _meta():
-    return RealtimeCallMeta(call_id="c1", remote_phone_number="+15551234567", project_dir="/tmp/proj")
+    return RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+    )
 
 
 def test_session_update_configures_telephony_audio_vad_and_all_tools():
@@ -60,9 +91,52 @@ def test_session_update_configures_telephony_audio_vad_and_all_tools():
 
 
 def test_instructions_name_the_consult_tool_and_project():
-    text = build_realtime_instructions(_meta())
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+        agent_identity_handle="claude",
+        agent_identity_email="claude@example.com",
+        agent_identity_phone="+15550001111",
+        contact_known=True,
+        contact_id="contact-1",
+        contact_name="Ada Lovelace",
+        contact_emails=["ada@example.com"],
+        contact_phones=["+15551234567"],
+        contact_company="Inkbox",
+        contact_job_title="Engineer",
+        contact_notes="Prefers calls in the morning.",
+    )
+    text = build_realtime_instructions(meta)
     assert CONSULT_TOOL_NAME in text
     assert "/tmp/proj" in text
+    assert "Your Inkbox identity handle: claude." in text
+    assert "claude@example.com" in text
+    assert "Ada Lovelace" in text
+    assert "ada@example.com" in text
+    assert "Do not perform a context lookup before greeting" in text
+    assert "look up contacts" in text
+
+
+def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        direction="outbound",
+        project_dir="/tmp/proj",
+        contact_known=True,
+        contact_name="Ada Lovelace",
+        outbound_purpose="tell them the deployment is fixed",
+        outbound_opening="Hi, this is Claude Code calling with the deployment update.",
+        outbound_context="Deployment failed twice before the final fix.",
+    )
+
+    text = build_realtime_instructions(meta)
+
+    assert "outbound call" in text
+    assert "tell them the deployment is fixed" in text
+    assert "Deployment failed twice before the final fix." in text
+    assert "Hi, this is Claude Code calling with the deployment update." in build_realtime_greeting(meta)
 
 
 def test_dispatch_consult_runs_agent_and_speaks_answer():
@@ -156,6 +230,183 @@ def test_consult_timeout_reports_error_not_crash():
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
     assert "timed out" in json.loads(item["item"]["output"])["error"]
+
+
+def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
+    monkeypatch.setattr(
+        realtime,
+        "aiohttp",
+        SimpleNamespace(
+            WSMsgType=SimpleNamespace(
+                TEXT="text",
+                CLOSE="close",
+                CLOSED="closed",
+                ERROR="error",
+            ),
+        ),
+    )
+    openai_ws = _ScriptedOpenAIWS([
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "who is Alex",
+        },
+        {
+            "type": "response.output_audio_transcript.done",
+            "transcript": "one moment",
+        },
+    ])
+    inkbox_ws = _FakeWS()
+    state = _BridgeState()
+
+    async def fake_consult(query, transcript):  # pragma: no cover - must not run
+        raise AssertionError("transcript mirroring should not consult")
+
+    asyncio.run(_openai_to_inkbox_pump(
+        openai_ws=openai_ws,
+        inkbox_ws=inkbox_ws,
+        state=state,
+        config=RealtimeConfig(api_key="sk-x"),
+        meta=_meta(),
+        on_agent_consult=fake_consult,
+    ))
+
+    assert [frame for frame in inkbox_ws.sent if frame.get("event") == "transcript"] == [
+        {
+            "event": "transcript",
+            "party": "remote",
+            "text": "who is Alex",
+            "is_final": True,
+        },
+        {
+            "event": "transcript",
+            "party": "local",
+            "text": "one moment",
+            "is_final": True,
+        },
+    ]
+    assert state.transcript == [("caller", "who is Alex"), ("agent", "one moment")]
+
+
+def test_openai_pump_dispatches_call_id_keyed_consult_events(monkeypatch):
+    """Match Hermes: GA Realtime may key argument events by call_id."""
+    async def scenario():
+        monkeypatch.setattr(
+            realtime,
+            "aiohttp",
+            SimpleNamespace(
+                WSMsgType=SimpleNamespace(
+                    TEXT="text",
+                    CLOSE="close",
+                    CLOSED="closed",
+                    ERROR="error",
+                ),
+            ),
+        )
+        openai_ws = _ScriptedOpenAIWS([
+            {
+                "type": "response.output_item.added",
+                "item_id": "item-1",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": CONSULT_TOOL_NAME,
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "call_id": "call-1",
+                "name": CONSULT_TOOL_NAME,
+                "delta": '{"query":"who is Alex?"}',
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "call_id": "call-1",
+                "name": CONSULT_TOOL_NAME,
+            },
+        ])
+        state = _BridgeState()
+        seen = {}
+
+        async def fake_consult(query, transcript):
+            seen["query"] = query
+            seen["transcript"] = transcript
+            return "Alex is in the contact book."
+
+        await _openai_to_inkbox_pump(
+            openai_ws=openai_ws,
+            inkbox_ws=_FakeWS(),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=fake_consult,
+        )
+        if state.consult_tasks:
+            await asyncio.gather(*state.consult_tasks)
+
+        assert seen["query"] == "who is Alex?"
+        item = next(f for f in openai_ws.sent if f.get("type") == "conversation.item.create")
+        output = json.loads(item["item"]["output"])
+        assert output["status"] == "ok"
+        assert output["answer"] == "Alex is in the contact book."
+
+    asyncio.run(scenario())
+
+
+def test_openai_pump_uses_frame_item_id_when_item_has_no_id(monkeypatch):
+    """Match Hermes: output_item.added sometimes carries item_id on the frame."""
+    async def scenario():
+        monkeypatch.setattr(
+            realtime,
+            "aiohttp",
+            SimpleNamespace(
+                WSMsgType=SimpleNamespace(
+                    TEXT="text",
+                    CLOSE="close",
+                    CLOSED="closed",
+                    ERROR="error",
+                ),
+            ),
+        )
+        openai_ws = _ScriptedOpenAIWS([
+            {
+                "type": "response.output_item.added",
+                "item_id": "item-2",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-2",
+                    "name": POST_CALL_ACTION_TOOL_NAME,
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "item-2",
+                "delta": '{"action":"email Dima the summary"}',
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "item-2",
+                "call_id": "call-2",
+            },
+        ])
+        state = _BridgeState()
+
+        async def fake_consult(query, transcript):  # pragma: no cover - must not run
+            raise AssertionError("post-call action should not consult")
+
+        await _openai_to_inkbox_pump(
+            openai_ws=openai_ws,
+            inkbox_ws=_FakeWS(),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+            on_agent_consult=fake_consult,
+        )
+        if state.consult_tasks:
+            await asyncio.gather(*state.consult_tasks)
+
+        assert state.post_call_actions == [{"action": "email Dima the summary", "details": ""}]
+
+    asyncio.run(scenario())
 
 
 # ----------------------------------------------------------------------

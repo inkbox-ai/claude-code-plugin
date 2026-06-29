@@ -140,7 +140,7 @@ Claude Code never silently runs anything destructive. The bridge passes a `can_u
 
 ## Sessions
 
-Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Claude session ids are persisted in `~/.inkbox-claude/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used (call replies fall back to SMS if you hang up before Claude finishes).
+Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Claude session ids are persisted in `~/.inkbox-claude/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Claude finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
 **Typing indicator.** While Claude works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
 
@@ -192,7 +192,7 @@ Calls have two modes, chosen per call:
 | `CLAUDE_PROJECT_DIR` | yes | cwd | Directory Claude Code works in. |
 | `CLAUDE_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
-| `INKBOX_BASE_URL` | no | `https://inkbox.ai` | Override the Inkbox API base URL. |
+| `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |
 | `INKBOX_ALLOWED_USERS` | no | - | Local allowlist (emails / E.164 numbers). Usually leave empty and use Inkbox contact rules. |
@@ -214,10 +214,12 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
+- `inkbox_place_call` — place an outbound phone call through the running gateway with purpose/opening/context.
+- `inkbox_list_calls` · `inkbox_get_call_transcript` — browse recent calls and fetch transcript segments.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
-- `inkbox_lookup_contact` · `inkbox_list_contacts` — resolve and find address-book contacts (reverse-lookup by email/phone, or free-text search by name/company).
-- `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_delete_contact` — save, edit, and remove contacts. Reads and writes are filtered server-side to what this identity may see.
+- `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).
+- `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_delete_contact` — save, edit, and remove contacts. Reads and writes are filtered server-side to what this identity may see. vCard export/import is not exposed.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
@@ -228,7 +230,7 @@ On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent
 3. Ask it to do something requiring a command (e.g. "run the tests") and verify you get a permission text; reply `1` and verify the result comes back.
 4. Ask it something open-ended enough to trigger a poll; reply with a number.
 5. Email the agent; verify the reply lands as an email on the same thread.
-6. Call the number, ask what it's working on, hang up mid-answer, and verify the tail arrives as a text.
+6. Call the number, ask what it's working on, hang up mid-answer, and verify the late voice tail is not silently sent as SMS or email.
 
 ## Development
 

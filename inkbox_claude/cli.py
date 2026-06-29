@@ -7,12 +7,12 @@ import sys
 
 try:
     from . import daemon
-    from .config import read_config
+    from .config import inkbox_client_kwargs, read_config
     from .doctor import print_doctor
     from .setup_wizard import interactive_setup
 except ImportError:  # pragma: no cover - direct local import/test fallback
     import daemon
-    from config import read_config
+    from config import inkbox_client_kwargs, read_config
     from doctor import print_doctor
     from setup_wizard import interactive_setup
 
@@ -24,7 +24,7 @@ def _cmd_whoami() -> int:
         return 1
     from inkbox import Inkbox
 
-    identity = Inkbox(api_key=cfg.api_key, base_url=cfg.base_url).get_identity(cfg.identity)
+    identity = Inkbox(**inkbox_client_kwargs(cfg.api_key, cfg.base_url)).get_identity(cfg.identity)
     mailbox = getattr(identity, "mailbox", None)
     phone = getattr(identity, "phone_number", None)
     print(f"handle:   {identity.agent_handle}")

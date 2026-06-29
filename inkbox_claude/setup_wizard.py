@@ -27,10 +27,10 @@ from typing import Any
 from urllib.parse import urlencode
 
 try:
-    from .config import INKBOX_BASE_URL_DEFAULT
+    from .config import INKBOX_BASE_URL_DEFAULT, inkbox_base_url_kwargs, inkbox_client_kwargs
     from .realtime import DEFAULT_MODEL as REALTIME_MODEL, REALTIME_URL
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_BASE_URL_DEFAULT
+    from config import INKBOX_BASE_URL_DEFAULT, inkbox_base_url_kwargs, inkbox_client_kwargs
     from realtime import DEFAULT_MODEL as REALTIME_MODEL, REALTIME_URL
 
 
@@ -42,6 +42,7 @@ _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
 _AVATAR_PATH = Path(__file__).resolve().parent / "assets" / "claude_code_avatar.png"
+_RAW_AVATAR_BASE_URL_DEFAULT = "https://inkbox.ai"
 
 
 # ----------------------------------------------------------------------
@@ -494,7 +495,7 @@ def _setup_signing_key(api_key: str, base_url: str, Inkbox: Any) -> None:
         raise SystemExit(1)
 
     try:
-        new_key = Inkbox(api_key=api_key, base_url=base_url).create_signing_key()
+        new_key = Inkbox(**inkbox_client_kwargs(api_key, base_url)).create_signing_key()
     except Exception as exc:
         print_error(f"  Failed to create signing key: {exc}")
         print_error("  A signing key is required; aborting setup. Retry, or paste an existing key.")
@@ -547,7 +548,7 @@ def _wait_for_sms_opt_in(api_key: str, base_url: str, phone: Any, Inkbox: Any) -
         return None
 
     try:
-        client = Inkbox(api_key=api_key, base_url=base_url)
+        client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
     except Exception:
         return
 
@@ -594,6 +595,10 @@ def _wait_for_sms_opt_in(api_key: str, base_url: str, phone: Any, Inkbox: Any) -
 # ----------------------------------------------------------------------
 
 
+def _avatar_base_url(base_url: str) -> str:
+    return (base_url or _RAW_AVATAR_BASE_URL_DEFAULT).rstrip("/")
+
+
 async def _identity_has_avatar_async(base_url: str, api_key: str, handle: str) -> bool | None:
     """Check whether an identity already has a contact-card avatar.
 
@@ -607,7 +612,7 @@ async def _identity_has_avatar_async(base_url: str, api_key: str, handle: str) -
     """
     import aiohttp
 
-    url = f"{base_url.rstrip('/')}/api/v1/identities/{handle}/avatar"
+    url = f"{_avatar_base_url(base_url)}/api/v1/identities/{handle}/avatar"
     timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -637,7 +642,7 @@ async def _upload_avatar_async(
     """
     import aiohttp
 
-    url = f"{base_url.rstrip('/')}/api/v1/identities/{handle}/avatar"
+    url = f"{_avatar_base_url(base_url)}/api/v1/identities/{handle}/avatar"
     timeout = aiohttp.ClientTimeout(total=30)
     form = aiohttp.FormData()
     form.add_field("file", image, filename="claude_code_avatar.png", content_type="image/png")
@@ -895,7 +900,7 @@ def _configure_imessage(api_key: str, base_url: str, handle: str, Inkbox: Any) -
     print_info("  No number to provision — you connect through the Inkbox iMessage router.")
 
     try:
-        client = Inkbox(api_key=api_key, base_url=base_url)
+        client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
         identity = client.get_identity(handle)
     except Exception as exc:
         print_warning(f"  Could not load the identity for iMessage setup: {exc}")
@@ -1134,8 +1139,8 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
                 human_email=human_email,
                 note_to_human=note,
                 agent_handle=handle,
-                base_url=base_url,
                 harness="claude-code",
+                **inkbox_base_url_kwargs(base_url),
             )
             break
         except InkboxAPIError as exc:
@@ -1210,7 +1215,11 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
             print_warning("  This code is dead. Type 'resend' before trying another code.")
             continue
         try:
-            verify = Inkbox.verify_signup(api_key=resp.api_key, verification_code=entry, base_url=base_url)
+            verify = Inkbox.verify_signup(
+                api_key=resp.api_key,
+                verification_code=entry,
+                **inkbox_base_url_kwargs(base_url),
+            )
             print_success(f"  Verified - claim status: {verify.claim_status}")
             verified = True
             break
@@ -1232,7 +1241,7 @@ def _self_signup_flow(base_url: str, Inkbox: Any, InkboxAPIError: Any) -> tuple[
         print_info("  We provision a local US number so SMS is supported.")
         if prompt_yes_no("  Provision a phone number for this agent?", True):
             try:
-                client = Inkbox(api_key=resp.api_key, base_url=base_url)
+                client = Inkbox(**inkbox_client_kwargs(resp.api_key, base_url))
                 provisioned_phone = client.phone_numbers.provision(agent_handle=resp.agent_handle, type="local")
                 print_success(f"  Provisioned: {provisioned_phone.number}")
             except InkboxAPIError as exc:
@@ -1280,7 +1289,7 @@ def _retry_or_abort(retry_label: str, *, error_context: str = "") -> bool:
 
 def _try_resend(Inkbox: Any, InkboxAPIError: Any, api_key: str, base_url: str, human_email: str) -> bool:
     try:
-        Inkbox.resend_signup_verification(api_key=api_key, base_url=base_url)
+        Inkbox.resend_signup_verification(api_key=api_key, **inkbox_base_url_kwargs(base_url))
         print_success(f"  Resent. Check {human_email}.")
         return True
     except InkboxAPIError as exc:
@@ -1331,7 +1340,7 @@ def _api_key_flow(
         return None, "", False
 
     try:
-        client = Inkbox(api_key=api_key, base_url=base_url)
+        client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
         info = client.whoami()
     except InkboxAPIError as exc:
         print_error(f"  whoami failed: HTTP {_error_status(exc)} {_error_detail(exc)}")
@@ -1356,9 +1365,9 @@ def _api_key_flow(
     if subtype == _enum_value(ADMIN_SCOPED):
         return _pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError)
 
-    print_warning(f"  Unrecognized API-key subtype: {subtype!r}.")
-    print_info("  Falling back to list_identities().")
-    return _pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError)
+    print_error(f"  Unsupported API-key subtype: {subtype!r}.")
+    print_info("  Use an admin-scoped or agent-scoped Inkbox API key.")
+    return None, "", False
 
 
 def _pick_agent_scoped(client: Any, api_key: str) -> tuple[Any | None, str, bool]:

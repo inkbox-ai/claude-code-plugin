@@ -7,9 +7,9 @@ import shutil
 from typing import List, Tuple
 
 try:
-    from .config import read_config
+    from .config import inkbox_client_kwargs, read_config
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import read_config
+    from config import inkbox_client_kwargs, read_config
 
 
 def run_doctor() -> List[Tuple[str, bool, str]]:
@@ -65,7 +65,7 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         try:
             from inkbox import Inkbox
 
-            identity = Inkbox(api_key=cfg.api_key, base_url=cfg.base_url).get_identity(cfg.identity)
+            identity = Inkbox(**inkbox_client_kwargs(cfg.api_key, cfg.base_url)).get_identity(cfg.identity)
             mailbox = getattr(identity, "mailbox", None)
             phone = getattr(identity, "phone_number", None)
             detail = ", ".join(filter(None, [
