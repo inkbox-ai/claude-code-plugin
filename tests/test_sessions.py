@@ -507,3 +507,91 @@ def test_double_text_interrupts_running_turn():
         session._worker.cancel()
 
     asyncio.run(scenario())
+
+
+def test_failed_turn_resets_wedged_client_keeping_resume_id():
+    # Regression for the silent-wedge bug: an oversized stream-json line kills
+    # the SDK's message reader, so receive_response() raises and the client is
+    # left dead-but-present. The failed turn must drop the client (so the next
+    # turn rebuilds a fresh subprocess) while keeping the resume id, so the
+    # conversation continues with context intact instead of going silent.
+    async def scenario():
+        session = make_session([])
+
+        class WedgedClient:
+            def __init__(self):
+                self.disconnected = False
+
+            async def query(self, text):
+                pass
+
+            def receive_response(self):
+                async def gen():
+                    raise RuntimeError(
+                        "JSON message exceeded maximum buffer size of 1048576 bytes"
+                    )
+                    yield  # pragma: no cover - makes this an async generator
+                return gen()
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        fake = WedgedClient()
+        session._client = fake
+        session.resume_session_id = "sess-keep"
+
+        # A normal turn (no future) re-raises after self-healing; _drain shows
+        # the human a notice, but the next turn recovers.
+        raised = False
+        try:
+            await session._run_turn(_Turn(text="read a huge file"))
+        except RuntimeError:
+            raised = True
+
+        assert raised is True
+        assert fake.disconnected is True              # wedged client torn down
+        assert session._client is None               # next turn rebuilds fresh
+        assert session.resume_session_id == "sess-keep"  # context preserved
+
+    asyncio.run(scenario())
+
+
+def test_interrupted_turn_does_not_reset_client():
+    # When a turn fails *because* a new message interrupted it, the client is
+    # still healthy — the reset must be skipped so we don't needlessly respawn
+    # the subprocess.
+    async def scenario():
+        session = make_session([])
+
+        class InterruptedClient:
+            def __init__(self, sess):
+                self.sess = sess
+                self.disconnected = False
+
+            async def query(self, text):
+                pass
+
+            def receive_response(self):
+                sess = self.sess
+
+                async def gen():
+                    sess._interrupting = True  # a concurrent /stop flipped this
+                    raise RuntimeError("aborted mid-turn")
+                    yield  # pragma: no cover
+                return gen()
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        fake = InterruptedClient(session)
+        session._client = fake
+
+        try:
+            await session._run_turn(_Turn(text="never mind"))
+        except RuntimeError:
+            pass
+
+        assert session._client is fake      # NOT reset
+        assert fake.disconnected is False
+
+    asyncio.run(scenario())
