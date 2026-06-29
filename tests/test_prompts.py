@@ -3,19 +3,46 @@ from inkbox_claude.prompts import build_channel_prompt, frame_inbound, strip_mar
 
 def test_frame_inbound_tags_channel_and_sender():
     assert frame_inbound("imessage", {"sender": "+15551234567"}, "hi").startswith(
-        "[iMessage from +15551234567]"
+        "[inkbox:imessage from=+15551234567 | contact=unknown_in_inkbox]"
     )
     assert frame_inbound("sms", {"sender": "+15551234567"}, "yo").startswith(
-        "[Text message (SMS) from +15551234567]"
+        "[inkbox:sms from=+15551234567 | contact=unknown_in_inkbox]"
     )
     # Email carries its subject into the tag.
     framed = frame_inbound("email", {"sender": "a@b.com", "subject": "Deploy?"}, "body")
-    assert framed.startswith("[Email from a@b.com]")
-    assert "Subject: Deploy?" in framed
+    assert framed.startswith("[inkbox:email from=a@b.com subject='Deploy?'")
     # Voice has no sender tag but flags speech.
-    assert frame_inbound("voice", {}, "what's up").startswith("[Spoken live on a phone call")
+    assert frame_inbound("voice", {}, "what's up").startswith("[inkbox:voice_call")
     # The body always survives intact.
     assert frame_inbound("imessage", {"sender": "x"}, "the message").endswith("the message")
+
+
+def test_frame_inbound_includes_contact_marker():
+    framed = frame_inbound(
+        "imessage",
+        {
+            "sender": "+15167251294",
+            "conversation_id": "imconv-1",
+            "contact": {
+                "id": "contact-dima",
+                "name": "Dima",
+                "company": "Inkbox",
+                "emails": ["dima@inkbox.ai"],
+                "phones": ["+15167251294"],
+                "job_title": "ignored",
+                "notes": "ignored",
+            },
+        },
+        "hi",
+    )
+    assert framed.startswith(
+        "[inkbox:imessage from=+15167251294 conversation_id=imconv-1 | "
+        "contact_id=contact-dima contact_name='Dima' contact_company='Inkbox'"
+    )
+    assert "contact_emails=['dima@inkbox.ai']" in framed
+    assert "contact_phones=['+15167251294']" in framed
+    assert "job_title" not in framed
+    assert "notes" not in framed
 
 
 def test_channel_prompt_mentions_identity_and_dir():

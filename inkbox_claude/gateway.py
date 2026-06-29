@@ -27,7 +27,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from aiohttp import WSMsgType, web
@@ -62,7 +62,7 @@ try:
         inkbox_client_kwargs,
     )
     from .media import download_media, inbound_media_note
-    from .prompts import strip_markdown
+    from .prompts import contact_marker, strip_markdown
     from .realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -73,7 +73,7 @@ try:
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, call_contexts_dir, inkbox_client_kwargs
     from media import download_media, inbound_media_note
-    from prompts import strip_markdown
+    from prompts import contact_marker, strip_markdown
     from realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -156,6 +156,7 @@ def _call_ended_prompt(transcript: Any) -> str:
 
 
 WEBHOOK_DEDUP_TTL_SECONDS = 300
+CONTACT_CACHE_TTL_SECONDS = 300
 SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
 IMESSAGE_MAX_LENGTH = 18995  # Sendblue-compatible iMessage text cap
 # Inbound SMS carrier keywords handled entirely by the Inkbox server;
@@ -214,6 +215,9 @@ class InkboxGateway:
         self._inflight_request_ids: Dict[str, float] = {}
         self._active_call_ws: Dict[str, Any] = {}
         self._call_meta_by_id: Dict[str, Dict[str, Any]] = {}
+        # ((kind, value) -> (contact summary, expires_at)); mirrors Hermes'
+        # per-inbound lookup cache for repeated remote phone/email events.
+        self._contact_cache: Dict[Tuple[str, str], Tuple[Optional[Dict[str, Any]], float]] = {}
         # Failed outbound message ids we've already told the agent about, so a
         # webhook retry (or a second failure event for the same message) doesn't
         # re-notify and spin the agent in a loop.
@@ -495,14 +499,26 @@ class InkboxGateway:
         data: Dict[str, Any],
         fallback: str,
         thread_key: Optional[str] = None,
+        contact: Optional[Dict[str, Any]] = None,
+        *,
+        allow_webhook_contact: bool = True,
     ) -> str:
         # Webhook payloads carry resolved contacts — key the session by
         # contact id so email/SMS/iMessage/voice converge on one session. If
         # Inkbox cannot resolve a contact, keep channel conversations stable
         # before falling back to the raw address/number.
-        contacts = data.get("contacts") or []
-        if len(contacts) == 1 and contacts[0].get("id"):
-            return str(contacts[0]["id"])
+        if contact and contact.get("id"):
+            return str(contact["id"])
+        if allow_webhook_contact:
+            contacts = data.get("contacts") or []
+            if len(contacts) == 1:
+                contact_id = (
+                    contacts[0].get("id")
+                    or contacts[0].get("contact_id")
+                    or contacts[0].get("contactId")
+                )
+                if contact_id:
+                    return str(contact_id)
         if thread_key:
             return thread_key
         return fallback
@@ -630,6 +646,32 @@ class InkboxGateway:
         except Exception:
             return summary
 
+    async def _resolve_contact_full(
+        self, *, kind: str, value: str
+    ) -> Optional[Dict[str, Any]]:
+        if not value:
+            return None
+        cache_key = (kind, value.lower())
+        now = time.time()
+        cached = self._contact_cache.get(cache_key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+        if self._inkbox is None:
+            return None
+        try:
+            matches = await asyncio.to_thread(self._inkbox.contacts.lookup, **{kind: value})
+        except Exception:
+            logger.debug("[bridge] contacts.lookup(%s=%s) failed", kind, value, exc_info=True)
+            self._contact_cache[cache_key] = (None, now + CONTACT_CACHE_TTL_SECONDS)
+            return None
+        if len(matches) != 1:
+            self._contact_cache[cache_key] = (None, now + CONTACT_CACHE_TTL_SECONDS)
+            return None
+        contact = self._contact_summary(matches[0])
+        self._contact_cache[cache_key] = (contact, now + CONTACT_CACHE_TTL_SECONDS)
+        return contact
+
     async def _resolve_call_contact(
         self, call_context: Dict[str, Any], remote: str
     ) -> Optional[Dict[str, Any]]:
@@ -696,12 +738,20 @@ class InkboxGateway:
             saved = await self._fetch_mail_attachments(message)
             body_text = (body_text + inbound_media_note(saved)).strip()
         thread_key = self._thread_key("email", message.get("thread_id"))
-        chat_id = self._chat_key(data, sender, thread_key)
+        contact = await self._resolve_contact_full(kind="email", value=sender)
+        chat_id = self._chat_key(
+            data,
+            sender,
+            thread_key,
+            contact=contact,
+            allow_webhook_contact=False,
+        )
         meta = {
             "to": sender,
             "sender": sender,
             "subject": subject,
             "thread_id": message.get("thread_id"),
+            "contact": contact,
         }
         # The channel tag (Subject included) is added by frame_inbound.
         await self.sessions.get(chat_id).handle_inbound(body_text, "email", meta)
@@ -807,13 +857,15 @@ class InkboxGateway:
         conversation_id: str,
         local_phone: str,
         participants: List[str],
+        contact: Optional[Dict[str, Any]] = None,
     ) -> str:
         marker_parts = [
             f"[inkbox:group_sms conversation_id={conversation_id or 'unknown'}",
             f"from={sender}",
             f"local={local_phone}" if local_phone else None,
             f"participants={','.join(participants)}" if participants else None,
-            "reply_mode=conversation_id]",
+            "reply_mode=conversation_id",
+            f"| {contact_marker(contact)}]",
         ]
         marker = " ".join(part for part in marker_parts if part)
         policy = "\n".join([
@@ -832,12 +884,13 @@ class InkboxGateway:
         conversation_id: str,
         target_message_id: str,
         reaction_label: str,
+        contact: Optional[Dict[str, Any]] = None,
     ) -> str:
         conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
         target_part = f" target_message_id={target_message_id}" if target_message_id else ""
         marker = (
             f"[inkbox:imessage_reaction from={sender} reaction={reaction_label}"
-            f"{conversation_part}{target_part}]"
+            f"{conversation_part}{target_part} | {contact_marker(contact)}]"
         )
         policy = "\n".join([
             f"{sender} reacted with a '{reaction_label}' tapback to your message.",
@@ -913,6 +966,7 @@ class InkboxGateway:
             or len(contacts) > 1
             or len(agent_identities) > 1
         )
+        contact = await self._resolve_contact_full(kind="phone", value=sender)
         if is_group:
             body = self._group_sms_prompt(
                 body,
@@ -920,14 +974,22 @@ class InkboxGateway:
                 conversation_id=conversation_id,
                 local_phone=local_phone,
                 participants=participants,
+                contact=contact,
             )
         thread_key = self._thread_key("sms", conversation_id)
-        chat_id = thread_key if is_group and thread_key else self._chat_key(data, sender, thread_key)
+        chat_id = self._chat_key(
+            data,
+            sender,
+            thread_key,
+            contact=contact,
+            allow_webhook_contact=False,
+        )
         meta = {
             "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
             "conversation_kind": "group" if is_group else "direct",
+            "contact": contact,
         }
         await self.sessions.get(chat_id).handle_inbound(body, "sms", meta)
         return web.json_response({"ok": True})
@@ -962,8 +1024,15 @@ class InkboxGateway:
 
         body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         conversation_id = str(message.get("conversation_id") or "").strip()
-        chat_id = self._chat_key(data, sender, self._thread_key("imessage", conversation_id))
-        meta = {"conversation_id": conversation_id or None, "sender": sender}
+        contact = await self._resolve_contact_full(kind="phone", value=sender)
+        chat_id = self._chat_key(
+            data,
+            sender,
+            self._thread_key("imessage", conversation_id),
+            contact=contact,
+            allow_webhook_contact=False,
+        )
+        meta = {"conversation_id": conversation_id or None, "sender": sender, "contact": contact}
         await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
         return web.json_response({"ok": True})
 
@@ -994,13 +1063,21 @@ class InkboxGateway:
                         if reaction_type == "custom" and custom_emoji
                         else reaction_type
                     ) or "unknown"
+                    contact = await self._resolve_contact_full(kind="phone", value=sender)
                     body = self._imessage_reaction_prompt(
                         sender=sender,
                         conversation_id=conversation_id,
                         target_message_id=target_message_id,
                         reaction_label=reaction_label,
+                        contact=contact,
                     )
-                    chat_id = self._chat_key(data, sender, self._thread_key("imessage", conversation_id))
+                    chat_id = self._chat_key(
+                        data,
+                        sender,
+                        self._thread_key("imessage", conversation_id),
+                        contact=contact,
+                        allow_webhook_contact=False,
+                    )
                     meta = {
                         "conversation_id": conversation_id or None,
                         "sender": sender,
@@ -1008,6 +1085,7 @@ class InkboxGateway:
                         "reply_to_id": target_message_id or reaction_id,
                         "reaction": reaction_label,
                         "typing": reaction_label == "question",
+                        "contact": contact,
                     }
                     await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
                     response = web.json_response({"ok": True})

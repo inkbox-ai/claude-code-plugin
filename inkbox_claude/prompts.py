@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # Appended to the claude_code system prompt preset for every bridged
 # session. The agent is a full Claude Code instance with tool access —
@@ -15,10 +15,10 @@ You are NOT in a terminal. You are an Inkbox agent ({identity_line}). The
 human is talking to you over {channels}. Your replies are delivered to
 their phone or inbox, so:
 
-- Each incoming message starts with a small bracketed tag showing how it
-  reached you and from whom — e.g. [iMessage from +15551234567] or
-  [Spoken live on a phone call]. Read it to know which channel you're on
-  right now, but never repeat the tag back in your reply.
+- Each incoming message starts with a small [inkbox:...] metadata tag showing
+  how it reached you, the remote phone/email, and any resolved Inkbox contact.
+  Read it to know who you are talking to and which channel you're on right now,
+  but never repeat the tag back in your reply.
 - Plain text only. No markdown — no **bold**, no backticks, no headers,
   no bullet lists, no code blocks unless they explicitly ask for code.
 - Keep it short and conversational. Think texts, not essays. Lead with
@@ -98,6 +98,22 @@ def build_channel_prompt(
     )
 
 
+def contact_marker(details: Optional[Dict[str, Any]]) -> str:
+    """Render a one-line Inkbox contact summary for inbound turn tags."""
+    if not details or not details.get("id"):
+        return "contact=unknown_in_inkbox"
+    parts = [f"contact_id={details['id']}"]
+    if details.get("name"):
+        parts.append(f"contact_name={details['name']!r}")
+    if details.get("company"):
+        parts.append(f"contact_company={details['company']!r}")
+    if details.get("emails"):
+        parts.append(f"contact_emails={details['emails']}")
+    if details.get("phones"):
+        parts.append(f"contact_phones={details['phones']}")
+    return " ".join(parts)
+
+
 def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     """Prefix an inbound message with a tag naming its channel and sender.
 
@@ -113,23 +129,33 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     Returns:
         str: ``text`` prefixed with a one-line bracketed channel tag.
     """
+    if text.lstrip().startswith("[inkbox:"):
+        return text
+
     meta = meta or {}
     sender = str(meta.get("sender") or "").strip()
-    from_part = f" from {sender}" if sender else ""
+    from_part = f" from={sender}" if sender else ""
+    marker = contact_marker(meta.get("contact"))
     if mode == "email":
-        header = f"[Email{from_part}]"
         subject = str(meta.get("subject") or "").strip()
-        if subject:
-            header += f"\nSubject: {subject}"
+        subject_part = f" subject={subject!r}" if subject else ""
+        header = f"[inkbox:email{from_part}{subject_part} | {marker}]"
     elif mode == "sms":
-        header = f"[Text message (SMS){from_part}]"
+        conversation_id = str(meta.get("conversation_id") or "").strip()
+        conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
+        label = "group_sms" if meta.get("conversation_kind") == "group" else "sms"
+        header = f"[inkbox:{label}{from_part}{conversation_part} | {marker}]"
     elif mode == "imessage":
-        header = f"[iMessage{from_part}]"
+        conversation_id = str(meta.get("conversation_id") or "").strip()
+        conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
+        header = f"[inkbox:imessage{from_part}{conversation_part} | {marker}]"
     elif mode == "voice":
-        header = "[Spoken live on a phone call — keep the reply short and speech-friendly]"
+        call_id = str(meta.get("call_id") or "").strip()
+        call_part = f" call_id={call_id}" if call_id else ""
+        header = f"[inkbox:voice_call{call_part} | {marker}]"
     else:
-        header = f"[Message via {mode}{from_part}]"
-    return f"{header}\n\n{text}"
+        header = f"[inkbox:{mode}{from_part} | {marker}]"
+    return f"{header}\n{text}"
 
 
 _MD_PATTERNS = [

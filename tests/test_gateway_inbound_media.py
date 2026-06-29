@@ -31,6 +31,32 @@ class _FakeSessions:
         return self.by_id.setdefault(chat_id, _FakeSession())
 
 
+class _FakeContacts:
+    def lookup(self, **kwargs):
+        if kwargs in (
+            {"phone": "+15167251294"},
+            {"email": "dima@inkbox.ai"},
+        ):
+            return [
+                types.SimpleNamespace(
+                    id="contact-dima",
+                    preferred_name="Dima",
+                    given_name="Dima",
+                    family_name="",
+                    company_name="Inkbox",
+                    job_title="Cofounder",
+                    notes="private note",
+                    emails=[
+                        types.SimpleNamespace(value="dima@inkbox.ai", is_primary=True),
+                    ],
+                    phones=[
+                        types.SimpleNamespace(value="+15167251294", is_primary=True),
+                    ],
+                )
+            ]
+        return []
+
+
 def _gw(monkeypatch, saved):
     async def fake_download(items, *, prefix):
         # Pretend each item downloaded; echo count so the prefix/threading works.
@@ -39,6 +65,10 @@ def _gw(monkeypatch, saved):
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
     gw.sessions = _FakeSessions()
     return gw
+
+
+def _attach_fake_contacts(gw):
+    gw._inkbox = types.SimpleNamespace(contacts=_FakeContacts())
 
 
 def test_inbound_mms_media_only_wakes_agent_with_note(monkeypatch):
@@ -124,6 +154,27 @@ def test_unknown_inbound_email_uses_thread_session_key(monkeypatch):
     assert meta["thread_id"] == "thread-123"
 
 
+def test_inbound_email_lookup_injects_contact_without_webhook_contact(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    _attach_fake_contacts(gw)
+    envelope = {"data": {"message": {
+        "id": "m-dima",
+        "from_address": "dima@inkbox.ai",
+        "thread_id": "thread-dima",
+        "subject": "Yo",
+        "snippet": "Who am I?",
+    }}}
+
+    asyncio.run(gw._on_mail_received(envelope))
+
+    body, mode, meta = gw.sessions.by_id["contact-dima"].inbound[0]
+    assert body == "Who am I?"
+    assert mode == "email"
+    assert meta["contact"]["id"] == "contact-dima"
+    assert meta["contact"]["name"] == "Dima"
+    assert meta["contact"]["emails"] == ["dima@inkbox.ai"]
+
+
 def test_unknown_direct_sms_uses_conversation_session_key(monkeypatch):
     gw = _gw(monkeypatch, [])
     envelope = {"data": {"text_message": {
@@ -143,6 +194,27 @@ def test_unknown_direct_sms_uses_conversation_session_key(monkeypatch):
     assert meta["conversation_kind"] == "direct"
 
 
+def test_inbound_sms_lookup_injects_contact_without_webhook_contact(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    _attach_fake_contacts(gw)
+    envelope = {"data": {"text_message": {
+        "id": "t-dima",
+        "direction": "inbound",
+        "remote_phone_number": "+15167251294",
+        "conversation_id": "conv-dima",
+        "text": "who am I?",
+    }}}
+
+    asyncio.run(gw._on_text_received(envelope))
+
+    body, mode, meta = gw.sessions.by_id["contact-dima"].inbound[0]
+    assert body == "who am I?"
+    assert mode == "sms"
+    assert meta["contact"]["id"] == "contact-dima"
+    assert meta["contact"]["name"] == "Dima"
+    assert meta["contact"]["phones"] == ["+15167251294"]
+
+
 def test_unknown_inbound_imessage_uses_conversation_session_key(monkeypatch):
     gw = _gw(monkeypatch, [])
     envelope = {"data": {"message": {
@@ -159,6 +231,27 @@ def test_unknown_inbound_imessage_uses_conversation_session_key(monkeypatch):
     assert body == "hello"
     assert mode == "imessage"
     assert meta["conversation_id"] == "imconv-123"
+
+
+def test_inbound_imessage_lookup_injects_contact_without_webhook_contact(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    _attach_fake_contacts(gw)
+    envelope = {"data": {"message": {
+        "id": "i-dima",
+        "direction": "inbound",
+        "remote_number": "+15167251294",
+        "conversation_id": "imconv-dima",
+        "content": "who am I?",
+    }}}
+
+    asyncio.run(gw._on_imessage_received(envelope))
+
+    body, mode, meta = gw.sessions.by_id["contact-dima"].inbound[0]
+    assert body == "who am I?"
+    assert mode == "imessage"
+    assert meta["contact"]["id"] == "contact-dima"
+    assert meta["contact"]["name"] == "Dima"
+    assert meta["contact"]["phones"] == ["+15167251294"]
 
 
 def test_inbound_text_without_media_is_unchanged(monkeypatch):
@@ -215,12 +308,13 @@ def test_imessage_reaction_injects_silent_policy(monkeypatch):
 
     asyncio.run(gw._on_imessage_reaction_received(envelope))
 
-    session = gw.sessions.by_id["contact-9"]
+    session = gw.sessions.by_id["imessage:imconv-123"]
     body, mode, meta = session.inbound[0]
     assert mode == "imessage"
     assert body.startswith("[inkbox:imessage_reaction from=+15551112222 reaction=question")
     assert "conversation_id=imconv-123" in body
     assert "target_message_id=im-target-9" in body
+    assert "contact=unknown_in_inkbox" in body
     assert "return exactly [SILENT]" in body
     assert meta["conversation_id"] == "imconv-123"
     assert meta["typing"] is True
