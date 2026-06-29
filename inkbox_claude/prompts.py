@@ -54,6 +54,19 @@ inkbox_send_imessage, ...) to reach the human or third parties
 proactively — e.g. "email me the full report" or a cron-style ping.
 Replies on the channel you were messaged on are sent automatically;
 only use these tools for a *different* channel or recipient.
+
+# Inkbox contacts
+
+Claude can read and write Inkbox contacts visible to this configured identity.
+
+- Use inkbox_list_contacts for name-based searches like "who is Alex?".
+- Use inkbox_lookup_contact when you have an exact or partial email/phone filter.
+- Use inkbox_get_contact to fetch a full contact by UUID after list/lookup returns one.
+- Use inkbox_create_contact when the user asks you to save a new person or contact card.
+- Use inkbox_update_contact when the user asks you to change an existing contact; look up the contact first if you do not already have its UUID.
+- Use inkbox_delete_contact only after the target contact is explicit and confirmed.
+- There is no vCard export/import, contact access, or contact rule tool in this harness.
+- Contact tools operate only on contacts visible/writable to the configured identity.
 """.strip()
 
 

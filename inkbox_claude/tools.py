@@ -542,20 +542,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return _error(str(exc))
 
     @tool(
-        "inkbox_export_contact_vcard",
-        "Export one contact as a vCard 4.0 string by contact id.",
-        {"contact_id": str},
-    )
-    async def inkbox_export_contact_vcard(args: Dict[str, Any]) -> Dict[str, Any]:
-        def _run():
-            return {"vcard": client.contacts.vcards.export_vcard(str(args["contact_id"]))}
-
-        try:
-            return _result(await asyncio.to_thread(_run))
-        except Exception as exc:
-            return _error(str(exc))
-
-    @tool(
         "inkbox_delete_contact",
         "Remove a contact from the address book by its contact id. Look it up "
         "first to confirm you have the right person.",
@@ -588,7 +574,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_get_contact,
         inkbox_create_contact,
         inkbox_update_contact,
-        inkbox_export_contact_vcard,
         inkbox_delete_contact,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
@@ -609,7 +594,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_get_contact",
         "mcp__inkbox__inkbox_create_contact",
         "mcp__inkbox__inkbox_update_contact",
-        "mcp__inkbox__inkbox_export_contact_vcard",
         "mcp__inkbox__inkbox_delete_contact",
     ]
     return server, tool_names
