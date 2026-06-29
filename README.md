@@ -218,8 +218,8 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_calls` · `inkbox_get_call_transcript` — browse recent calls and fetch transcript segments.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
-- `inkbox_lookup_contact` · `inkbox_list_contacts` — resolve and find address-book contacts (reverse-lookup by email/phone, or free-text search by name/company).
-- `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_delete_contact` — save, edit, and remove contacts. Reads and writes are filtered server-side to what this identity may see.
+- `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).
+- `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_export_contact_vcard` · `inkbox_delete_contact` — save, edit, export, and remove contacts. Reads and writes are filtered server-side to what this identity may see.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
@@ -230,7 +230,7 @@ On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent
 3. Ask it to do something requiring a command (e.g. "run the tests") and verify you get a permission text; reply `1` and verify the result comes back.
 4. Ask it something open-ended enough to trigger a poll; reply with a number.
 5. Email the agent; verify the reply lands as an email on the same thread.
-6. Call the number, ask what it's working on, hang up mid-answer, and verify the tail arrives as a text.
+6. Call the number, ask what it's working on, hang up mid-answer, and verify the late voice tail is not silently sent as SMS or email.
 
 ## Development
 
