@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -17,6 +18,22 @@ INKBOX_WS_PATH = "/phone/media/ws"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
 DEFAULT_WEBHOOK_PATH = "/webhook"
+
+
+def call_contexts_dir() -> Path:
+    """Directory where ``inkbox_place_call`` stashes per-call context (purpose,
+    opening line) for the gateway to load when the outbound call connects.
+
+    Shared across the tool process and the gateway daemon (same host + user);
+    honours ``INKBOX_CLAUDE_HOME`` like the daemon's state dir.
+
+    Returns:
+        Path: The created ``<home>/call_contexts`` directory.
+    """
+    root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
+    path = root / "call_contexts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 # Tools Claude Code may run without texting the human first. Everything
 # else (Bash, Write, Edit, ...) escalates over the active channel.

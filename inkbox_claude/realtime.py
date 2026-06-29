@@ -105,6 +105,11 @@ class RealtimeCallMeta:
     remote_phone_number: Optional[str]
     agent_identity_phone: Optional[str] = None
     project_dir: Optional[str] = None
+    # Outbound calls only: why this agent placed the call, threaded from
+    # ``inkbox_place_call`` so the live session opens with context, not cold.
+    outbound_purpose: Optional[str] = None
+    outbound_opening: Optional[str] = None
+    outbound_context: Optional[str] = None
 
 
 @dataclass
@@ -166,6 +171,18 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         "can answer directly. Use it whenever the caller wants something done in the code.",
         "While a tool runs you may say a brief 'one moment' so the caller isn't left in silence.",
     ]
+    if meta.outbound_purpose:
+        lines += [
+            "",
+            "This is an OUTBOUND call you placed — the callee did not call you. "
+            f"You are calling because: {meta.outbound_purpose}",
+        ]
+        if meta.outbound_context:
+            lines.append(f"Background: {meta.outbound_context}")
+        lines.append(
+            "Open by greeting them, saying who you are, and stating why you're "
+            "calling in one short sentence, then let them respond."
+        )
     if additional.strip():
         lines += ["", additional.strip()]
     return "\n".join(lines)
@@ -173,6 +190,17 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
 
 def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
     """Instructions for the proactive opening line spoken at pickup."""
+    if meta.outbound_opening:
+        return (
+            "Open the call by saying, naturally and in one short sentence: "
+            f"\"{meta.outbound_opening}\" Then stop and let them respond."
+        )
+    if meta.outbound_purpose:
+        return (
+            "You placed this call. Open by greeting them, saying you're their "
+            f"Claude Code agent, and stating why you're calling: {meta.outbound_purpose}. "
+            "Keep it to one short sentence, then stop."
+        )
     return (
         "Greet the caller briefly and naturally, e.g. \"Hey, it's your Claude Code "
         "agent — what do you need?\" Keep it to one short sentence and then stop."
@@ -605,6 +633,19 @@ async def _openai_to_inkbox_pump(
         state.consult_tasks.add(task)
         task.add_done_callback(state.consult_tasks.discard)
 
+    async def _relay_transcript(party: str, text: str) -> None:
+        # Realtime runs the WS in raw-media mode (OpenAI does STT/TTS, Inkbox
+        # does neither), so the platform never records any transcript on its
+        # own. Mirror each finalized turn back as a client `transcript` event
+        # so it lands in the Inkbox call record. party: local=agent, remote=caller.
+        with suppress(Exception):
+            await inkbox_ws.send_str(json.dumps({
+                "event": "transcript",
+                "party": party,
+                "text": text,
+                "is_final": True,
+            }))
+
     async for msg in openai_ws:
         if state.closed:
             return
@@ -661,10 +702,12 @@ async def _openai_to_inkbox_pump(
             text = (frame.get("transcript") or "").strip()
             if text:
                 state.transcript.append(("agent", text))
+                await _relay_transcript("local", text)
         elif ftype == "conversation.item.input_audio_transcription.completed":
             text = (frame.get("transcript") or "").strip()
             if text:
                 state.transcript.append(("caller", text))
+                await _relay_transcript("remote", text)
 
         # Function-call lifecycle.
         elif ftype == "response.output_item.added":
