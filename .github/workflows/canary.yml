@@ -2,10 +2,11 @@ name: Canary — plugin vs Claude Code latest
 
 on:
   schedule:
-    # 06:13 & 18:13 America/Los_Angeles (staggered ahead of the rest of the
-    # fleet's canaries so upstream breakage surfaces here first).
-    - cron: "13 13 * * *"
-    - cron: "13 1 * * *"
+    # 05:13 & 17:13 America/Los_Angeles (PDT/UTC-7 basis; cron is UTC) —
+    # leads the fleet's hour-staggered canary waves so upstream breakage
+    # surfaces here first.
+    - cron: "13 12 * * *"
+    - cron: "13 0 * * *"
   workflow_dispatch:
 
 jobs:
