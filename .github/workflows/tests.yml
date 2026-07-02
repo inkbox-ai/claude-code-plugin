@@ -1,0 +1,60 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Offline unit suite — inkbox is mocked in the tests, so install only what
+  # they import. Runs on every push/PR, drafts included.
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test deps
+        run: pip install pytest aiohttp segno claude-agent-sdk
+
+      # tests/contract runs in its own job against the LATEST host, not here.
+      # tests/live is collected but self-skips without the live API keys.
+      - name: Test
+        run: pytest -q --ignore=tests/contract
+
+  # Contract suite — the bridge's view of the host interface, checked against
+  # the latest published claude-agent-sdk + Claude Code CLI so upstream drift
+  # fails a PR here instead of a live gateway later.
+  contract-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install bridge + latest SDK
+        run: |
+          pip install -e . pytest
+          pip install -U claude-agent-sdk
+
+      - name: Install latest Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Contract tests vs latest host
+        run: pytest -q tests/contract

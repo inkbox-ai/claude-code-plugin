@@ -1,0 +1,47 @@
+name: Canary — plugin vs Claude Code latest
+
+on:
+  schedule:
+    # 06:13 & 18:13 America/Los_Angeles (staggered ahead of the rest of the
+    # fleet's canaries so upstream breakage surfaces here first).
+    - cron: "13 13 * * *"
+    - cron: "13 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install bridge + latest SDK
+        run: |
+          pip install -e . pytest
+          pip install -U claude-agent-sdk
+
+      - name: Install latest Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Contract tests vs latest host
+        run: pytest -q tests/contract
+
+      # Unattended runs page the team; manual dispatches don't.
+      - name: Notify Google Chat on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+        run: |
+          [ -n "$WEBHOOK_URL" ] || exit 0
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"🚨 claude-code-plugin canary FAILED against the latest Claude Code host: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$WEBHOOK_URL" || true
