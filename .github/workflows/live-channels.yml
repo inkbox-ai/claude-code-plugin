@@ -1,0 +1,165 @@
+name: Live channels e2e
+
+# Boots a REAL bridge (tunnel + webhooks + Claude Code sessions) with this
+# checkout, then drives it from a remote Inkbox identity over email + SMS.
+# Two legs, serialized (they share the AUT identity):
+#   * mock — the sessions "think" against a local deterministic model server
+#            (tests/live/mock_anthropic.py): free, proves the whole pipe.
+#   * real — a real Claude model: proves reasoning + tool use end to end.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      timeout_s:
+        description: "Per-question reply timeout (seconds)"
+        required: false
+        default: "150"
+  workflow_run:
+    workflows: ["Canary — plugin vs Claude Code latest"]
+    types: [completed]
+
+# Only one holder of the AUT identity's Inkbox tunnel at a time — the voice
+# suite shares this group, so live runs queue instead of fighting the tunnel.
+concurrency:
+  group: inkbox-live-aut-tunnel
+  cancel-in-progress: false
+
+jobs:
+  live:
+    # Draft PRs and fork PRs (no secrets) skip; chained runs only follow a
+    # PASSING canary.
+    if: >
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        leg: [mock, real]
+    env:
+      INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
+      CLAUDE_PROJECT_DIR: ${{ github.workspace }}
+      # A stray permission escalation should fail a test fast, not park the
+      # session for the default 10 minutes.
+      INKBOX_PERMISSION_TIMEOUT_S: "30"
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install bridge
+        run: pip install -e . pytest
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Derive AUT identity handle
+        run: |
+          HANDLE=$(python3 - <<'PY'
+          import os
+          from inkbox import Inkbox
+          c = Inkbox(api_key=os.environ["INKBOX_API_KEY"])
+          print(c.mailboxes.list()[0].email_address.split("@", 1)[0])
+          PY
+          )
+          echo "INKBOX_IDENTITY=$HANDLE" >> "$GITHUB_ENV"
+          echo "AUT handle: $HANDLE"
+
+      - name: Start mock model server
+        if: matrix.leg == 'mock'
+        run: |
+          nohup python3 tests/live/mock_anthropic.py 8089 > /tmp/mock_anthropic.log 2>&1 &
+          for i in $(seq 1 10); do
+            curl -fsS http://127.0.0.1:8089/ > /dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "mock model server never came up"; exit 1
+
+      - name: Point sessions at the mock model
+        if: matrix.leg == 'mock'
+        run: |
+          echo "ANTHROPIC_BASE_URL=http://127.0.0.1:8089" >> "$GITHUB_ENV"
+          echo "ANTHROPIC_API_KEY=sk-mock-not-used" >> "$GITHUB_ENV"
+
+      - name: Point sessions at the real model
+        if: matrix.leg == 'real'
+        run: echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}" >> "$GITHUB_ENV"
+
+      - name: Start bridge gateway
+        run: |
+          nohup inkbox-claude run > /tmp/gateway.log 2>&1 &
+          echo $! > /tmp/gateway.pid
+          for i in $(seq 1 36); do
+            if grep -q "\[bridge\] ready" /tmp/gateway.log; then
+              echo "gateway ready"; exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/gateway.pid)" 2>/dev/null; then
+              echo "gateway process died during startup"; tail -n 150 /tmp/gateway.log; exit 1
+            fi
+            sleep 5
+          done
+          echo "gateway never became ready"; tail -n 150 /tmp/gateway.log; exit 1
+
+      - name: Live channel tests (${{ matrix.leg }} model)
+        env:
+          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+          CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+          LIVE_EMAIL_TIMEOUT: ${{ github.event.inputs.timeout_s || '150' }}
+          LIVE_REAL_MODEL: ${{ matrix.leg == 'real' && '1' || '' }}
+          LIVE_CONTACT_CRUD: ${{ matrix.leg == 'real' && '1' || '' }}
+        run: python3 -m pytest tests/live -v
+
+      # Logs can carry live message content — surface them only when needed.
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
+          echo "=== mock_anthropic.log ==="; tail -n 100 /tmp/mock_anthropic.log 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-channels-${{ matrix.leg }}-logs
+          path: |
+            /tmp/gateway.log
+            /tmp/mock_anthropic.log
+          if-no-files-found: ignore
+
+      - name: Stop bridge gateway
+        if: always()
+        run: |
+          [ -f /tmp/gateway.pid ] && kill "$(cat /tmp/gateway.pid)" 2>/dev/null || true
+
+  # Page the team only when an UNATTENDED run breaks (the canary chain);
+  # PR authors and manual dispatchers are already watching.
+  notify:
+    needs: live
+    if: always() && needs.live.result == 'failure' && github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Google Chat
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+        run: |
+          [ -n "$WEBHOOK_URL" ] || exit 0
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"🚨 claude-code-plugin live channels e2e FAILED (chained off the canary): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$WEBHOOK_URL" || true

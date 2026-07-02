@@ -1,0 +1,147 @@
+name: Live voice e2e
+
+# Real phone calls against a real bridge, one scenario per job:
+#   * inbound_inkbox    — driver calls the agent; Inkbox STT/TTS answers.
+#   * outbound_realtime — driver texts "call me"; the agent dials back powered
+#                         by the realtime voice API.
+# A driver process (tests/live/voice_driver.py) is the peer on the other end
+# of the call, bridged over the driver identity's own Inkbox tunnel.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+# Shares the AUT tunnel lock with the channels suite.
+concurrency:
+  group: inkbox-live-aut-tunnel
+  cancel-in-progress: false
+
+jobs:
+  voice:
+    if: >
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        scenario: [inbound_inkbox, outbound_realtime]
+    env:
+      INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
+      CLAUDE_PROJECT_DIR: ${{ github.workspace }}
+      INKBOX_PERMISSION_TIMEOUT_S: "30"
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      VOICE_DRIVER_STATE: /tmp/voice_driver_state.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # uvicorn[standard] matters: the bare install can't accept WebSocket
+      # upgrades, and the driver's call-media endpoint is a WebSocket.
+      - name: Install bridge + driver deps
+        run: pip install -e . pytest fastapi 'uvicorn[standard]'
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Derive AUT identity handle
+        run: |
+          HANDLE=$(python3 - <<'PY'
+          import os
+          from inkbox import Inkbox
+          c = Inkbox(api_key=os.environ["INKBOX_API_KEY"])
+          print(c.mailboxes.list()[0].email_address.split("@", 1)[0])
+          PY
+          )
+          echo "INKBOX_IDENTITY=$HANDLE" >> "$GITHUB_ENV"
+          echo "AUT handle: $HANDLE"
+
+      - name: Configure speech mode (${{ matrix.scenario }})
+        run: |
+          if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
+            echo "INKBOX_REALTIME_ENABLED=true" >> "$GITHUB_ENV"
+            echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
+            echo "INKBOX_REALTIME_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"
+          else
+            echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Start voice driver
+        env:
+          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+        run: |
+          nohup python3 tests/live/voice_driver.py > /tmp/voice_driver.log 2>&1 &
+          echo $! > /tmp/voice_driver.pid
+          for i in $(seq 1 30); do
+            [ -f "$VOICE_DRIVER_STATE" ] && { echo "driver ready"; exit 0; }
+            if ! kill -0 "$(cat /tmp/voice_driver.pid)" 2>/dev/null; then
+              echo "voice driver died during startup"; tail -n 100 /tmp/voice_driver.log; exit 1
+            fi
+            sleep 3
+          done
+          echo "voice driver never became ready"; tail -n 100 /tmp/voice_driver.log; exit 1
+
+      - name: Start bridge gateway
+        run: |
+          nohup inkbox-claude run > /tmp/gateway.log 2>&1 &
+          echo $! > /tmp/gateway.pid
+          for i in $(seq 1 36); do
+            if grep -q "\[bridge\] ready" /tmp/gateway.log; then
+              echo "gateway ready"; exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/gateway.pid)" 2>/dev/null; then
+              echo "gateway process died during startup"; tail -n 150 /tmp/gateway.log; exit 1
+            fi
+            sleep 5
+          done
+          echo "gateway never became ready"; tail -n 150 /tmp/gateway.log; exit 1
+
+      - name: Live voice test (${{ matrix.scenario }})
+        env:
+          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+          CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+          VOICE_SCENARIO: ${{ matrix.scenario }}
+          LIVE_REAL_MODEL: "1"
+        run: python3 -m pytest tests/live/test_voice.py -v
+
+      # Logs can carry live call transcripts — surface them only when needed.
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
+          echo "=== voice_driver.log ==="; tail -n 150 /tmp/voice_driver.log 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-voice-${{ matrix.scenario }}-logs
+          path: |
+            /tmp/gateway.log
+            /tmp/voice_driver.log
+          if-no-files-found: ignore
+
+      # Driver first (SIGINT so its cleanup reverts the number's auto-accept),
+      # then a beat for the revert to land, then the gateway.
+      - name: Teardown
+        if: always()
+        run: |
+          [ -f /tmp/voice_driver.pid ] && kill -INT "$(cat /tmp/voice_driver.pid)" 2>/dev/null || true
+          sleep 3
+          [ -f /tmp/gateway.pid ] && kill "$(cat /tmp/gateway.pid)" 2>/dev/null || true
