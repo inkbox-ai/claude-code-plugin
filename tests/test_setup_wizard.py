@@ -88,7 +88,7 @@ def test_install_command_prefers_uv_when_available(monkeypatch):
         "install",
         "--python",
         "/tmp/venv/bin/python",
-        "inkbox>=0.4.10",
+        "inkbox>=0.4.15,<1.0.0",
         "aiohttp>=3.9",
     ]]
 
@@ -98,10 +98,10 @@ def test_install_command_falls_back_to_pip_and_ensurepip(monkeypatch):
     monkeypatch.setattr(setup_wizard.shutil, "which", lambda _name: None)
 
     assert setup_wizard._install_commands() == [
-        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.10", "aiohttp>=3.9"]],
+        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.15,<1.0.0", "aiohttp>=3.9"]],
         [
             ["/tmp/venv/bin/python", "-m", "ensurepip", "--upgrade"],
-            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.10", "aiohttp>=3.9"],
+            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.4.15,<1.0.0", "aiohttp>=3.9"],
         ],
     ]
 
@@ -120,7 +120,7 @@ def test_missing_sdk_guidance_prints_interpreter(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "/tmp/venv/bin/python" in out
     assert "uv pip install --python" in out
-    assert "inkbox>=0.4.10" in out
+    assert "inkbox>=0.4.15,<1.0.0" in out
 
 
 # ----------------------------------------------------------------------
@@ -362,7 +362,7 @@ def test_setup_signing_key_decline_aborts(tmp_path, monkeypatch):
 
 
 # ----------------------------------------------------------------------
-# iMessage walkthrough (mirrors the hermes-agent-plugin fakes)
+# iMessage walkthrough
 # ----------------------------------------------------------------------
 
 
@@ -417,10 +417,11 @@ def test_configure_imessage_enables_and_offers_connect(monkeypatch):
         lambda _client, _identity, handle: walked.append(handle),
     )
 
-    setup_wizard._configure_imessage(
+    enabled = setup_wizard._configure_imessage(
         "ApiKey_test", "https://inkbox.ai", "agent", lambda **_kwargs: client,
     )
 
+    assert enabled is True
     assert identity.updates == [{"imessage_enabled": True}]
     assert walked == ["agent"]
 
@@ -436,10 +437,11 @@ def test_configure_imessage_declined_leaves_identity_untouched(monkeypatch):
         lambda *_a: (_ for _ in ()).throw(AssertionError("should not walk through connect")),
     )
 
-    setup_wizard._configure_imessage(
+    enabled = setup_wizard._configure_imessage(
         "ApiKey_test", "https://inkbox.ai", "agent", lambda **_kwargs: client,
     )
 
+    assert enabled is False
     assert identity.updates == []
 
 
@@ -588,8 +590,24 @@ def test_configure_realtime_skips_without_phone(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
     setup_wizard._configure_realtime_calls(types.SimpleNamespace(phone_number=None))
-    # No phone → returns before writing anything to this run's .env file.
+    # No phone and no iMessage → returns before writing anything to .env.
     assert not env_file.exists()
+
+
+def test_configure_realtime_offered_for_imessage_only_identity(tmp_path, monkeypatch):
+    # Calls can arrive over the shared iMessage line, so realtime is offered
+    # even without a dedicated number when the threaded flag says enabled
+    # (the local identity object may be stale, hence the explicit bool).
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-rt")
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
+    monkeypatch.setattr(setup_wizard, "_test_openai_realtime_api_key", lambda *a, **k: (True, "ok"))
+
+    setup_wizard._configure_realtime_calls(
+        types.SimpleNamespace(phone_number=None), imessage_enabled=True
+    )
+    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "true"
 
 
 # ----------------------------------------------------------------------
@@ -641,3 +659,156 @@ def test_avatar_declined_for_existing_agent(monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("declined → no upload")))
     identity = types.SimpleNamespace(agent_handle="dev-agent")
     setup_wizard._configure_avatar("https://inkbox.ai", "ApiKey_x", identity, is_signup=False)
+
+
+# ----------------------------------------------------------------------
+# Dedicated phone number (standalone step, after iMessage)
+# ----------------------------------------------------------------------
+
+
+def test_offer_dedicated_number_reports_existing(monkeypatch, capsys):
+    identity = types.SimpleNamespace(
+        agent_handle="agent",
+        phone_number=types.SimpleNamespace(number="+15550001111", type="local"),
+    )
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
+
+    result, provisioned = setup_wizard._offer_dedicated_number(object(), identity)
+
+    assert result is identity and provisioned is False
+    assert "Already provisioned: +15550001111" in capsys.readouterr().out
+
+
+def test_offer_dedicated_number_provisions_and_refetches(monkeypatch):
+    class FakePhones:
+        def provision(self, *, agent_handle, type):
+            assert (agent_handle, type) == ("agent", "local")
+            return types.SimpleNamespace(number="+15550002222", type="local")
+
+    refreshed = types.SimpleNamespace(
+        agent_handle="agent",
+        phone_number=types.SimpleNamespace(number="+15550002222", type="local"),
+    )
+
+    class FakeClient:
+        phone_numbers = FakePhones()
+
+        def get_identity(self, _handle):
+            return refreshed
+
+    identity = types.SimpleNamespace(agent_handle="agent", phone_number=None)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
+
+    result, provisioned = setup_wizard._offer_dedicated_number(FakeClient(), identity)
+
+    assert result is refreshed and provisioned is True
+
+
+def test_offer_dedicated_number_failure_points_at_paid_tiers(monkeypatch, capsys):
+    class FakePhones:
+        def provision(self, **_kwargs):
+            raise RuntimeError("HTTP 402 plan does not include phone numbers")
+
+    class FakeClient:
+        phone_numbers = FakePhones()
+
+    identity = types.SimpleNamespace(agent_handle="agent", phone_number=None)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
+
+    result, provisioned = setup_wizard._offer_dedicated_number(FakeClient(), identity)
+
+    out = capsys.readouterr().out
+    assert result is identity and provisioned is False
+    # Plan-gating fallback: point at pricing, echo the raw error, keep moving.
+    assert "Dedicated phone numbers are available on Inkbox paid tiers" in out
+    assert "https://inkbox.ai/pricing" in out
+    assert "HTTP 402 plan does not include phone numbers" in out
+
+
+def test_offer_dedicated_number_declined_skips(monkeypatch, capsys):
+    class FakeClient:
+        phone_numbers = types.SimpleNamespace(
+            provision=lambda **_k: (_ for _ in ()).throw(AssertionError("declined → no provision"))
+        )
+
+    identity = types.SimpleNamespace(agent_handle="agent", phone_number=None)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: False)
+
+    result, provisioned = setup_wizard._offer_dedicated_number(FakeClient(), identity)
+
+    assert result is identity and provisioned is False
+    assert "Skipped" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# Wizard step ordering
+# ----------------------------------------------------------------------
+
+
+def test_wizard_walks_imessage_before_dedicated_number(tmp_path, monkeypatch):
+    """iMessage comes FIRST, then the standalone dedicated-number step, then
+    the summary and the realtime offer — with the iMessage bool threaded into
+    the realtime gate (the local identity object may be stale)."""
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    for var in ("INKBOX_API_KEY", "INKBOX_IDENTITY", "INKBOX_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+    identity = types.SimpleNamespace(agent_handle="agent", phone_number=None, mailbox=None)
+    order = []
+    seen = {}
+
+    fake_symbols = {
+        "Inkbox": lambda **_k: types.SimpleNamespace(),
+        "InkboxAPIError": Exception,
+        "IdentityPhoneNumberCreateOptions": object,
+        "WhoamiApiKeyResponse": object,
+        "ADMIN_SCOPED": "admin_scoped",
+        "AGENT_CLAIMED": "agent_scoped_claimed",
+        "AGENT_UNCLAIMED": "agent_scoped_unclaimed",
+    }
+    monkeypatch.setattr(setup_wizard, "_ensure_inkbox_sdk", lambda: fake_symbols)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *a, **k: True)
+    monkeypatch.setattr(
+        setup_wizard, "_api_key_flow", lambda *a, **k: (identity, "ApiKey_x", False)
+    )
+    monkeypatch.setattr(setup_wizard, "_configure_avatar", lambda *a, **k: order.append("avatar"))
+    monkeypatch.setattr(
+        setup_wizard, "_configure_imessage",
+        lambda *a, **k: order.append("imessage") or True,
+    )
+    monkeypatch.setattr(
+        setup_wizard, "_offer_dedicated_number",
+        lambda _client, ident: order.append("dedicated_number") or (ident, False),
+    )
+    monkeypatch.setattr(setup_wizard, "_print_agent_summary", lambda *a, **k: order.append("summary"))
+    monkeypatch.setattr(
+        setup_wizard, "_wait_for_sms_opt_in",
+        lambda *a, **k: order.append("sms_opt_in"),
+    )
+
+    def fake_realtime(_identity, *, imessage_enabled=False):
+        order.append("realtime")
+        seen["imessage_enabled"] = imessage_enabled
+
+    monkeypatch.setattr(setup_wizard, "_configure_realtime_calls", fake_realtime)
+    monkeypatch.setattr(setup_wizard, "_setup_signing_key", lambda *a, **k: order.append("signing_key"))
+    monkeypatch.setattr(setup_wizard, "_configure_project_dir", lambda: order.append("project_dir"))
+    monkeypatch.setattr(setup_wizard, "_configure_autostart", lambda: order.append("autostart"))
+
+    setup_wizard.interactive_setup()
+
+    assert order == [
+        "avatar",
+        "imessage",
+        "dedicated_number",
+        "summary",
+        "realtime",
+        "signing_key",
+        "project_dir",
+        "autostart",
+    ]
+    # No number was provisioned this run, so the START wait never blocks.
+    assert "sms_opt_in" not in order
+    assert seen["imessage_enabled"] is True

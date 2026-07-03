@@ -1,8 +1,5 @@
 """Inkbox ↔ OpenAI Realtime API voice bridge for live phone calls.
 
-Ported from Hermes' Inkbox realtime bridge, with the coding-agent tool tier
-kept intact.
-
 When Realtime is configured, the gateway pre-opens an OpenAI Realtime
 WebSocket *before* accepting the Inkbox call in raw-media mode, then runs
 two pumps for the call's duration:
@@ -110,6 +107,9 @@ class RealtimeCallMeta:
     agent_identity_handle: Optional[str] = None
     agent_identity_email: Optional[str] = None
     agent_identity_phone: Optional[str] = None
+    # Whether the identity also has the shared Inkbox iMessage line enabled —
+    # lets the spoken prompt draw the dedicated-vs-shared-line distinction.
+    agent_imessage_enabled: bool = False
     project_dir: Optional[str] = None
     contact_known: bool = False
     contact_id: Optional[str] = None
@@ -175,7 +175,19 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
     if meta.agent_identity_email:
         lines.append(f"Your Inkbox agent email address: {meta.agent_identity_email}.")
     if meta.agent_identity_phone:
-        lines.append(f"Your Inkbox agent phone number: {meta.agent_identity_phone}.")
+        lines.append(
+            f"Your dedicated phone line (your own number, for SMS and voice calls): "
+            f"{meta.agent_identity_phone}.",
+        )
+    if meta.agent_imessage_enabled:
+        lines.append(
+            "You also have a shared Inkbox iMessage line — voice calls and iMessage "
+            "with people connected to you over iMessage. Its number is managed by "
+            "Inkbox: never state or promise a number for it. The current call may be "
+            "running over either line; calls follow the conversation's channel "
+            "(iMessage contacts are called over the shared line, SMS/phone contacts "
+            "over your dedicated number).",
+        )
     if meta.remote_phone_number:
         lines.append(f"Remote phone number: {meta.remote_phone_number}.")
     if meta.contact_known:

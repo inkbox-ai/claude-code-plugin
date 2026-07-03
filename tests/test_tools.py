@@ -53,13 +53,20 @@ class _FakeTranscript:
 
 class _FakeIdentity:
     def __init__(self):
+        self.agent_handle = "claude-agent"
+        self.mailbox = type("Mailbox", (), {"email_address": "claude@inkbox.ai"})()
         self.phone_number = type(
             "Phone",
             (),
-            {"client_websocket_url": "wss://agent.inkboxwire.com/phone/media/ws?existing=1"},
+            {
+                "number": "+15550001111",
+                "client_websocket_url": "wss://agent.inkboxwire.com/phone/media/ws?existing=1",
+            },
         )()
+        self.imessage_enabled = False
         self.tunnel = type("Tunnel", (), {"public_host": "agent.inkboxwire.com"})()
         self.place_call_kwargs = None
+        self.place_call_error = None
         self.list_calls_kwargs = None
         self.transcript_call_id = None
         self.sent_texts = []
@@ -67,6 +74,8 @@ class _FakeIdentity:
 
     def place_call(self, **kwargs):
         self.place_call_kwargs = kwargs
+        if self.place_call_error is not None:
+            raise self.place_call_error
         return type("Call", (), {"id": "call-123", "status": "queued"})()
 
     def list_calls(self, **kwargs):
@@ -186,6 +195,9 @@ def test_place_call_writes_context_and_tags_websocket_url(tmp_path, monkeypatch)
     assert data["placed"] is True
     assert data["id"] == "call-123"
     assert data["to"] == "+15551112222"
+    # Number-only identity → resolved to (and echoed as) the dedicated line.
+    assert data["origination"] == "dedicated_number"
+    assert client.identity.place_call_kwargs["origination"] == "dedicated_number"
     ws_url = client.identity.place_call_kwargs["client_websocket_url"]
     parsed = urlparse(ws_url)
     query = parse_qs(parsed.query)
@@ -205,6 +217,77 @@ def test_place_call_requires_purpose():
     )
 
     assert "purpose is required" in data["error"]
+
+
+def test_place_call_explicit_origination_wins():
+    client = _FakeClient()
+    client.identity.imessage_enabled = True
+
+    data = _call(
+        client,
+        "inkbox_place_call",
+        {
+            "to_number": "+15551112222",
+            "purpose": "check in",
+            "origination": "shared_imessage_number",
+        },
+    )
+
+    assert data["origination"] == "shared_imessage_number"
+    assert client.identity.place_call_kwargs["origination"] == "shared_imessage_number"
+
+
+def test_place_call_no_shared_connection_returns_legible_error():
+    client = _FakeClient()
+    client.identity.imessage_enabled = True
+    client.identity.place_call_error = RuntimeError(
+        "HTTP 409 {'error': 'no_shared_connection'}"
+    )
+
+    data = _call(
+        client,
+        "inkbox_place_call",
+        {
+            "to_number": "+15551112222",
+            "purpose": "check in",
+            "origination": "shared_imessage_number",
+        },
+    )
+
+    # The agent gets an actionable message, not a raw 409.
+    assert "isn't connected to you over iMessage" in data["error"]
+    assert 'set origination to "dedicated_number"' in data["error"]
+    assert "no_shared_connection" in data["detail"]
+
+
+def test_place_call_without_any_line_tells_agent_how_to_fix():
+    client = _FakeClient()
+    client.identity.phone_number = None
+    client.identity.imessage_enabled = False
+
+    data = _call(
+        client,
+        "inkbox_place_call",
+        {"to_number": "+15551112222", "purpose": "check in"},
+    )
+
+    assert "no dedicated phone number" in data["error"]
+    assert "enable iMessage" in data["error"]
+    assert client.identity.place_call_kwargs is None
+
+
+def test_whoami_reports_the_two_lines():
+    client = _FakeClient()
+    client.identity.imessage_enabled = True
+
+    data = _call(client, "inkbox_whoami", {})
+
+    assert data["lines"]["dedicated_phone_line"] == "+15550001111"
+    assert data["lines"]["shared_imessage_line"] == "enabled"
+    # The shared line's number is managed by Inkbox and never surfaced.
+    assert "origination=dedicated_number" in data["lines"]["dedicated_phone_line_note"]
+    assert "origination=shared_imessage_number" in data["lines"]["shared_imessage_line_note"]
+    assert "not shown" in data["lines"]["shared_imessage_line_note"]
 
 
 def test_list_calls_passes_pagination_and_returns_rows():

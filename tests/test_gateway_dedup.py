@@ -17,7 +17,13 @@ class _FakeResponse:
 class _FakeRequest:
     def __init__(self, body, *, request_id="req-1"):
         self._body = body
-        self.headers = {"X-Inkbox-Request-Id": request_id}
+        # Real Inkbox traffic always carries its signature header — routing
+        # keys off the identified source even when verification is off.
+        self.headers = {
+            "X-Inkbox-Request-Id": request_id,
+            "X-Inkbox-Signature": "sha256=test",
+        }
+        self.url = "https://agent.example/webhook"
 
     async def read(self):
         return self._body

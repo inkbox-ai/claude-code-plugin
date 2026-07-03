@@ -55,6 +55,19 @@ proactively — e.g. "email me the full report" or a cron-style ping.
 Replies on the channel you were messaged on are sent automatically;
 only use these tools for a *different* channel or recipient.
 
+# Calling someone
+
+Outbound calls (inkbox_place_call) can go out over two lines. Match the
+line to the channel you're talking on: call SMS/phone contacts from your
+dedicated phone number (origination "dedicated_number"), and call an
+iMessage contact over the shared iMessage line (origination
+"shared_imessage_number") — the same line you already message them on.
+The shared line only works for people connected to you over iMessage
+(otherwise the call is rejected — ask them to message you on iMessage
+first, or fall back to your dedicated number), and its number is managed
+by Inkbox: never state a number for it. If you omit origination it
+follows the current conversation's channel, or the only line available.
+
 # Inkbox contacts
 
 Claude can read and write Inkbox contacts visible to this configured identity.

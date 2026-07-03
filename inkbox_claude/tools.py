@@ -1,8 +1,8 @@
 """Inkbox messaging tools exposed to Claude Code via in-process MCP.
 
-Mirrors the hermes-agent-plugin direct-tool surface: whoami, outbound
-email/SMS/iMessage, and text-conversation triage. The Inkbox SDK is
-synchronous, so every call is pushed onto a thread.
+Whoami, outbound email/SMS/iMessage, calls, contacts, and
+text-conversation triage. The Inkbox SDK is synchronous, so every call
+is pushed onto a thread.
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ import logging
 import mimetypes
 import secrets
 import time
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 try:
@@ -40,6 +41,73 @@ logger = logging.getLogger(__name__)
 
 SMS_MAX_LENGTH = 1600
 IMESSAGE_MAX_LENGTH = 18995
+
+# The contact session whose turn is driving the current tool call. Each
+# session binds itself here right before its agent client connects, so the
+# client's tool-dispatch tasks inherit a reference to it; the session object
+# is long-lived and its ``mode`` mutates per inbound message, giving tools a
+# live view of the conversation's channel.
+CURRENT_SESSION: ContextVar[Any] = ContextVar("inkbox_claude_current_session", default=None)
+
+
+def _current_channel_hint() -> Optional[str]:
+    """Which Inkbox channel is the current agent turn happening on?
+
+    Reads the bound session's last inbound modality (concurrency-safe: each
+    agent client's dispatch tasks see only their own session).
+
+    Returns:
+        Optional[str]: ``"imessage"`` | ``"dedicated"`` | ``None`` (unknown /
+        not in a gateway turn, e.g. tests or a non-phone channel).
+    """
+    session = CURRENT_SESSION.get()
+    mode = str(getattr(session, "mode", "") or "").strip().lower()
+    if mode == "imessage":
+        return "imessage"
+    if mode in {"sms", "voice"}:
+        return "dedicated"
+    return None
+
+
+def _resolve_call_origination(identity: Any, explicit: str) -> Optional[str]:
+    """Pick which line an outbound call originates from.
+
+    Calls can go out over two paths: the agent's own ``dedicated_number`` or
+    the ``shared_imessage_number`` it's already messaging the recipient on.
+    Resolution order:
+
+    1. An explicit choice (from the agent) always wins.
+    2. If only one path exists, use it (dedicated number but no iMessage →
+       dedicated; iMessage enabled but no number → shared).
+    3. If BOTH exist, follow the channel the current conversation is on — an
+       iMessage turn calls over the shared iMessage line, an SMS/phone turn
+       over the dedicated number.  This makes "call me" do the right thing
+       without the agent having to specify the line.
+    4. If both exist but we can't tell the channel, default to the dedicated
+       number (the open line that can reach anyone).
+
+    Args:
+        identity (Any): The agent identity (``phone_number`` +
+            ``imessage_enabled`` are read).
+        explicit (str): The agent's explicit ``origination`` arg, if any.
+
+    Returns:
+        Optional[str]: The resolved origination, or None when neither path
+        exists (nothing to call from).
+    """
+    explicit = (explicit or "").strip().lower()
+    if explicit in {"dedicated_number", "shared_imessage_number"}:
+        return explicit
+    has_number = getattr(identity, "phone_number", None) is not None
+    imessage_enabled = bool(getattr(identity, "imessage_enabled", False))
+    if has_number and imessage_enabled:
+        # Both lines available — follow the conversation's channel.
+        return "shared_imessage_number" if _current_channel_hint() == "imessage" else "dedicated_number"
+    if has_number:
+        return "dedicated_number"
+    if imessage_enabled:
+        return "shared_imessage_number"
+    return None
 
 
 def _json_safe(value: Any) -> Any:
@@ -145,7 +213,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
     @tool(
         "inkbox_whoami",
-        "Show this agent's Inkbox identity: handle, email address, and phone number.",
+        "Show this agent's Inkbox identity: handle, email address, and its two "
+        "calling lines (dedicated phone number + shared iMessage line).",
         {},
     )
     async def inkbox_whoami(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -153,11 +222,31 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             identity = _identity()
             phone = identity.phone_number
             mailbox = identity.mailbox
+            # Present the two lines with explicit labels so the agent
+            # describes them correctly: its OWN dedicated phone line vs the
+            # SHARED iMessage line. The dedicated number is the one for SMS +
+            # voice; the iMessage line's number is managed by Inkbox and
+            # never surfaced.
+            dedicated_number = getattr(phone, "number", None)
+            imessage_enabled = bool(getattr(identity, "imessage_enabled", False))
             return {
                 "handle": identity.agent_handle,
                 "email": getattr(mailbox, "email_address", None),
-                "phone": getattr(phone, "number", None),
-                "imessage_enabled": getattr(identity, "imessage_enabled", False),
+                "phone": dedicated_number,
+                "imessage_enabled": imessage_enabled,
+                "lines": {
+                    "dedicated_phone_line": dedicated_number or "(none provisioned)",
+                    "dedicated_phone_line_note": (
+                        "Your own phone line for SMS and voice calls. Call from it with "
+                        "origination=dedicated_number."
+                    ),
+                    "shared_imessage_line": "enabled" if imessage_enabled else "disabled",
+                    "shared_imessage_line_note": (
+                        "Voice + iMessage with people connected to you over iMessage. Its "
+                        "number is managed by Inkbox and not shown. Call over it with "
+                        "origination=shared_imessage_number."
+                    ),
+                },
             }
 
         try:
@@ -268,10 +357,17 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
     @tool(
         "inkbox_place_call",
-        "Place an outbound phone call from this agent's Inkbox number. The call's audio "
-        "bridges to the running gateway. Always pass purpose so the live call opens "
-        "with context; optionally pass opening_message and context.",
-        {"to_number": str, "purpose": str, "opening_message": str, "context": str},
+        "Place an outbound voice call. Calls can go out over two lines: your own "
+        "dedicated phone number, or the shared Inkbox iMessage line you are "
+        "already messaging the recipient on. Match the channel you're talking on "
+        "— call SMS/phone contacts from your dedicated number "
+        '(origination "dedicated_number"), and call an iMessage contact over the '
+        'shared iMessage line (origination "shared_imessage_number"; only works '
+        "if they are connected to you over iMessage, otherwise the call is "
+        "rejected). If origination is omitted it is resolved automatically. The "
+        "call's audio bridges to the running gateway. Always pass purpose so the "
+        "live call opens with context; optionally pass opening_message and context.",
+        {"to_number": str, "purpose": str, "origination": str, "opening_message": str, "context": str},
     )
     async def inkbox_place_call(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
@@ -284,6 +380,18 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                     "purpose is required so the live call opens with context"
                 )
             identity = _identity()
+
+            # Resolve the outbound line (dedicated number vs shared iMessage line).
+            origination = _resolve_call_origination(
+                identity, str(args.get("origination") or "")
+            )
+            if origination is None:
+                raise RuntimeError(
+                    "This identity can't place calls: it has no dedicated phone "
+                    "number and iMessage is not enabled. Provision a number or "
+                    "enable iMessage first."
+                )
+
             phone = getattr(identity, "phone_number", None)
             ws_url = str(getattr(phone, "client_websocket_url", "") or "").strip()
             if not ws_url:
@@ -303,11 +411,20 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                 to_number=to_number,
             )
             ws_url = _append_query_param(ws_url, "context_token", token)
-            call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
+            try:
+                call = identity.place_call(
+                    to_number=to_number,
+                    origination=origination,
+                    client_websocket_url=ws_url,
+                )
+            except TypeError:
+                # Older SDK without ``origination`` support → dedicated only.
+                call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
             return {
                 "placed": True,
                 "id": str(getattr(call, "id", "")),
                 "to": to_number,
+                "origination": origination,
                 "context_token": token,
                 "status": _json_safe(getattr(call, "status", None)),
             }
@@ -315,7 +432,18 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         try:
             return _result(await asyncio.to_thread(_run))
         except Exception as exc:
-            return _error(str(exc))
+            msg = str(exc)
+            if "no_shared_connection" in msg:
+                # Surface a legible reason: shared-line calls only work for
+                # people already connected over iMessage.
+                return _error(
+                    "Can't place a shared iMessage-line call: this person isn't "
+                    "connected to you over iMessage yet. They need to message your "
+                    "iMessage number first. To call from your own phone number "
+                    'instead, set origination to "dedicated_number".',
+                    detail=msg,
+                )
+            return _error(msg)
 
     @tool(
         "inkbox_list_calls",
@@ -415,7 +543,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
     # ------------------------------------------------------------------
     # Contacts — the org address book, filtered server-side to what this
-    # identity may see (ported from hermes-agent-plugin's contact-lookup).
+    # identity may see.
     # ------------------------------------------------------------------
 
     @tool(

@@ -128,6 +128,18 @@ def test_send_to_contact_suppresses_exact_silent_reply():
     asyncio.run(gw.send_to_contact("contact-1", "[SILENT]", "sms", {"to": "+15551234567"}))
 
 
+def test_send_to_contact_drops_external_event_text_without_delivery():
+    # External-event chats are synthetic (no mailbox/number behind them) —
+    # escalation prompts and error notices must drop instead of e.g. trying
+    # to email the "external:<source>:<key>" chat id.
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    asyncio.run(
+        gw.send_to_contact("external:ci:run-7", "Permission to run Bash?", "email", {})
+    )
+
+
 def test_send_to_contact_drops_late_voice_reply_without_channel_fallback():
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
     gw._inkbox = _NoDeliveryInkbox()
@@ -262,6 +274,45 @@ def test_call_ws_uses_stored_call_contact_session_for_stt_tts(monkeypatch):
     assert session.inbound[0][2]["contact"]["id"] == "contact-1"
     assert session.inbound[0][2]["contact"]["name"] == "Ada Lovelace"
     assert "call-1" not in gw._call_meta_by_id
+
+
+def test_call_ws_backfills_remote_via_identity_centered_call_read(monkeypatch):
+    """When the upgrade carries no caller metadata (Inkbox accepted the call
+    itself), a single call-id read resolves the remote party — including
+    shared-line calls, which have no phone_number on the identity."""
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"transcript","text":"hello","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    class _FakeCalls:
+        def __init__(self):
+            self.requested = []
+
+        def get(self, call_id):
+            self.requested.append(call_id)
+            return types.SimpleNamespace(
+                remote_phone_number="+15559990000", direction="inbound"
+            )
+
+    class _FakeInkboxWithCalls:
+        def __init__(self):
+            self.calls = _FakeCalls()
+            self.contacts = types.SimpleNamespace(lookup=lambda **_k: [])
+
+    session = _FakeContactSession()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw.sessions = _FakeSessions(session)
+    gw._inkbox = _FakeInkboxWithCalls()
+    request = _FakeRequest()
+    request.query = {"call_id": "call-9"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert gw._inkbox.calls.requested == ["call-9"]
+    assert session.inbound[0][2]["sender"] == "+15559990000"
 
 
 class _FakeBridge:

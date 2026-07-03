@@ -1,0 +1,134 @@
+name: Live external events e2e
+
+# Boots a REAL bridge with this checkout, then POSTs signed external escalation
+# webhooks at its local /webhook listener asking it to phone the driver contact.
+# The tests verify the agent actually places that call (and that a forged
+# signature is rejected without waking the agent). The driver sits on
+# auto_reject (set by the tests) — we monitor the escalation, not the call.
+# Real model + real call, so this runs only on ready (non-draft) PRs + dispatch.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      timeout_s:
+        description: "Seconds to wait for the agent to place the call"
+        required: false
+        default: "200"
+
+# Shares the AUT tunnel lock with the channels + voice suites.
+concurrency:
+  group: inkbox-live-aut-tunnel
+  cancel-in-progress: false
+
+jobs:
+  external-events:
+    # Draft PRs and fork PRs (no secrets) skip.
+    if: >
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
+      CLAUDE_PROJECT_DIR: ${{ github.workspace }}
+      # A stray permission escalation should fail a test fast, not park the
+      # session for the default 10 minutes.
+      INKBOX_PERMISSION_TIMEOUT_S: "30"
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # The whole point of this suite — let external webhooks reach the agent.
+      INKBOX_EXTERNAL_EVENTS_ENABLED: "true"
+      # No realtime needed — the driver auto-rejects, so no media leg runs.
+      INKBOX_REALTIME_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install bridge
+        run: pip install -e . pytest
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Derive AUT identity handle
+        run: |
+          HANDLE=$(python3 - <<'PY'
+          import os
+          from inkbox import Inkbox
+          c = Inkbox(api_key=os.environ["INKBOX_API_KEY"])
+          print(c.mailboxes.list()[0].email_address.split("@", 1)[0])
+          PY
+          )
+          echo "INKBOX_IDENTITY=$HANDLE" >> "$GITHUB_ENV"
+          echo "AUT handle: $HANDLE"
+
+      # Per-run GitHub webhook secret: shared by the bridge (to verify
+      # X-Hub-Signature-256) and the test (to sign). Generated fresh each run
+      # so nothing is committed.
+      - name: Mint per-run GitHub webhook secret
+        run: |
+          GH_SECRET="$(openssl rand -hex 24)"
+          echo "::add-mask::$GH_SECRET"
+          echo "INKBOX_WEBHOOK_SECRET_GITHUB=$GH_SECRET" >> "$GITHUB_ENV"
+
+      - name: Start bridge gateway
+        run: |
+          nohup inkbox-claude run > /tmp/gateway.log 2>&1 &
+          echo $! > /tmp/gateway.pid
+          for i in $(seq 1 36); do
+            if grep -q "\[bridge\] ready" /tmp/gateway.log; then
+              echo "gateway ready"; exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/gateway.pid)" 2>/dev/null; then
+              echo "gateway process died during startup"; tail -n 150 /tmp/gateway.log; exit 1
+            fi
+            sleep 5
+          done
+          echo "gateway never became ready"; tail -n 150 /tmp/gateway.log; exit 1
+
+      # Inkbox-signed escalation + GitHub-signed (valid & forged) escalation.
+      - name: Live external-event tests
+        env:
+          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+          CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+          CLAUDE_CODE_INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
+          LIVE_EXTERNAL_TIMEOUT: ${{ github.event.inputs.timeout_s || '200' }}
+          LIVE_REAL_MODEL: "1"
+          LIVE_EXTERNAL_EVENTS: "1"
+        run: >-
+          python3 -m pytest
+          tests/live/test_external_event_intelligence.py
+          tests/live/test_external_event_github.py -v
+
+      # Logs can carry live agent content — surface them only when needed.
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-external-events-logs
+          path: /tmp/gateway.log
+          if-no-files-found: ignore
+
+      - name: Stop bridge gateway
+        if: always()
+        run: |
+          [ -f /tmp/gateway.pid ] && kill "$(cat /tmp/gateway.pid)" 2>/dev/null || true

@@ -314,6 +314,7 @@ class ContactSession:
         on_clear: Optional[Callable[[str], None]] = None,
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
+        system_prompt_extra: str = "",
     ):
         self.chat_id = chat_id
         self.cfg = cfg
@@ -326,6 +327,9 @@ class ContactSession:
         self.resume_session_id = resume_session_id
         self.on_session_id = on_session_id
         self.on_clear = on_clear
+        # Extra session-scoped system prompt (e.g. the external-event
+        # directive) — appended after the channel prompt at client start.
+        self.system_prompt_extra = system_prompt_extra
 
         self.mode = "email"  # last inbound modality; selects the reply channel
         self.reply_meta: Dict[str, Any] = {}
@@ -725,18 +729,33 @@ class ContactSession:
                 "claude-agent-sdk is not installed; run: pip install claude-agent-sdk"
             )
 
+        try:
+            from .tools import CURRENT_SESSION
+        except ImportError:  # pragma: no cover - direct local import/test fallback
+            from tools import CURRENT_SESSION
+        # Bind this session before the client connects: the client's internal
+        # tool-dispatch tasks inherit this context, so the Inkbox tools can
+        # read the session's live mode (e.g. to pick an outbound call line).
+        CURRENT_SESSION.set(self)
+
+        # Session-scoped extras (e.g. the external-event directive) ride on
+        # the system prompt so they carry harness authority for every turn.
+        prompt_append = build_channel_prompt(
+            project_dir=self.cfg.project_dir,
+            identity_handle=self.identity_info.get("handle", ""),
+            email_address=self.identity_info.get("email", ""),
+            phone_number=self.identity_info.get("phone", ""),
+        )
+        if self.system_prompt_extra:
+            prompt_append = f"{prompt_append}\n\n{self.system_prompt_extra}"
+
         options = ClaudeAgentOptions(
             cwd=self.cfg.project_dir or None,
             model=self.cfg.claude_model or None,
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
-                "append": build_channel_prompt(
-                    project_dir=self.cfg.project_dir,
-                    identity_handle=self.identity_info.get("handle", ""),
-                    email_address=self.identity_info.get("email", ""),
-                    phone_number=self.identity_info.get("phone", ""),
-                ),
+                "append": prompt_append,
             },
             setting_sources=["user", "project"],
             # Read-only tools and our own Inkbox tools run without a text;
@@ -895,11 +914,14 @@ class SessionManager:
         if self._session_ids.pop(chat_id, None) is not None:
             self._persist()
 
-    def get(self, chat_id: str) -> ContactSession:
+    def get(self, chat_id: str, system_prompt_extra: str = "") -> ContactSession:
         """Fetch or lazily create the session for one remote party.
 
         Args:
             chat_id (str): Contact id, or raw address/number fallback.
+            system_prompt_extra (str): Optional extra system-prompt text bound
+                to the session if this call creates it (existing sessions keep
+                the prompt they started with).
 
         Returns:
             ContactSession: The (possibly new) session for that contact.
@@ -918,6 +940,7 @@ class SessionManager:
                 on_clear=self._clear_state,
                 typing_fn=self.typing_fn,
                 health_fn=self.health_fn,
+                system_prompt_extra=system_prompt_extra,
             )
             self.sessions[chat_id] = session
         return session
