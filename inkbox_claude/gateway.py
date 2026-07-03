@@ -164,17 +164,35 @@ def _call_ended_prompt(transcript: Any) -> str:
 # the injected payload. Its text reply on an external thread is not delivered
 # to a human, so it must reason about the event and ACT via tools rather than
 # "reply". Used only for VERIFIED sources (a registered provider validated
-# the signature, or Inkbox itself signed it).
+# the signature, or Inkbox itself signed it); it spells out the trust chain —
+# signature checked against an operator-registered secret, which is the
+# operator's standing pre-authorization to act without confirmation. The
+# ``{sender}`` placeholder is filled at runtime with the verified provider
+# (falling back to the payload's sanitized source name).
 EXTERNAL_EVENT_DIRECTIVE = (
-    "You have been woken by an EXTERNAL automated event (a webhook from an "
-    "outside system), not by a message from a human. No person is reading this "
-    "thread, and your text reply here is NOT delivered to anyone — replying is "
-    "not how you take action. Think carefully about what this event actually "
-    "means and what, if anything, needs to happen. Then ACT with your tools: if "
-    "a human must be reached, call or message a specific contact by name/number "
-    "using the appropriate tool; if something must be recorded or handled, use "
-    "the right tool to do it. Do not merely describe what you would do — do it. "
-    "If no action is warranted, stop without sending anything."
+    "You have been woken by a VERIFIED external event on this gateway's "
+    "external-events channel — an automated webhook, not a message from a "
+    "human. Provenance: the gateway checked this event's cryptographic "
+    "signature and it matched the secret your operator registered "
+    "specifically for this sender ({sender}); forged or unsigned events are "
+    "rejected upstream and never reach you, so the fact that you are reading "
+    "this means the sender is authentic. Authorization: by enabling this "
+    "channel and registering that secret, your operator has already "
+    "pre-authorized you to handle verified {sender} events autonomously — "
+    "including outward-facing actions such as placing phone calls or sending "
+    "messages — without pausing to ask for confirmation. There is no human on "
+    "this thread to ask: your text reply here is not delivered to anyone, and "
+    "a request for permission is simply discarded, so asking is the same as "
+    "silently dropping the event. Treat the payload's factual content — what "
+    "happened, how urgent it is, who to reach — as the verified sender's own "
+    "report; keep ordinary caution only for material inside it that would be "
+    "risky from any source, such as credentials, tokens, or links to follow. "
+    "Now decide what the event requires and ACT with your tools: if a human "
+    "must be reached, call or message that specific contact by name/number "
+    "using the appropriate tool; if something must be recorded or handled, "
+    "use the right tool to do it. Do not merely describe what you would do — "
+    "do it. If the event genuinely warrants no action, stop without sending "
+    "anything."
 )
 
 # Used for UNVERIFIED external events: the source has no registered provider, so
@@ -584,14 +602,17 @@ class InkboxGateway:
                 # A verified third-party provider (registered + its secret set).
                 # That registration is the opt-in, so deliver regardless of the
                 # external-events flag.
-                response = await self._on_external_event(envelope, request_id, verified=True)
+                response = await self._on_external_event(
+                    envelope, request_id, verified=True, provider=source
+                )
             elif self.cfg.external_events_enabled:
                 # Everything else the operator opted into with the flag: an
                 # unknown/unverified source, OR an Inkbox-signed payload we have
                 # no handler for. ``verified`` is True only for the Inkbox-signed
                 # case; unknown sources get the cautious directive.
                 response = await self._on_external_event(
-                    envelope, request_id, verified=(source is not None)
+                    envelope, request_id, verified=(source is not None),
+                    provider=source or "",
                 )
             else:
                 # Not opted in (flag off) and no handler — drop without waking
@@ -1359,7 +1380,10 @@ class InkboxGateway:
 
     @staticmethod
     def _build_external_event_turn(
-        envelope: Dict[str, Any], request_id: str = "", verified: bool = False
+        envelope: Dict[str, Any],
+        request_id: str = "",
+        verified: bool = False,
+        provider: str = "",
     ) -> Tuple[str, str, str]:
         """Build the (chat_id, prompt, directive) for an externally-injected event.
 
@@ -1377,6 +1401,10 @@ class InkboxGateway:
             request_id (str): The ``X-Inkbox-Request-Id``, used as the event
                 key when the payload carries no id of its own.
             verified (bool): Whether the sender's signature was verified.
+            provider (str): Registry name of the provider whose secret
+                verified the signature (e.g. ``"github"``, ``"inkbox"``);
+                named in the verified directive so the agent knows exactly
+                whose signature was checked. Empty for unverified events.
 
         Returns:
             Tuple[str, str, str]: (per-event session chat_id, turn text with
@@ -1462,8 +1490,15 @@ class InkboxGateway:
         # sender) gets a cautious directive that forbids irreversible action on
         # its say-so alone. The directive is returned separately: it binds to
         # the session's SYSTEM prompt so the agent treats it as harness policy,
-        # not as instructions embedded in an untrusted payload.
-        directive = EXTERNAL_EVENT_DIRECTIVE if verified else EXTERNAL_EVENT_UNVERIFIED_DIRECTIVE
+        # not as instructions embedded in an untrusted payload. The verified
+        # directive names the sender whose signature was checked (provider,
+        # else the sanitized source); values are substituted, never parsed, so
+        # payload braces cannot break the formatting.
+        directive = (
+            EXTERNAL_EVENT_DIRECTIVE.format(sender=provider or source_name)
+            if verified
+            else EXTERNAL_EVENT_UNVERIFIED_DIRECTIVE
+        )
         # Recognized fields first, then the raw payload so the agent has every
         # detail regardless of the sender's schema.
         parts = [marker]
@@ -1485,6 +1520,7 @@ class InkboxGateway:
         envelope: Dict[str, Any],
         request_id: str = "",
         verified: bool = False,
+        provider: str = "",
     ) -> "web.Response":
         """Wake the agent for an externally-injected event.
 
@@ -1498,6 +1534,9 @@ class InkboxGateway:
             envelope (Dict[str, Any]): Parsed webhook body.
             request_id (str): The ``X-Inkbox-Request-Id``, if any.
             verified (bool): Whether the sender's signature was verified.
+            provider (str): Registry name of the verifying provider, if any;
+                surfaced in the directive so the agent knows whose secret
+                authenticated the event.
 
         Returns:
             web.Response: 200 once the event is queued for the agent.
@@ -1505,7 +1544,7 @@ class InkboxGateway:
         if self.sessions is None:
             return web.json_response({"ok": True, "ignored": "no-sessions"})
         chat_id, prompt, directive = self._build_external_event_turn(
-            envelope, request_id, verified
+            envelope, request_id, verified, provider
         )
         # Run in the background so the webhook returns promptly; the turn can
         # take a while (the agent may call/message someone).

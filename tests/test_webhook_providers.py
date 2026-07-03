@@ -49,8 +49,8 @@ def _gateway(*, require_signature, external_events_enabled, monkeypatch=None):
     ))
     gw._external_wakes = []
 
-    async def _capture(envelope, request_id="", verified=False):
-        gw._external_wakes.append((envelope, verified))
+    async def _capture(envelope, request_id="", verified=False, provider=""):
+        gw._external_wakes.append((envelope, verified, provider))
         return gateway_mod.web.json_response({"ok": True})
 
     if monkeypatch is not None:
@@ -211,7 +211,7 @@ def test_unknown_source_passthrough_is_unverified_when_enabled(monkeypatch):
         gw._handle_webhook(_FakeRequest(b'{"event":"prod_on_fire"}'))
     )
     assert resp.status == 200
-    assert gw._external_wakes == [({"event": "prod_on_fire"}, False)]
+    assert gw._external_wakes == [({"event": "prod_on_fire"}, False, "")]
 
 
 def test_unknown_source_dropped_when_passthrough_disabled(monkeypatch):
@@ -257,7 +257,8 @@ def test_third_party_valid_signature_proceeds(monkeypatch):
         )
     )
     assert resp.status == 200
-    assert gw._external_wakes == [({"event": "charge"}, True)]
+    # The verifying provider's name travels with the wake (named in the directive).
+    assert gw._external_wakes == [({"event": "charge"}, True, "acme")]
     assert captured["secret"] == "s3cret"             # env secret reached the verifier
     assert captured["body"] == b'{"event":"charge"}'  # raw body, unparsed
     assert captured["url"] == "https://agent.example/webhook"
@@ -277,7 +278,7 @@ def test_verified_third_party_bypasses_passthrough_flag(monkeypatch):
         )
     )
     assert resp.status == 200
-    assert gw._external_wakes == [({"event": "charge"}, True)]
+    assert gw._external_wakes == [({"event": "charge"}, True, "acme")]
 
 
 def test_inkbox_signed_external_shaped_event_routes_external(monkeypatch):
@@ -303,7 +304,8 @@ def test_inkbox_signed_external_shaped_event_routes_external(monkeypatch):
     )
     assert resp.status == 200
     assert hit["mail"] == 0                        # not routed to any Inkbox handler
-    assert gw._external_wakes[0][1] is True        # woke the agent as VERIFIED external
+    # Woke the agent as VERIFIED external, credited to the Inkbox signature.
+    assert gw._external_wakes[0][1:] == (True, "inkbox")
 
 
 def test_inkbox_signed_unknown_dropped_when_external_events_off(monkeypatch):
@@ -343,7 +345,8 @@ def test_other_provider_claiming_inkbox_type_routes_external_not_mail(monkeypatc
     )
     assert resp.status == 200
     assert hit["mail"] == 0                  # never reached the Inkbox mail handler
-    assert gw._external_wakes[0][1] is True  # handled as a verified external event
+    # Handled as a verified external event under the provider that signed it.
+    assert gw._external_wakes[0][1:] == (True, "github")
 
 
 def test_github_valid_signature_reaches_agent(monkeypatch):
@@ -414,17 +417,37 @@ def test_verified_turn_carries_action_directive_and_fields():
         "id": "run-7",
     }
     chat_id, prompt, directive = InkboxGateway._build_external_event_turn(
-        envelope, "", verified=True
+        envelope, "", verified=True, provider="inkbox"
     )
     assert chat_id == "external:ci:run-7"
-    assert directive == gateway_mod.EXTERNAL_EVENT_DIRECTIVE
-    assert gateway_mod.EXTERNAL_EVENT_DIRECTIVE not in prompt
+    # The directive names the provider whose secret verified the signature.
+    assert directive == gateway_mod.EXTERNAL_EVENT_DIRECTIVE.format(sender="inkbox")
+    assert "(inkbox)" in directive
+    assert directive not in prompt
     assert "[inkbox:external source=ci event=workflow_failed event_key=run-7" in prompt
     assert "severity=high" in prompt
     assert "Deploy failed" in prompt
     assert "Requested action: call the operator" in prompt
     assert "Link: https://ci.example/run/7" in prompt
     assert "Raw event payload:" in prompt
+
+
+def test_verified_directive_sender_falls_back_to_source():
+    # No provider name (e.g. built directly) → the sanitized payload source
+    # names the sender instead of an empty parenthetical.
+    _, _, directive = InkboxGateway._build_external_event_turn(
+        {"source": "ci"}, "rid", verified=True
+    )
+    assert "(ci)" in directive
+
+
+def test_verified_directive_safe_with_braces_in_source():
+    # Substituted values are inserted literally — payload braces must not be
+    # parsed as format placeholders (no KeyError, text survives verbatim).
+    _, _, directive = InkboxGateway._build_external_event_turn(
+        {"source": "x{evil}"}, "rid", verified=True
+    )
+    assert "x{evil}" in directive
 
 
 def test_external_turn_bounds_untrusted_text():
@@ -458,16 +481,19 @@ def test_on_external_event_runs_capture_turn_in_per_event_session():
     gw.sessions = _FakeSessions(session)
 
     async def main():
-        resp = await gw._on_external_event({"source": "ci", "event": "boom"}, "rid", verified=True)
+        resp = await gw._on_external_event(
+            {"source": "ci", "event": "boom"}, "rid", verified=True, provider="inkbox"
+        )
         await asyncio.sleep(0)  # let the background turn task run
         return resp
 
     resp = asyncio.run(main())
     assert resp.status == 200
     # Fresh per-event session; the directive rides on its system prompt.
-    assert gw.sessions.requested == [("external:ci:rid", gateway_mod.EXTERNAL_EVENT_DIRECTIVE)]
+    directive = gateway_mod.EXTERNAL_EVENT_DIRECTIVE.format(sender="inkbox")
+    assert gw.sessions.requested == [("external:ci:rid", directive)]
     assert len(session.consults) == 1
-    assert gateway_mod.EXTERNAL_EVENT_DIRECTIVE not in session.consults[0]
+    assert directive not in session.consults[0]
     assert "[inkbox:external source=ci event=boom" in session.consults[0]
 
 
