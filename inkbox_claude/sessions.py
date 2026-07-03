@@ -88,6 +88,11 @@ class _Turn:
     # True for a one-shot turn spawned to recover from a rejected reply send.
     # A recovery turn that itself fails to send is not recovered again (no loop).
     recovery: bool = False
+    # For a delivery-failure recovery turn: pin the reply channel/thread so the
+    # final response goes back on the modality that failed, not wherever the
+    # human last spoke. None means "reply where the human last spoke" (normal).
+    route_mode: Optional[str] = None
+    route_meta: Optional[Dict[str, Any]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Claude as a turn.
@@ -588,6 +593,13 @@ class ContactSession:
     async def _run_turn(self, turn: _Turn) -> None:
         self._interrupting = False  # fresh turn starts un-interrupted
         self._current_turn = turn
+        # A recovery turn pins its own reply channel/thread (the one that failed),
+        # so its final response routes there rather than wherever the human last
+        # spoke. Applied here (not at enqueue) so an interleaved inbound can't
+        # steal the routing before this turn actually runs.
+        if turn.route_mode is not None:
+            self.mode = turn.route_mode
+            self.reply_meta = dict(turn.route_meta or {})
         typing_task: Optional[asyncio.Task] = None
         try:
             client = await self._ensure_client()
@@ -691,6 +703,33 @@ class ContactSession:
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
         return await future
+
+    async def run_recovery(self, prompt: str, mode: str, meta: Dict[str, Any]) -> None:
+        """Wake this session to recover a failed outbound message, on-channel.
+
+        Unlike :meth:`run_consult` (which hands the reply back to a caller and
+        never auto-sends), a recovery turn's final reply is delivered on the
+        channel/thread that failed — pinned via the turn's route, so it lands
+        there rather than wherever the human last spoke. That makes recovery
+        natural: the agent just rewrites the message to retry, or uses its
+        Inkbox tools to switch channels and replies ``[SILENT]`` to send nothing.
+
+        Marked ``recovery=True`` so that if this on-channel send is itself
+        rejected, it won't spawn yet another recovery (no loop).
+
+        Args:
+            prompt (str): The delivery-failure recovery prompt for Claude.
+            mode (str): Reply modality to route back on (sms / imessage / email).
+            meta (dict): Reply routing details for that channel/thread.
+
+        Returns:
+            None
+        """
+        await self._queue.put(
+            _Turn(text=prompt, recovery=True, route_mode=mode, route_meta=dict(meta or {}))
+        )
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
 
     async def _typing_loop(self) -> None:
         """Refresh the channel's typing indicator until the turn ends.
