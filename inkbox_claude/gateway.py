@@ -159,11 +159,12 @@ def _call_ended_prompt(transcript: Any) -> str:
     return "\n".join(parts)
 
 
-# Prepended to the turn whenever an external event wakes the agent. Its text
-# reply on an external thread is not delivered to a human, so it must reason
-# about the event and ACT via tools rather than "reply". Used only for
-# VERIFIED sources (a registered provider validated the signature, or Inkbox
-# itself signed it).
+# Appended to the session SYSTEM prompt whenever an external event wakes the
+# agent, so it reads as harness policy rather than as untrusted text inside
+# the injected payload. Its text reply on an external thread is not delivered
+# to a human, so it must reason about the event and ACT via tools rather than
+# "reply". Used only for VERIFIED sources (a registered provider validated
+# the signature, or Inkbox itself signed it).
 EXTERNAL_EVENT_DIRECTIVE = (
     "You have been woken by an EXTERNAL automated event (a webhook from an "
     "outside system), not by a message from a human. No person is reading this "
@@ -1359,8 +1360,8 @@ class InkboxGateway:
     @staticmethod
     def _build_external_event_turn(
         envelope: Dict[str, Any], request_id: str = "", verified: bool = False
-    ) -> Tuple[str, str]:
-        """Build the (chat_id, prompt) for an externally-injected event.
+    ) -> Tuple[str, str, str]:
+        """Build the (chat_id, prompt, directive) for an externally-injected event.
 
         External systems (e.g. a GitHub Actions workflow) have no Inkbox
         contact behind them and use their own ad-hoc JSON schema, so we read
@@ -1378,8 +1379,9 @@ class InkboxGateway:
             verified (bool): Whether the sender's signature was verified.
 
         Returns:
-            Tuple[str, str]: (session chat_id, full turn text with the
-            action/caution directive prepended).
+            Tuple[str, str, str]: (per-event session chat_id, turn text with
+            the event fields + raw payload, action/caution directive to bind
+            as the session's system-prompt extra).
         """
         # Some senders wrap fields under "data"; others send a flat object.
         # Read the top level first, then fall back to the data wrapper.
@@ -1442,8 +1444,10 @@ class InkboxGateway:
                 json.dumps(envelope, sort_keys=True, default=str).encode()
             ).hexdigest()[:16]
 
-        # One session per source for continuity across that source's events.
-        chat_id = f"external:{source_name}"
+        # One fresh session per event (grouped under the source) so the agent
+        # wakes into a clean session and one slow event can't queue the next
+        # source's event behind it.
+        chat_id = f"external:{source_name}:{event_key}"
 
         # Routing marker mirrors the inbound-modality convention so the agent
         # knows this is an external event (and its source/env/severity).
@@ -1456,11 +1460,13 @@ class InkboxGateway:
 
         # A VERIFIED source may be acted on; an UNVERIFIED one (unauthenticated
         # sender) gets a cautious directive that forbids irreversible action on
-        # its say-so alone.
+        # its say-so alone. The directive is returned separately: it binds to
+        # the session's SYSTEM prompt so the agent treats it as harness policy,
+        # not as instructions embedded in an untrusted payload.
         directive = EXTERNAL_EVENT_DIRECTIVE if verified else EXTERNAL_EVENT_UNVERIFIED_DIRECTIVE
         # Recognized fields first, then the raw payload so the agent has every
         # detail regardless of the sender's schema.
-        parts = [directive, "", marker]
+        parts = [marker]
         if title:
             parts.append(title)
         if body:
@@ -1472,7 +1478,7 @@ class InkboxGateway:
         parts.append("")
         parts.append("Raw event payload:")
         parts.append(json.dumps(envelope, indent=2, default=str)[:4000])
-        return chat_id, "\n".join(parts)
+        return chat_id, "\n".join(parts), directive
 
     async def _on_external_event(
         self,
@@ -1484,8 +1490,9 @@ class InkboxGateway:
 
         This is the catch-all path: any inbound webhook whose type is not a
         known Inkbox event (mail/text/imessage/call) lands here. The turn runs
-        as a capture turn (run_consult), so the agent's text reply is discarded
-        — it must act via tools, per the prepended directive.
+        as a capture turn (run_consult) on a fresh per-event session whose
+        system prompt carries the action/caution directive, so the agent's
+        text reply is discarded — it must act via tools.
 
         Args:
             envelope (Dict[str, Any]): Parsed webhook body.
@@ -1497,15 +1504,26 @@ class InkboxGateway:
         """
         if self.sessions is None:
             return web.json_response({"ok": True, "ignored": "no-sessions"})
-        chat_id, prompt = self._build_external_event_turn(envelope, request_id, verified)
+        chat_id, prompt, directive = self._build_external_event_turn(
+            envelope, request_id, verified
+        )
         # Run in the background so the webhook returns promptly; the turn can
         # take a while (the agent may call/message someone).
-        asyncio.create_task(self._run_external_turn(chat_id, prompt))
+        asyncio.create_task(self._run_external_turn(chat_id, prompt, directive))
         return web.json_response({"ok": True})
 
-    async def _run_external_turn(self, chat_id: str, prompt: str) -> None:
+    async def _run_external_turn(self, chat_id: str, prompt: str, directive: str) -> None:
         try:
-            await self.sessions.get(chat_id).run_consult(prompt)
+            # The directive rides on the session's system prompt (per-event
+            # session, so it can never leak into a human conversation).
+            session = self.sessions.get(chat_id, system_prompt_extra=directive)
+            reply = await session.run_consult(prompt)
+            # The reply text isn't delivered anywhere — log it so a run where
+            # the agent talked instead of acting is diagnosable.
+            logger.info(
+                "[bridge] external-event turn done: %s reply=%r",
+                chat_id, (reply or "")[:300],
+            )
         except Exception:
             logger.exception("[bridge] external-event turn failed: %s", chat_id)
 
@@ -1842,6 +1860,16 @@ class InkboxGateway:
         meta = meta or {}
         if content.strip() == "[SILENT]":
             logger.debug("[bridge] suppressing exact [SILENT] reply for %s", chat_id)
+            return
+        # External-event sessions have no human counterparty — ``chat_id`` is
+        # a synthetic ``external:<source>:<key>`` with no mailbox/number behind
+        # it. Drop the text cleanly (escalations then just time out and deny);
+        # the agent's real work on these threads happens through tools.
+        if str(chat_id).startswith("external:"):
+            logger.info(
+                "[bridge] dropping external-event text for %s: %s…",
+                chat_id, content[:60].replace("\n", " "),
+            )
             return
         if mode == "voice":
             ws = self._active_call_ws.get(chat_id)

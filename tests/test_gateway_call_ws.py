@@ -128,6 +128,18 @@ def test_send_to_contact_suppresses_exact_silent_reply():
     asyncio.run(gw.send_to_contact("contact-1", "[SILENT]", "sms", {"to": "+15551234567"}))
 
 
+def test_send_to_contact_drops_external_event_text_without_delivery():
+    # External-event chats are synthetic (no mailbox/number behind them) —
+    # escalation prompts and error notices must drop instead of e.g. trying
+    # to email the "external:<source>:<key>" chat id.
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
+    gw._inkbox = _NoDeliveryInkbox()
+
+    asyncio.run(
+        gw.send_to_contact("external:ci:run-7", "Permission to run Bash?", "email", {})
+    )
+
+
 def test_send_to_contact_drops_late_voice_reply_without_channel_fallback():
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
     gw._inkbox = _NoDeliveryInkbox()

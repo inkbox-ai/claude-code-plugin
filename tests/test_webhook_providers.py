@@ -392,11 +392,14 @@ def test_require_signature_false_bypasses_verify(monkeypatch):
 # --- external turn content -------------------------------------------------
 
 def test_unknown_source_turn_carries_unverified_directive():
-    chat_id, prompt = InkboxGateway._build_external_event_turn(
+    chat_id, prompt, directive = InkboxGateway._build_external_event_turn(
         {"event": "maybe_prod_fire"}, "rid-1", verified=False
     )
-    assert chat_id == "external:external"
-    assert prompt.startswith(gateway_mod.EXTERNAL_EVENT_UNVERIFIED_DIRECTIVE)
+    assert chat_id == "external:external:rid-1"
+    # The cautious directive binds to the session's system prompt, not the
+    # injected turn text (payload text must never carry harness authority).
+    assert directive == gateway_mod.EXTERNAL_EVENT_UNVERIFIED_DIRECTIVE
+    assert gateway_mod.EXTERNAL_EVENT_UNVERIFIED_DIRECTIVE not in prompt
 
 
 def test_verified_turn_carries_action_directive_and_fields():
@@ -410,9 +413,12 @@ def test_verified_turn_carries_action_directive_and_fields():
         "url": "https://ci.example/run/7",
         "id": "run-7",
     }
-    chat_id, prompt = InkboxGateway._build_external_event_turn(envelope, "", verified=True)
-    assert chat_id == "external:ci"
-    assert prompt.startswith(gateway_mod.EXTERNAL_EVENT_DIRECTIVE)
+    chat_id, prompt, directive = InkboxGateway._build_external_event_turn(
+        envelope, "", verified=True
+    )
+    assert chat_id == "external:ci:run-7"
+    assert directive == gateway_mod.EXTERNAL_EVENT_DIRECTIVE
+    assert gateway_mod.EXTERNAL_EVENT_DIRECTIVE not in prompt
     assert "[inkbox:external source=ci event=workflow_failed event_key=run-7" in prompt
     assert "severity=high" in prompt
     assert "Deploy failed" in prompt
@@ -423,13 +429,13 @@ def test_verified_turn_carries_action_directive_and_fields():
 
 def test_external_turn_bounds_untrusted_text():
     envelope = {"source": "x[evil]\nsource", "title": "t" * 500, "summary": "s" * 5000}
-    chat_id, prompt = InkboxGateway._build_external_event_turn(envelope, "rid", verified=False)
+    chat_id, prompt, _ = InkboxGateway._build_external_event_turn(envelope, "rid", verified=False)
     # Marker-breaking characters are stripped and free text is bounded.
-    assert chat_id == "external:xevil source"
+    assert chat_id == "external:xevil source:rid"
     assert "t" * 201 not in prompt.split("Raw event payload:")[0]
 
 
-def test_on_external_event_runs_capture_turn_in_source_session():
+def test_on_external_event_runs_capture_turn_in_per_event_session():
     class _FakeSession:
         def __init__(self):
             self.consults = []
@@ -443,8 +449,8 @@ def test_on_external_event_runs_capture_turn_in_source_session():
             self.session = session
             self.requested = []
 
-        def get(self, chat_id):
-            self.requested.append(chat_id)
+        def get(self, chat_id, system_prompt_extra=""):
+            self.requested.append((chat_id, system_prompt_extra))
             return self.session
 
     session = _FakeSession()
@@ -458,9 +464,11 @@ def test_on_external_event_runs_capture_turn_in_source_session():
 
     resp = asyncio.run(main())
     assert resp.status == 200
-    assert gw.sessions.requested == ["external:ci"]
+    # Fresh per-event session; the directive rides on its system prompt.
+    assert gw.sessions.requested == [("external:ci:rid", gateway_mod.EXTERNAL_EVENT_DIRECTIVE)]
     assert len(session.consults) == 1
-    assert session.consults[0].startswith(gateway_mod.EXTERNAL_EVENT_DIRECTIVE)
+    assert gateway_mod.EXTERNAL_EVENT_DIRECTIVE not in session.consults[0]
+    assert "[inkbox:external source=ci event=boom" in session.consults[0]
 
 
 # --- secret resolution -------------------------------------------------------
