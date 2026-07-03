@@ -264,6 +264,45 @@ def test_call_ws_uses_stored_call_contact_session_for_stt_tts(monkeypatch):
     assert "call-1" not in gw._call_meta_by_id
 
 
+def test_call_ws_backfills_remote_via_identity_centered_call_read(monkeypatch):
+    """When the upgrade carries no caller metadata (Inkbox accepted the call
+    itself), a single call-id read resolves the remote party — including
+    shared-line calls, which have no phone_number on the identity."""
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"transcript","text":"hello","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    class _FakeCalls:
+        def __init__(self):
+            self.requested = []
+
+        def get(self, call_id):
+            self.requested.append(call_id)
+            return types.SimpleNamespace(
+                remote_phone_number="+15559990000", direction="inbound"
+            )
+
+    class _FakeInkboxWithCalls:
+        def __init__(self):
+            self.calls = _FakeCalls()
+            self.contacts = types.SimpleNamespace(lookup=lambda **_k: [])
+
+    session = _FakeContactSession()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw.sessions = _FakeSessions(session)
+    gw._inkbox = _FakeInkboxWithCalls()
+    request = _FakeRequest()
+    request.query = {"call_id": "call-9"}
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert gw._inkbox.calls.requested == ["call-9"]
+    assert session.inbound[0][2]["sender"] == "+15559990000"
+
+
 class _FakeBridge:
     def __init__(self):
         self.ran = False

@@ -32,7 +32,7 @@ This finds a Python 3.10+, installs the bridge in its own venv, puts `inkbox-cla
 curl -fsSL https://raw.githubusercontent.com/inkbox-ai/claude-code-plugin/main/install.sh | bash
 ```
 
-That's the whole setup. The wizard creates a fresh Inkbox agent for you (or takes an existing API key), provisions a phone number, connects iMessage, mints a webhook signing key, picks the project directory Claude works in, and offers to **keep the bridge running on every boot**. When it finishes, text/email/call your agent and it answers from a real Claude Code session.
+That's the whole setup. The wizard creates a fresh Inkbox agent for you (or takes an existing API key), connects iMessage, provisions a dedicated phone number, mints a webhook signing key, picks the project directory Claude works in, and offers to **keep the bridge running on every boot**. When it finishes, text/email/call your agent and it answers from a real Claude Code session.
 
 The one thing to have ready: be **logged into Claude** — a Claude Pro/Max subscription (via the Claude Code app/CLI) or `ANTHROPIC_API_KEY` set. The installer checks this and warns if it's missing.
 
@@ -173,6 +173,22 @@ Calls have two modes, chosen per call:
   When the call ends, queued actions run in your session (and any plain "reflect on the call" follow-up if none were queued) — so "after we hang up, open a PR and text me" actually happens. Enable it in `inkbox-claude setup` (it validates your OpenAI key live) or via the `INKBOX_REALTIME_*` env vars below.
 - **Inkbox STT/TTS** (default / fallback): Inkbox auto-accepts the call and opens a WebSocket to the bridge; finalized transcripts become turns in your same session and Claude's replies are spoken back. The bridge falls back to this automatically if Realtime is off or OpenAI can't be reached (unless `INKBOX_REALTIME_FALLBACK_TO_INKBOX_STT_TTS=false`).
 
+### Two calling lines
+
+Calls — inbound and outbound — can run over either of two lines, and the agent picks the one that matches the channel it's talking on:
+
+- **The dedicated phone number.** The agent's own number (the same line SMS uses). Outbound calls present this number; inbound calls to it ring the agent.
+- **The shared Inkbox iMessage line.** The agent can also place and receive voice calls with a person it's connected to over iMessage, over the same shared line that person already messages. The underlying number is never surfaced — Inkbox resolves it from the iMessage connection — and it only works for people already connected over iMessage (an unknown caller is rejected; an outbound call with no connection is refused).
+
+Inbound answering is configured once per identity (`auto_accept` → open the call bridge WebSocket), so a single setting governs both lines. Outbound, the agent sets `origination` on `inkbox_place_call` (`dedicated_number` / `shared_imessage_number`), or omits it — then it resolves to the only line available, or, when both are, to the line matching the current conversation's channel (an iMessage turn calls over the shared line; an SMS/phone turn over the dedicated number).
+
+## External webhooks
+
+Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for events from **other systems** (e.g. a GitHub Actions failure). Every request is classified by its signature header first, then verified with that source's scheme — routing keys off who actually *signed* the request, never off the body's claimed event type, so a forged payload can't impersonate an Inkbox event:
+
+- **Registered sources** (GitHub via `X-Hub-Signature-256` today; drop a new provider module into `inkbox_claude/webhook_providers/` to add one) are verified with `INKBOX_WEBHOOK_SECRET_<NAME>` and always delivered — registering the provider + secret is the opt-in. The agent is told the event is verified and directed to act via its tools (its text reply on an external thread isn't delivered to anyone).
+- **Unknown/unverified sources** are dropped by default. Set `INKBOX_EXTERNAL_EVENTS_ENABLED=true` to pass them through anyway; the agent then gets a cautious directive forbidding irreversible action on the event's say-so alone.
+
 ## Media
 
 **Inbound.** When someone sends an MMS image, an iMessage attachment, or an email with files, the gateway downloads them to `~/.inkbox-claude/media/` (override with `INKBOX_CLAUDE_MEDIA_DIR`) and appends the local paths to the message, so Claude can open them with its Read tool — including viewing images. Media-only messages (no text) still wake the agent.
@@ -192,6 +208,8 @@ Calls have two modes, chosen per call:
 | `CLAUDE_PROJECT_DIR` | yes | cwd | Directory Claude Code works in. |
 | `CLAUDE_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
+| `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised/unverified external webhooks (see [External webhooks](#external-webhooks)). |
+| `INKBOX_WEBHOOK_SECRET_<NAME>` | per source | - | Verification secret for a registered third-party webhook source (e.g. `INKBOX_WEBHOOK_SECRET_GITHUB`). |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
 | `INKBOX_TUNNEL_NAME` | no | identity handle | Tunnel name override. |
@@ -210,11 +228,11 @@ Calls have two modes, chosen per call:
 
 The agent reaches you (or third parties) through an in-process MCP server:
 
-- `inkbox_whoami` — its own identity: handle, mailbox, phone, iMessage status.
+- `inkbox_whoami` — its own identity: handle, mailbox, and its two calling lines (dedicated phone number + shared iMessage line status).
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
-- `inkbox_place_call` — place an outbound phone call through the running gateway with purpose/opening/context.
+- `inkbox_place_call` — place an outbound voice call through the running gateway with purpose/opening/context, over either line via `origination` (see [Two calling lines](#two-calling-lines)).
 - `inkbox_list_calls` · `inkbox_get_call_transcript` — browse recent calls and fetch transcript segments.
 - `inkbox_list_text_conversations` · `inkbox_get_text_conversation` — browse SMS threads and history.
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
@@ -240,7 +258,7 @@ python -m pytest
 
 ## Architecture notes
 
-- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage webhook subscriptions, and patches the phone number's incoming-call channel (`auto_accept` + call WebSocket) — same shape as hermes-agent-plugin.
+- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage webhook subscriptions, and sets the identity's incoming-call action (`auto_accept` + call WebSocket) covering both calling lines.
 - **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Claude Agent SDK**: each session is one `ClaudeSDKClient` (its own Claude Code subprocess) with the `claude_code` system-prompt preset plus a messaging channel prompt appended, `can_use_tool` for escalation, and an in-process MCP server for the Inkbox tools.

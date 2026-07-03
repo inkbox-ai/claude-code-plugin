@@ -1,11 +1,11 @@
 [project]
 name = "claude-code-plugin"
-version = "0.1.1"
+version = "0.1.2"
 description = "Inkbox bridge for Claude Code — talk to your coding agent over email, SMS, iMessage, and voice"
 requires-python = ">=3.10"
 dependencies = [
   "aiohttp>=3.9",
-  "inkbox>=0.4.15",
+  "inkbox>=0.4.15,<1.0.0",
   "claude-agent-sdk>=0.1.0",
   "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]

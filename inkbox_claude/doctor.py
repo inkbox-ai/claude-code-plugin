@@ -1,4 +1,4 @@
-"""Readiness checks for the bridge, in the spirit of `hermes inkbox doctor`."""
+"""Readiness checks for the bridge: config, SDKs, CLI, and identity reachability."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         import inkbox  # noqa: F401
         checks.append(("inkbox SDK", True, "installed"))
     except ImportError:
-        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.4.10'"))
+        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.4.15,<1.0.0'"))
 
     try:
         import claude_agent_sdk  # noqa: F401

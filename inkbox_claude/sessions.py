@@ -725,6 +725,15 @@ class ContactSession:
                 "claude-agent-sdk is not installed; run: pip install claude-agent-sdk"
             )
 
+        try:
+            from .tools import CURRENT_SESSION
+        except ImportError:  # pragma: no cover - direct local import/test fallback
+            from tools import CURRENT_SESSION
+        # Bind this session before the client connects: the client's internal
+        # tool-dispatch tasks inherit this context, so the Inkbox tools can
+        # read the session's live mode (e.g. to pick an outbound call line).
+        CURRENT_SESSION.set(self)
+
         options = ClaudeAgentOptions(
             cwd=self.cfg.project_dir or None,
             model=self.cfg.claude_model or None,

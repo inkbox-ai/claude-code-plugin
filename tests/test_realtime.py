@@ -118,6 +118,33 @@ def test_instructions_name_the_consult_tool_and_project():
     assert "look up contacts" in text
 
 
+def test_instructions_name_the_two_lines_when_imessage_enabled():
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+        agent_identity_phone="+15550001111",
+        agent_imessage_enabled=True,
+    )
+    text = build_realtime_instructions(meta)
+    assert "Your dedicated phone line (your own number, for SMS and voice calls): +15550001111." in text
+    assert "shared Inkbox iMessage line" in text
+    # The shared line's number must never be spoken or promised.
+    assert "never state or promise a number for it" in text
+    assert "calls follow the conversation's channel" in text
+
+
+def test_instructions_omit_shared_line_when_imessage_disabled():
+    meta = RealtimeCallMeta(
+        call_id="c1",
+        remote_phone_number="+15551234567",
+        project_dir="/tmp/proj",
+        agent_identity_phone="+15550001111",
+    )
+    text = build_realtime_instructions(meta)
+    assert "shared Inkbox iMessage line" not in text
+
+
 def test_outbound_call_context_shapes_realtime_prompt_and_greeting():
     meta = RealtimeCallMeta(
         call_id="c1",
@@ -288,7 +315,7 @@ def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
 
 
 def test_openai_pump_dispatches_call_id_keyed_consult_events(monkeypatch):
-    """Match Hermes: GA Realtime may key argument events by call_id."""
+    """GA Realtime may key argument events by call_id."""
     async def scenario():
         monkeypatch.setattr(
             realtime,
@@ -353,7 +380,7 @@ def test_openai_pump_dispatches_call_id_keyed_consult_events(monkeypatch):
 
 
 def test_openai_pump_uses_frame_item_id_when_item_has_no_id(monkeypatch):
-    """Match Hermes: output_item.added sometimes carries item_id on the frame."""
+    """output_item.added sometimes carries item_id on the frame."""
     async def scenario():
         monkeypatch.setattr(
             realtime,

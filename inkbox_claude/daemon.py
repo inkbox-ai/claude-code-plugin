@@ -2,8 +2,7 @@
 
 `inkbox-claude run` stays in the foreground (what systemd/Docker/debugging
 want). `start`/`stop`/`status`/`restart` manage a detached background
-process with a PID file and a log file under ``~/.inkbox-claude/`` — the
-same shape as `hermes gateway start`/`stop`.
+process with a PID file and a log file under ``~/.inkbox-claude/``.
 """
 
 from __future__ import annotations
