@@ -2,7 +2,7 @@
 name = "claude-code-plugin"
 version = "0.1.2"
 description = "Inkbox bridge for Claude Code — talk to your coding agent over email, SMS, iMessage, and voice"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9",
   "inkbox>=0.4.15,<1.0.0",

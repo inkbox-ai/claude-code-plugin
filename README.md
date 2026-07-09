@@ -20,13 +20,13 @@
 ## Prerequisites
 
 - **Claude Code installed and logged in.** The bridge drives a real Claude Code session, so the `claude` CLI has to be on the machine and authenticated — install it ([claude.com/claude-code](https://claude.com/claude-code)), then either sign in with a Claude Pro/Max subscription or set `ANTHROPIC_API_KEY`. `inkbox-claude doctor` checks for it.
-- **Python 3.10+.** The installer finds one and builds the bridge its own venv.
+- **Python 3.11+.** The installer finds one and builds the bridge its own venv.
 - **macOS or Linux.** Boot persistence uses a systemd user unit on Linux and a launchd agent on macOS.
 - **An Inkbox agent** — nothing to set up in advance; the setup wizard self-signs up for you (or takes an existing API key).
 
 ## Get started — one command
 
-This finds a Python 3.10+, installs the bridge in its own venv, puts `inkbox-claude` on your PATH, and runs the setup wizard:
+This finds a Python 3.11+, installs the bridge in its own venv, puts `inkbox-claude` on your PATH, and runs the setup wizard:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inkbox-ai/claude-code-plugin/main/install.sh | bash
@@ -70,7 +70,7 @@ you (phone)  ── SMS / iMessage / email / call ──▶  Inkbox  ──▶  
 
 ## Manual install
 
-If you'd rather not run the installer (any Python 3.10+ environment):
+If you'd rather not run the installer (any Python 3.11+ environment):
 
 ```bash
 pip install -e .
