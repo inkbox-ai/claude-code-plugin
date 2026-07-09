@@ -261,6 +261,7 @@ def test_stale_resume_id_retries_once_fresh(monkeypatch):
         session = make_session([])
         session.resume_session_id = "old-session"
         session.on_clear = lambda chat_id: cleared.append(chat_id)
+        session.always_allowed.add("Bash")
 
         class FakeClient:
             async def connect(self):
@@ -286,7 +287,44 @@ def test_stale_resume_id_retries_once_fresh(monkeypatch):
         assert attempts == ["old-session", None]
         assert session.resume_session_id is None
         assert cleared == ["contact-1"]
+        assert session.always_allowed == set()
         assert session._client is not None
+
+    asyncio.run(scenario())
+
+
+def test_stale_resume_error_during_query_retries_fresh(monkeypatch):
+    async def scenario():
+        cleared = []
+        query_resume_ids = []
+        session = make_session([])
+        session.resume_session_id = "old-session"
+        session.on_clear = lambda chat_id: cleared.append(chat_id)
+
+        class FakeClient:
+            async def connect(self):
+                pass
+
+            async def query(self, _text):
+                query_resume_ids.append(session.resume_session_id)
+                if len(query_resume_ids) == 1:
+                    raise RuntimeError("No conversation found with session ID: old-session")
+
+            async def receive_response(self):
+                if False:
+                    yield None
+
+            async def disconnect(self):
+                pass
+
+        monkeypatch.setattr(sessions_mod, "CLAUDE_SDK_AVAILABLE", True)
+        monkeypatch.setattr(sessions_mod, "ClaudeSDKClient", lambda options: FakeClient())
+
+        await session._run_turn(_Turn(text="hello"))
+
+        assert query_resume_ids == ["old-session", None]
+        assert session.resume_session_id is None
+        assert cleared == ["contact-1"]
 
     asyncio.run(scenario())
 
@@ -310,6 +348,44 @@ def test_failed_connect_does_not_keep_broken_client(monkeypatch):
 
         assert raised is True
         assert session._client is None
+
+    asyncio.run(scenario())
+
+
+def test_turn_query_failure_sends_notice_and_closes_client(monkeypatch):
+    async def scenario():
+        sent = []
+        clients = []
+        session = make_session(sent)
+
+        class FakeClient:
+            def __init__(self):
+                self.disconnects = 0
+                clients.append(self)
+
+            async def connect(self):
+                pass
+
+            async def query(self, _text):
+                raise RuntimeError("Claude Code process exited")
+
+            async def receive_response(self):
+                if False:
+                    yield None
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        monkeypatch.setattr(sessions_mod, "CLAUDE_SDK_AVAILABLE", True)
+        monkeypatch.setattr(sessions_mod, "ClaudeSDKClient", lambda options: FakeClient())
+
+        await session._queue.put(_Turn(text="hello"))
+        await session._drain()
+
+        assert clients[0].disconnects == 1
+        assert session._client is None
+        assert "/health" in sent[-1][1]
+        assert "/clear" in sent[-1][1]
 
     asyncio.run(scenario())
 
