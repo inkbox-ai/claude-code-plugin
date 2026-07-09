@@ -618,41 +618,49 @@ class ContactSession:
         self._interrupting = False  # fresh turn starts un-interrupted
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
+        retried_missing_resume = False
         try:
-            try:
-                client = await self._ensure_client()
-            except Exception as exc:
-                if not self.resume_session_id or not _is_missing_resume_error(exc):
-                    raise
-                logger.warning(
-                    "[session %s] Claude resume id %s is stale; retrying fresh",
-                    self.chat_id,
-                    self.resume_session_id,
-                )
-                self.resume_session_id = None
-                if self.on_clear is not None:
-                    self.on_clear(self.chat_id)
-                await self.close()
-                client = await self._ensure_client()
-            # Keep a typing indicator alive on the human's channel for the whole
-            # turn, then always tear it down — even if the turn raises.
-            self._turn_active = True
-            typing_task = asyncio.create_task(self._typing_loop())
-            await client.query(turn.text)
+            while True:
+                try:
+                    client = await self._ensure_client()
+                    # Keep a typing indicator alive on the human's channel for
+                    # the whole turn, then always tear it down — even if the
+                    # turn raises.
+                    self._turn_active = True
+                    typing_task = asyncio.create_task(self._typing_loop())
+                    await client.query(turn.text)
 
-            chunks: list[str] = []
-            final: Optional[str] = None
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            chunks.append(block.text)
-                elif isinstance(message, ResultMessage):
-                    final = message.result
-                    if message.session_id and self.on_session_id:
-                        self.resume_session_id = message.session_id
-                        self.on_session_id(self.chat_id, message.session_id)
-            reply = (final or "\n\n".join(chunks)).strip()
+                    chunks: list[str] = []
+                    final: Optional[str] = None
+                    async for message in client.receive_response():
+                        if isinstance(message, AssistantMessage):
+                            for block in message.content:
+                                if isinstance(block, TextBlock):
+                                    chunks.append(block.text)
+                        elif isinstance(message, ResultMessage):
+                            final = message.result
+                            if message.session_id and self.on_session_id:
+                                self.resume_session_id = message.session_id
+                                self.on_session_id(self.chat_id, message.session_id)
+                    reply = (final or "\n\n".join(chunks)).strip()
+                    break
+                except Exception as exc:
+                    if (
+                        retried_missing_resume
+                        or not self.resume_session_id
+                        or not _is_missing_resume_error(exc)
+                    ):
+                        raise
+                    retried_missing_resume = True
+                    if typing_task is not None:
+                        typing_task.cancel()
+                        try:
+                            await typing_task
+                        except asyncio.CancelledError:
+                            pass
+                        typing_task = None
+                    self._turn_active = False
+                    await self._clear_stale_resume()
         except Exception as exc:
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.
@@ -682,6 +690,19 @@ class ContactSession:
             return
         if reply:
             await self._deliver_reply(turn, reply)
+
+    async def _clear_stale_resume(self) -> None:
+        """Forget a stale Claude resume id and reset conversation-scoped state."""
+        logger.warning(
+            "[session %s] Claude resume id %s is stale; retrying fresh",
+            self.chat_id,
+            self.resume_session_id,
+        )
+        self.resume_session_id = None
+        if self.on_clear is not None:
+            self.on_clear(self.chat_id)
+        self.always_allowed.clear()
+        await self.close()
 
     async def _deliver_reply(self, turn: _Turn, reply: str) -> None:
         """Send a normal turn's reply, recovering once if the send is rejected.
