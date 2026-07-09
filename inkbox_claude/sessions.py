@@ -173,6 +173,33 @@ def _send_rejected_prompt(reply: str, reason: str) -> str:
     ])
 
 
+def _exception_text(exc: Exception) -> str:
+    """Flatten an exception plus SDK stderr into text for classification."""
+    parts = [str(exc)]
+    stderr = getattr(exc, "stderr", None)
+    if stderr:
+        parts.append(str(stderr))
+    return "\n".join(p for p in parts if p)
+
+
+def _is_missing_resume_error(exc: Exception) -> bool:
+    return "No conversation found with session ID" in _exception_text(exc)
+
+
+def _turn_error_notice(exc: Exception) -> str:
+    """Build the text the human sees when a Claude turn cannot start/finish."""
+    if _is_missing_resume_error(exc):
+        return (
+            "Claude Code couldn't find the old conversation I tried to resume. "
+            "I cleared that stale session; send your message again to start fresh, "
+            "or text /health to check the bridge."
+        )
+    return (
+        "Sorry — Claude Code hit an error while working on that. "
+        "Text /health to check the bridge, or /clear to start fresh."
+    )
+
+
 def _transcript_dir(project_dir: Optional[str]) -> Optional[Path]:
     """Locate Claude Code's transcript folder for a project.
 
@@ -419,18 +446,16 @@ class ContactSession:
             turn = await self._queue.get()
             try:
                 await self._run_turn(turn)
-            except Exception:
+            except Exception as exc:
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
                 if self._interrupting:
                     logger.info("[session %s] turn interrupted by a new message", self.chat_id)
                     continue
                 logger.exception("[session %s] turn failed", self.chat_id)
+                await self.close()
                 try:
-                    await self._reply(
-                        "Sorry — I hit an error while working on that and had to stop. "
-                        "Try sending it again."
-                    )
+                    await self._reply(_turn_error_notice(exc))
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
 
@@ -594,7 +619,21 @@ class ContactSession:
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         try:
-            client = await self._ensure_client()
+            try:
+                client = await self._ensure_client()
+            except Exception as exc:
+                if not self.resume_session_id or not _is_missing_resume_error(exc):
+                    raise
+                logger.warning(
+                    "[session %s] Claude resume id %s is stale; retrying fresh",
+                    self.chat_id,
+                    self.resume_session_id,
+                )
+                self.resume_session_id = None
+                if self.on_clear is not None:
+                    self.on_clear(self.chat_id)
+                await self.close()
+                client = await self._ensure_client()
             # Keep a typing indicator alive on the human's channel for the whole
             # turn, then always tear it down — even if the turn raises.
             self._turn_active = True
@@ -766,7 +805,11 @@ class ContactSession:
             resume=self.resume_session_id or None,
         )
         self._client = ClaudeSDKClient(options=options)
-        await self._client.connect()
+        try:
+            await self._client.connect()
+        except Exception:
+            self._client = None
+            raise
         logger.info(
             "[session %s] Claude Code session started (resume=%s)",
             self.chat_id, self.resume_session_id or "fresh",
