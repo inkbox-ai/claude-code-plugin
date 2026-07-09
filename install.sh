@@ -8,7 +8,7 @@
 #
 #   ./install.sh
 #
-# Finds a Python 3.10+, sets up an isolated venv, installs the bridge, puts
+# Finds a Python 3.11+, sets up an isolated venv, installs the bridge, puts
 # `inkbox-claude` on your PATH, then runs the setup wizard. Re-runnable.
 #
 # Flags:
@@ -54,22 +54,22 @@ ok()   { echo "  ${GREEN}✓${RESET} $*"; }
 warn() { echo "  ${YELLOW}!${RESET} $*"; }
 die()  { echo "${RED}✗ $*${RESET}" >&2; exit 1; }
 
-# --- 1. find Python 3.10+ --------------------------------------------------
+# --- 1. find Python 3.11+ --------------------------------------------------
 find_python() {
   local c v maj min
-  for c in python3.13 python3.12 python3.11 python3.10 python3 python; do
+  for c in python3.13 python3.12 python3.11 python3 python; do
     command -v "$c" >/dev/null 2>&1 || continue
     v="$("$c" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo 0.0)"
     maj="${v%.*}"; min="${v#*.}"
-    if [ "$maj" = "3" ] && [ "$min" -ge 10 ] 2>/dev/null; then
+    if [ "$maj" = "3" ] && [ "$min" -ge 11 ] 2>/dev/null; then
       echo "$c"; return 0
     fi
   done
   return 1
 }
 
-step "Looking for Python 3.10+"
-PY="$(find_python)" || die "No Python 3.10+ found. Install python3.11+ and re-run. (claude-agent-sdk needs >=3.10.)"
+step "Looking for Python 3.11+"
+PY="$(find_python)" || die "No Python 3.11+ found. Install python3.11+ and re-run."
 ok "using $($PY --version 2>&1) at $(command -v "$PY")"
 
 # --- 2. get the source -----------------------------------------------------

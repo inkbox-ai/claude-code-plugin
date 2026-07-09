@@ -28,6 +28,20 @@ def test_status_reports_not_running(tmp_path, monkeypatch, capsys):
     assert "not running" in capsys.readouterr().out
 
 
+def test_run_foreground_missing_config_prints_setup_hint(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    monkeypatch.delenv("INKBOX_API_KEY", raising=False)
+    monkeypatch.delenv("INKBOX_IDENTITY", raising=False)
+
+    assert daemon.run_foreground() == 1
+    out = capsys.readouterr().out
+    assert "Inkbox is not set up yet" in out
+    assert "inkbox-claude setup" in out
+    assert "INKBOX_API_KEY" in out
+
+
 def test_stop_is_a_noop_when_not_running(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
     assert daemon.stop() == 0

@@ -104,7 +104,13 @@ def run_foreground() -> int:
     if os.name == "posix":
         signal.signal(signal.SIGTERM, signal.default_int_handler)
 
-    gateway = InkboxGateway(read_config())
+    cfg = read_config()
+    if not cfg.api_key or not cfg.identity:
+        print("Inkbox is not set up yet.")
+        print("Run `inkbox-claude setup`, or set INKBOX_API_KEY and INKBOX_IDENTITY in your .env file.")
+        return 1
+
+    gateway = InkboxGateway(cfg)
     try:
         asyncio.run(gateway.run())
     except KeyboardInterrupt:
