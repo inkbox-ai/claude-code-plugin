@@ -16,6 +16,10 @@ on the driver's number within the window — proof the request reasoned its way 
   * email -> call: email asks the agent to call; we poll the driver's calls.
   * SMS   -> call: SMS asks the agent to call; we poll the driver's calls.
 
+Each call leg first resets the AUT's session (see ``_reset_aut_session``) so it
+starts from a clean conversation — otherwise a placed call lingers in context and
+the next "call me" is answered with a text instead of a fresh dial.
+
 More channels (iMessage) get added here. Real-model only.
 """
 
@@ -176,9 +180,27 @@ def _wait_for_new_call(remote, remote_pid: str, aut_phone: str, before: set):
     pytest.fail(f"agent did not place a call to the driver within {TIMEOUT_S:.0f}s")
 
 
+# The bridge has no way to hang up a call it placed (the SDK exposes only
+# list/get/place), so a test call rides the server's max-duration cap and stays
+# "active" for the whole run. The AUT also keys ONE session per contact across
+# channels, so back-to-back call legs share context: after the first dial the
+# agent reasons "I already called this person" and answers the next "call me"
+# with a text instead of dialing again. Resetting the session before each leg
+# (the bridge's ``/clear`` control command, intercepted locally and never sent to
+# Claude) drops that context so every ask lands in a fresh conversation.
+RESET_SETTLE_S = 5.0
+
+
+def _reset_aut_session(remote, remote_pid: str, aut_phone: str) -> None:
+    """Reset the AUT's session for the driver contact via the ``/clear`` control SMS."""
+    remote.texts.send(remote_pid, to=aut_phone, text="/clear")
+    time.sleep(RESET_SETTLE_S)  # let the bridge intercept + reset before the real ask
+
+
 def test_email_request_gets_call(xc):
     """Email asks the agent to CALL; a new inbound call must land on the driver."""
     remote, remote_pid, aut_phone = xc["remote"], xc["remote_pid"], xc["aut_phone"]
+    _reset_aut_session(remote, remote_pid, aut_phone)  # fresh session, no prior-call context
     # Snapshot BEFORE sending so a pre-existing call can't be mistaken for the reply.
     before = {c.id for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone)}
     remote.messages.send(
@@ -191,6 +213,12 @@ def test_email_request_gets_call(xc):
 def test_sms_request_gets_call(xc):
     """SMS asks the agent to CALL; a new inbound call must land on the driver."""
     remote, remote_pid, aut_phone = xc["remote"], xc["remote_pid"], xc["aut_phone"]
+    _reset_aut_session(remote, remote_pid, aut_phone)  # fresh session, no prior-call context
     before = {c.id for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone)}
-    remote.texts.send(remote_pid, to=aut_phone, text="Call me please — give me a ring now.")
+    # Be explicit that we want an actual dial — a terse "call me" lets the model
+    # answer by text; the email leg's wording is unambiguous, so match it here.
+    remote.texts.send(
+        remote_pid, to=aut_phone,
+        text="Please place a phone call to my number right now — actually call me, don't text back.",
+    )
     _wait_for_new_call(remote, remote_pid, aut_phone, before)
