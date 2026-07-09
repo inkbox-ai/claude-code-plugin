@@ -254,6 +254,106 @@ def test_clear_command_starts_fresh_session():
     asyncio.run(scenario())
 
 
+def test_stale_resume_id_retries_once_fresh(monkeypatch):
+    async def scenario():
+        cleared = []
+        attempts = []
+        session = make_session([])
+        session.resume_session_id = "old-session"
+        session.on_clear = lambda chat_id: cleared.append(chat_id)
+
+        class FakeClient:
+            async def connect(self):
+                attempts.append(session.resume_session_id)
+                if len(attempts) == 1:
+                    raise RuntimeError("No conversation found with session ID: old-session")
+
+            async def query(self, _text):
+                pass
+
+            async def receive_response(self):
+                if False:
+                    yield None
+
+            async def disconnect(self):
+                pass
+
+        monkeypatch.setattr(sessions_mod, "CLAUDE_SDK_AVAILABLE", True)
+        monkeypatch.setattr(sessions_mod, "ClaudeSDKClient", lambda options: FakeClient())
+
+        await session._run_turn(_Turn(text="hello"))
+
+        assert attempts == ["old-session", None]
+        assert session.resume_session_id is None
+        assert cleared == ["contact-1"]
+        assert session._client is not None
+
+    asyncio.run(scenario())
+
+
+def test_failed_connect_does_not_keep_broken_client(monkeypatch):
+    async def scenario():
+        session = make_session([])
+
+        class FakeClient:
+            async def connect(self):
+                raise RuntimeError("Claude Code could not start")
+
+        monkeypatch.setattr(sessions_mod, "CLAUDE_SDK_AVAILABLE", True)
+        monkeypatch.setattr(sessions_mod, "ClaudeSDKClient", lambda options: FakeClient())
+
+        raised = False
+        try:
+            await session._ensure_client()
+        except RuntimeError:
+            raised = True
+
+        assert raised is True
+        assert session._client is None
+
+    asyncio.run(scenario())
+
+
+def test_turn_failure_sends_actionable_notice_and_closes_client():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+
+        class FakeClient:
+            def __init__(self):
+                self.disconnects = 0
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+        fake = FakeClient()
+        session._client = fake
+
+        async def fail(_turn):
+            raise RuntimeError("Claude Code could not start")
+
+        session._run_turn = fail
+        await session._queue.put(_Turn(text="hello"))
+        await session._drain()
+
+        assert fake.disconnects == 1
+        assert session._client is None
+        assert "/health" in sent[-1][1]
+        assert "/clear" in sent[-1][1]
+        assert "Try sending it again" not in sent[-1][1]
+
+    asyncio.run(scenario())
+
+
+def test_missing_resume_notice_mentions_stale_session():
+    notice = sessions_mod._turn_error_notice(
+        RuntimeError("No conversation found with session ID: old-session")
+    )
+
+    assert "old conversation" in notice
+    assert "/health" in notice
+
+
 def test_stop_command_interrupts_turn_without_clearing():
     async def scenario():
         sent = []
