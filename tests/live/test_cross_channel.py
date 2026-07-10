@@ -217,8 +217,11 @@ def test_sms_request_gets_call(xc):
     before = {c.id for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone)}
     # Be explicit that we want an actual dial — a terse "call me" lets the model
     # answer by text; the email leg's wording is unambiguous, so match it here.
+    # Fresh body each send: the agent replies by calling, not texting, so this
+    # SMS never gets an SMS reply to reset the conversation cadence — two
+    # identical no-reply sends would trip the duplicate_body rule (422).
     remote.texts.send(
         remote_pid, to=aut_phone,
-        text="Please place a phone call to my number right now — actually call me, don't text back.",
+        text=f"Please place a phone call to my number right now — actually call me, don't text back. (ref {_token()})",
     )
     _wait_for_new_call(remote, remote_pid, aut_phone, before)

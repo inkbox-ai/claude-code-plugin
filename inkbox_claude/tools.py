@@ -138,6 +138,32 @@ def _error(message: str, **fields: Any) -> Dict[str, Any]:
     }
 
 
+def _log_send_rejection(tool_name: str, exc: Exception) -> None:
+    """Surface a rejected tool send in the gateway log.
+
+    When the agent sends directly via a tool (not a normal reply), a server
+    content-policy rejection comes back inline as the tool result. Logging the
+    rule slug (e.g. ``message_blocked_spam_filter``) leaves the same
+    delivery-failure fingerprint the wake-up path logs, so operators (and the
+    live retry test) can see the block reached the agent by either route.
+
+    Args:
+        tool_name (str): The send tool that was rejected.
+        exc (Exception): The exception the send raised.
+
+    Returns:
+        None
+    """
+    detail = getattr(exc, "detail", None)
+    rule = ""
+    if isinstance(detail, dict):
+        rule = str(detail.get("error") or "").strip()
+        sub_rule = str(detail.get("rule") or "").strip()
+        if rule and sub_rule:
+            rule = f"{rule} rule={sub_rule}"
+    logger.warning("[bridge] %s rejected: %s", tool_name, rule or str(exc))
+
+
 def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
     char_count = len(content or "")
     return (
@@ -316,6 +342,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         try:
             return _result(await asyncio.to_thread(_run))
         except Exception as exc:
+            _log_send_rejection("inkbox_send_sms", exc)
             return _error(str(exc))
 
     @tool(
@@ -353,6 +380,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         try:
             return _result(await asyncio.to_thread(_run))
         except Exception as exc:
+            _log_send_rejection("inkbox_send_imessage", exc)
             return _error(str(exc))
 
     @tool(
