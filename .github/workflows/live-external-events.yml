@@ -31,7 +31,9 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository) ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Headroom for the 300s primary + 180s one-shot re-inject window on the
+    # valid-signature call test (cold-start fresh session per external event).
+    timeout-minutes: 25
     env:
       INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
       INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
@@ -106,7 +108,7 @@ jobs:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
           CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           CLAUDE_CODE_INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
-          LIVE_EXTERNAL_TIMEOUT: ${{ github.event.inputs.timeout_s || '200' }}
+          LIVE_EXTERNAL_TIMEOUT: ${{ github.event.inputs.timeout_s || '300' }}
           LIVE_REAL_MODEL: "1"
           LIVE_EXTERNAL_EVENTS: "1"
         run: >-
