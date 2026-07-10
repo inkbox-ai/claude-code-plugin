@@ -82,12 +82,20 @@ def test_new_message_does_not_interrupt_a_running_capture_turn():
     asyncio.run(scenario())
 
 
-def test_rejected_reply_send_spawns_one_recovery_turn():
+def test_rejected_reply_send_routes_to_delivery_failure_loop():
     # A blocked outbound reply (e.g. carrier spam filter 422) must not surface a
-    # generic error — it queues a one-shot recovery turn with the real reason so
-    # Claude can rephrase or switch channels.
+    # generic error — it is handed to the gateway's shared delivery-failure loop
+    # (chat_id + mode + meta + the blocked reply + the exception) so the loop can
+    # feed the rule back to Claude and cap the resend.
     async def scenario():
         session = make_session([])
+        session.mode = "sms"
+        session.reply_meta = {"to": "+15555550101", "conversation_id": "conv-1"}
+        calls = []
+
+        async def on_rejected(chat_id, mode, meta, content, exc):
+            calls.append((chat_id, mode, dict(meta), content, exc))
+        session.on_send_rejected = on_rejected
 
         class Blocked(Exception):
             detail = {"error": "message_blocked_spam_filter", "rule": "crypto_content",
@@ -97,22 +105,17 @@ def test_rejected_reply_send_spawns_one_recovery_turn():
             raise Blocked()
         session._reply = boom
 
-        # First (normal) turn's reply is rejected → one recovery turn queued.
         await session._deliver_reply(_Turn(text="orig"), "Bitcoin: $63295")
-        assert session._queue.qsize() == 1
-        recovery = session._queue.get_nowait()
-        assert recovery.recovery is True
-        assert "Cryptocurrency price content is restricted." in recovery.text
-        assert "Bitcoin: $63295" in recovery.text
 
-        # A recovery turn that ALSO fails re-raises (no second recovery → no loop).
-        raised = False
-        try:
-            await session._deliver_reply(_Turn(text="retry", recovery=True), "Bitcoin: $1")
-        except Blocked:
-            raised = True
-        assert raised is True
+        # Handed to the loop, not queued as a local recovery turn.
         assert session._queue.empty()
+        assert len(calls) == 1
+        chat_id, mode, meta, content, exc = calls[0]
+        assert chat_id == "contact-1"
+        assert mode == "sms"
+        assert meta["to"] == "+15555550101"
+        assert content == "Bitcoin: $63295"
+        assert isinstance(exc, Blocked)
 
     asyncio.run(scenario())
 

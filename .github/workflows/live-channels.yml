@@ -124,6 +124,13 @@ jobs:
           LIVE_EMAIL_TIMEOUT: ${{ github.event.inputs.timeout_s || '150' }}
           LIVE_REAL_MODEL: ${{ matrix.leg == 'real' && '1' || '' }}
           LIVE_CONTACT_CRUD: ${{ matrix.leg == 'real' && '1' || '' }}
+          # The delivery-failure retry tests read the gateway log for the loop's
+          # wake-up lines, and the carrier test forges a signed
+          # text.delivery_failed webhook at the gateway's local listener.
+          # Exported under AUT_* names so no other suite's skip gate keys on them.
+          GATEWAY_LOG: /tmp/gateway.log
+          AUT_INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
+          AUT_WEBHOOK_URL: http://127.0.0.1:8767/webhook
         run: python3 -m pytest tests/live -v
 
       # Logs can carry live message content — surface them only when needed.

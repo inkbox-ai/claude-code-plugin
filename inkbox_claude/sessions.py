@@ -66,6 +66,9 @@ SendFn = Callable[[str, str, str, Dict[str, Any]], Awaitable[Any]]
 TypingFn = Callable[[str, str, Dict[str, Any]], Awaitable[Any]]
 # gateway.health_report() signature.
 HealthFn = Callable[[], Awaitable[str]]
+# gateway._note_send_rejection(chat_id, mode, meta, content, exc) signature —
+# hands a synchronously-rejected reply to the shared delivery-failure loop.
+SendRejectedFn = Callable[[str, str, Dict[str, Any], str, Exception], Awaitable[None]]
 
 TYPING_REFRESH_SECONDS = 40.0
 TYPING_MAX_SECONDS = 600.0
@@ -85,9 +88,6 @@ class _Turn:
 
     text: str
     future: Optional["asyncio.Future[str]"] = None
-    # True for a one-shot turn spawned to recover from a rejected reply send.
-    # A recovery turn that itself fails to send is not recovered again (no loop).
-    recovery: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Claude as a turn.
@@ -147,30 +147,6 @@ def _send_error_reason(exc: Exception) -> str:
         if message:
             return str(message)
     return str(exc)
-
-
-def _send_rejected_prompt(reply: str, reason: str) -> str:
-    """Build the recovery prompt for a reply the provider rejected at send time.
-
-    Args:
-        reply (str): The text that was blocked.
-        reason (str): Why the send was rejected.
-
-    Returns:
-        str: A prompt telling Claude to rephrase or switch channels.
-    """
-    return "\n".join([
-        "[reply rejected] Your last reply was NOT delivered — the messaging "
-        "provider rejected it before sending.",
-        f"Reason: {reason}",
-        "",
-        f'Your blocked reply was:\n"{reply}"',
-        "",
-        "Recover now: rephrase to avoid whatever was flagged (e.g. drop the "
-        "restricted content), or send it over a different channel with your "
-        "Inkbox tools — iMessage isn't subject to carrier SMS content filtering. "
-        "Send the recovered version now.",
-    ])
 
 
 def _exception_text(exc: Exception) -> str:
@@ -341,6 +317,7 @@ class ContactSession:
         on_clear: Optional[Callable[[str], None]] = None,
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
+        on_send_rejected: Optional[SendRejectedFn] = None,
         system_prompt_extra: str = "",
     ):
         self.chat_id = chat_id
@@ -348,6 +325,7 @@ class ContactSession:
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
+        self.on_send_rejected = on_send_rejected
         self.mcp_server = mcp_server
         self.mcp_tool_names = mcp_tool_names
         self.identity_info = identity_info
@@ -705,13 +683,14 @@ class ContactSession:
         await self.close()
 
     async def _deliver_reply(self, turn: _Turn, reply: str) -> None:
-        """Send a normal turn's reply, recovering once if the send is rejected.
+        """Send a normal turn's reply, feeding a rejection to the failure loop.
 
         A synchronous send rejection (carrier spam filter, opt-out, invalid
-        recipient) comes back as an API error, not a webhook. Rather than
-        surfacing a generic failure, hand the reason back to Claude once so it
-        can rephrase or switch channels. A recovery turn that itself fails is
-        re-raised (the worker logs it) — never retried, so it can't loop.
+        recipient, too-long) comes back as an API error, not a webhook. Hand
+        it to the gateway's shared delivery-failure loop so it can wake the
+        agent with the rule to fix — sharing one capped budget with the async
+        delivery-failure webhooks, so a reply that keeps failing goes quiet
+        after the cap instead of looping.
 
         Args:
             turn (_Turn): The turn whose reply is being sent.
@@ -725,11 +704,10 @@ class ContactSession:
         except Exception as exc:
             reason = _send_error_reason(exc)
             logger.warning("[session %s] reply send rejected: %s", self.chat_id, reason)
-            if turn.recovery:
-                raise  # already a recovery attempt — don't spawn another
-            await self._queue.put(
-                _Turn(text=_send_rejected_prompt(reply, reason), recovery=True)
-            )
+            if self.on_send_rejected is not None:
+                await self.on_send_rejected(
+                    self.chat_id, self.mode, self.reply_meta, reply, exc
+                )
 
     async def run_consult(self, query: str) -> str:
         """Run one Claude Code turn and RETURN its text (don't send it).
@@ -943,11 +921,13 @@ class SessionManager:
         identity_info: Dict[str, str],
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
+        on_send_rejected: Optional[SendRejectedFn] = None,
     ):
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
+        self.on_send_rejected = on_send_rejected
         self.mcp_server = mcp_server
         self.mcp_tool_names = mcp_tool_names
         self.identity_info = identity_info
@@ -1004,6 +984,7 @@ class SessionManager:
                 on_clear=self._clear_state,
                 typing_fn=self.typing_fn,
                 health_fn=self.health_fn,
+                on_send_rejected=self.on_send_rejected,
                 system_prompt_extra=system_prompt_extra,
             )
             self.sessions[chat_id] = session
