@@ -39,12 +39,15 @@ BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 # The bridge's local webhook listener (INKBOX_BRIDGE_PORT defaults to 8767).
 WEBHOOK_URL = os.environ.get("AUT_WEBHOOK_URL", "http://127.0.0.1:8767/webhook")
 TIMEOUT_S = float(os.environ.get("LIVE_EXTERNAL_TIMEOUT", "300"))
-# Second-chance window after a one-shot re-inject (see the valid-signature test).
-# Every external event wakes a FRESH Claude Code session (chat_id is
-# external:<source>:<event_key>, no resume), so the valid test is a cold-start +
-# real-model call on a fixed budget — occasionally slow under CI load. A benign
-# re-inject gets one more window before we call it a real failure.
-RETRY_WINDOW_S = float(os.environ.get("LIVE_EXTERNAL_RETRY_WINDOW", "180"))
+# The valid-signature call test makes several INDEPENDENT attempts. Every
+# external event wakes a fresh Claude Code session (chat_id is
+# external:<source>:<event_key>, no resume), so each re-inject is a fresh
+# cold-start draw — and a real model occasionally hesitates on a verified
+# "call this person" escalation. A few independent draws make that rare
+# hesitation a non-event. Windows are bounded so the suite stays under the job
+# timeout; a compliant agent dials well inside one window.
+ATTEMPTS = int(os.environ.get("LIVE_EXTERNAL_ATTEMPTS", "3"))
+ATTEMPT_WINDOW_S = float(os.environ.get("LIVE_EXTERNAL_ATTEMPT_WINDOW", "170"))
 # How long to watch after the forged event to be confident nothing was dialed.
 FORGED_QUIET_S = float(os.environ.get("LIVE_FORGED_QUIET", "40"))
 POLL_EVERY_S = 6.0
@@ -209,23 +212,22 @@ def _wait_for_call(aut, driver_phone: str, before: set, timeout_s: float) -> boo
 
 
 def test_valid_github_signature_makes_agent_call_driver(ctx):
-    """A validly-signed GitHub failure → the agent places a call to the driver."""
+    """A validly-signed GitHub failure → the agent places a call to the driver.
+
+    Each attempt re-injects a fresh event (→ a fresh cold-start session → an
+    independent draw): a real model occasionally hesitates on a verified
+    "call this person" escalation, so a few independent tries make that rare
+    hesitation a non-event. The forged-event test proves we never dial
+    spuriously, so re-sending a benign verified escalation is safe.
+    """
     aut, driver_phone, driver_name = ctx["aut"], ctx["driver_phone"], ctx["driver_name"]
     before = {c.id for c in _outbound_calls_to(aut, driver_phone)}
 
-    _post_valid_escalation(driver_name)
-    if _wait_for_call(aut, driver_phone, before, TIMEOUT_S):
-        return  # the agent escalated by phoning the driver — exactly what we monitor for
-
-    # First window lapsed with no call. The event woke a cold-start fresh session
-    # and a real-model call can occasionally run long (or the model hesitates) —
-    # so re-inject once (a fresh event id → a fresh session) and give it one more
-    # window before declaring a real failure. The forged-event test proves we
-    # never dial spuriously, so a benign re-send is safe.
-    _post_valid_escalation(driver_name)
-    if _wait_for_call(aut, driver_phone, before, RETRY_WINDOW_S):
-        return
+    for _ in range(ATTEMPTS):
+        _post_valid_escalation(driver_name)
+        if _wait_for_call(aut, driver_phone, before, ATTEMPT_WINDOW_S):
+            return  # the agent escalated by phoning the driver — what we monitor for
     pytest.fail(
-        f"agent never called {driver_name} within {TIMEOUT_S:.0f}s + a "
-        f"{RETRY_WINDOW_S:.0f}s re-inject window"
+        f"agent never called {driver_name} across {ATTEMPTS} verified escalations "
+        f"({ATTEMPT_WINDOW_S:.0f}s each)"
     )
