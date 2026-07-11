@@ -764,8 +764,14 @@ class InkboxGateway:
                     response = await self._on_imessage_reaction_received(envelope)
                 # Outbound delivery failures: tell the agent its message didn't
                 # land so it can retry or reach the human another way.
-                elif event_type in ("text.delivery_failed", "text.delivery_unconfirmed"):
+                elif event_type == "text.delivery_failed":
                     response = await self._on_text_delivery_failed(envelope, event_type)
+                # Carrier uncertainty, not a hard failure - the message often
+                # still landed, so log it but don't wake the agent. Waking here
+                # would resend a message that was likely delivered.
+                elif event_type == "text.delivery_unconfirmed":
+                    logger.debug("[bridge] text.delivery_unconfirmed (telemetry) - not waking agent")
+                    response = web.json_response({"ok": True, "ignored": event_type})
                 elif event_type == "imessage.delivery_failed":
                     response = await self._on_imessage_delivery_failed(envelope)
                 elif event_type in ("message.bounced", "message.failed"):
@@ -1739,8 +1745,6 @@ class InkboxGateway:
                 if not recipient:
                     recipient = rec_number.strip()
                 break
-        if event_type == "text.delivery_unconfirmed" and not reason:
-            reason = "carrier could not confirm delivery"
         conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
         chat_id = self._chat_key(data, recipient, self._thread_key("sms", conversation_id))
         logger.info("[bridge] SMS delivery failed to %s: %s", recipient, reason or event_type)
