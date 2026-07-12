@@ -421,6 +421,28 @@ def _tunnel_state_dir() -> Path:
     return root
 
 
+class _ExpectedTunnelIdleFilter(logging.Filter):
+    """Drop the SDK's per-slot warning for a normal idle intake timeout."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Match narrowly: only the healthy idle-cap 408 is expected noise.
+        # Anything else on this logger (401s, disconnects) must stay visible.
+        message = record.getMessage()
+        return not (
+            record.name == "inkbox.tunnels"
+            and "/_system/intake slot=" in message
+            and "status=408" in message
+            and "reason='intake-idle-cap'" in message
+        )
+
+
+def _install_tunnel_log_filter() -> None:
+    """Attach ``_ExpectedTunnelIdleFilter`` to the SDK tunnel logger once."""
+    tunnel_logger = logging.getLogger("inkbox.tunnels")
+    if not any(isinstance(item, _ExpectedTunnelIdleFilter) for item in tunnel_logger.filters):
+        tunnel_logger.addFilter(_ExpectedTunnelIdleFilter())
+
+
 class InkboxGateway:
     """Routes Inkbox webhooks into contact-keyed Claude Code sessions."""
 
@@ -531,6 +553,9 @@ class InkboxGateway:
     async def _open_tunnel(self) -> None:
         if not INKBOX_TUNNEL_AVAILABLE:
             raise RuntimeError("inkbox SDK tunnel client unavailable; upgrade: pip install -U inkbox")
+        # A healthy gateway gets one idle-cap warning per parked intake slot;
+        # mute those before the runtime starts so real errors stand out.
+        _install_tunnel_log_filter()
         state_dir = _tunnel_state_dir()
         # Wipe SDK tunnel state so a stale tunnel_id can't wedge reconnects.
         shutil.rmtree(state_dir, ignore_errors=True)
