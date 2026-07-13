@@ -927,6 +927,59 @@ class InkboxGateway:
         return [str(value).strip() for value in values if str(value).strip()]
 
     @classmethod
+    def _agent_identity_summary(cls, entry: Any) -> Optional[Dict[str, Any]]:
+        """Summarize one resolved agent-identity webhook entry (id required)."""
+        identity_id = cls._field(entry, "id", "identity_id", "identityId")
+        if not identity_id:
+            return None
+        handle = cls._field(entry, "agent_handle", "agentHandle", "handle")
+        name = cls._field(entry, "display_name", "displayName")
+        return {
+            "id": str(identity_id),
+            "handle": str(handle) if handle else None,
+            "name": str(name) if name else None,
+        }
+
+    @classmethod
+    def _single_agent_identity(cls, identities: List[Any]) -> Optional[Dict[str, Any]]:
+        """Pick the sender's agent identity when exactly one resolved.
+
+        Text/iMessage webhooks resolve ``agent_identities`` for the remote
+        party, so a single entry unambiguously names a 1:1 peer agent. Zero
+        or several is ambiguous — keep the unknown fallback, never guess.
+        """
+        summaries = [
+            summary
+            for summary in (cls._agent_identity_summary(entry) for entry in identities)
+            if summary
+        ]
+        return summaries[0] if len(summaries) == 1 else None
+
+    @classmethod
+    def _mail_sender_agent_identity(
+        cls, data: Any, sender: str
+    ) -> Optional[Dict[str, Any]]:
+        """Pick the mail sender's agent identity when exactly one matches.
+
+        Mail resolves agent identities per recipient bucket, so the sender's
+        identity is the ``from``-bucket entry whose address matches the
+        sender — trusted only when exactly one does.
+        """
+        sender_key = sender.strip().lower()
+        matches: List[Dict[str, Any]] = []
+        for entry in cls._webhook_list(data, "agent_identities", "agentIdentities"):
+            bucket = str(cls._field(entry, "bucket") or "").strip().lower()
+            address = str(
+                cls._field(entry, "address", "email_address", "emailAddress") or ""
+            ).strip().lower()
+            if bucket != "from" or address != sender_key:
+                continue
+            summary = cls._agent_identity_summary(entry)
+            if summary:
+                matches.append(summary)
+        return matches[0] if len(matches) == 1 else None
+
+    @classmethod
     def _conversation_summary_is_group(cls, summary: Any) -> bool:
         return bool(cls._field(summary, "isGroup", "is_group", "is_group_conversation"))
 
@@ -1113,6 +1166,8 @@ class InkboxGateway:
             body_text = (body_text + inbound_media_note(saved)).strip()
         thread_key = self._thread_key("email", message.get("thread_id"))
         contact = await self._resolve_contact_full(kind="email", value=sender)
+        # An address-book contact always wins over a resolved agent identity.
+        agent_identity = None if contact else self._mail_sender_agent_identity(data, sender)
         chat_id = self._chat_key(
             data,
             sender,
@@ -1126,6 +1181,7 @@ class InkboxGateway:
             "subject": subject,
             "thread_id": message.get("thread_id"),
             "contact": contact,
+            "agent_identity": agent_identity,
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("email", None, sender, chat_id=chat_id)
@@ -1261,12 +1317,13 @@ class InkboxGateway:
         target_message_id: str,
         reaction_label: str,
         contact: Optional[Dict[str, Any]] = None,
+        agent_identity: Optional[Dict[str, Any]] = None,
     ) -> str:
         conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
         target_part = f" target_message_id={target_message_id}" if target_message_id else ""
         marker = (
             f"[inkbox:imessage_reaction from={sender} reaction={reaction_label}"
-            f"{conversation_part}{target_part} | {contact_marker(contact)}]"
+            f"{conversation_part}{target_part} | {contact_marker(contact, agent_identity)}]"
         )
         policy = "\n".join([
             f"{sender} reacted with a '{reaction_label}' tapback to your message.",
@@ -1343,6 +1400,11 @@ class InkboxGateway:
             or len(agent_identities) > 1
         )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
+        # 1:1 only — a group resolves multiple identities, where a single
+        # sender marker doesn't apply; a contact match always wins.
+        agent_identity = (
+            None if (contact or is_group) else self._single_agent_identity(agent_identities)
+        )
         if is_group:
             body = self._group_sms_prompt(
                 body,
@@ -1366,6 +1428,7 @@ class InkboxGateway:
             "sender": sender,
             "conversation_kind": "group" if is_group else "direct",
             "contact": contact,
+            "agent_identity": agent_identity,
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("sms", conversation_id, sender, chat_id=chat_id)
@@ -1403,6 +1466,14 @@ class InkboxGateway:
         body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
         conversation_id = str(message.get("conversation_id") or "").strip()
         contact = await self._resolve_contact_full(kind="phone", value=sender)
+        # An address-book contact always wins over a resolved agent identity.
+        agent_identity = (
+            None
+            if contact
+            else self._single_agent_identity(
+                self._webhook_list(data, "agent_identities", "agentIdentities", "identity_agents")
+            )
+        )
         chat_id = self._chat_key(
             data,
             sender,
@@ -1410,7 +1481,12 @@ class InkboxGateway:
             contact=contact,
             allow_webhook_contact=False,
         )
-        meta = {"conversation_id": conversation_id or None, "sender": sender, "contact": contact}
+        meta = {
+            "conversation_id": conversation_id or None,
+            "sender": sender,
+            "contact": contact,
+            "agent_identity": agent_identity,
+        }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("imessage", conversation_id, sender, chat_id=chat_id)
         await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
@@ -1444,12 +1520,23 @@ class InkboxGateway:
                         else reaction_type
                     ) or "unknown"
                     contact = await self._resolve_contact_full(kind="phone", value=sender)
+                    # An address-book contact always wins over an agent identity.
+                    agent_identity = (
+                        None
+                        if contact
+                        else self._single_agent_identity(
+                            self._webhook_list(
+                                data, "agent_identities", "agentIdentities", "identity_agents"
+                            )
+                        )
+                    )
                     body = self._imessage_reaction_prompt(
                         sender=sender,
                         conversation_id=conversation_id,
                         target_message_id=target_message_id,
                         reaction_label=reaction_label,
                         contact=contact,
+                        agent_identity=agent_identity,
                     )
                     chat_id = self._chat_key(
                         data,
