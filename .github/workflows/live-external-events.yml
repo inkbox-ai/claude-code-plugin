@@ -1,39 +1,41 @@
 name: Live external events e2e
 
-# Boots a REAL bridge with this checkout, then POSTs signed external escalation
-# webhooks at its local /webhook listener asking it to phone the driver contact.
-# The tests verify the agent actually places that call (and that a forged
-# signature is rejected without waking the agent). The driver sits on
-# auto_reject (set by the tests) — we monitor the escalation, not the call.
-# Real model + real call, so this runs only on ready (non-draft) PRs + dispatch.
+# Boots a REAL bridge with this checkout, then tests both external-event trust
+# paths at its local /webhook listener: an Inkbox-signed event must complete a
+# real-model turn, while GitHub HMAC tests prove forged rejection and valid
+# delivery into an agent session. Outbound calls are covered by live-voice,
+# which verifies call placement, media, transcript, and speech mode together.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_call:
+    inputs:
+      timeout_s:
+        description: "Seconds to wait for the external-event model turn"
+        required: false
+        type: string
+        default: "200"
+      orchestrated:
+        description: "True when the full-stack workflow owns the shared live lock"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       timeout_s:
-        description: "Seconds to wait for the agent to place the call"
+        description: "Seconds to wait for the external-event model turn"
         required: false
         default: "200"
 
 # Shares the AUT tunnel lock with the channels + voice suites.
 concurrency:
-  group: inkbox-live-aut-tunnel
+  group: ${{ inputs.orchestrated && format('inkbox-live-child-{0}', github.run_id) || 'inkbox-live-aut-tunnel' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   external-events:
-    # Draft PRs and fork PRs (no secrets) skip.
-    if: >
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.draft == false &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # Headroom for the 300s primary + 180s one-shot re-inject window on the
-    # valid-signature call test (cold-start fresh session per external event).
-    timeout-minutes: 25
+    timeout-minutes: 12
     env:
       INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
       INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
@@ -46,17 +48,17 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       # The whole point of this suite — let external webhooks reach the agent.
       INKBOX_EXTERNAL_EVENTS_ENABLED: "true"
-      # No realtime needed — the driver auto-rejects, so no media leg runs.
+      # No realtime needed: this suite verifies the external-event boundary.
       INKBOX_REALTIME_ENABLED: "false"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -102,15 +104,14 @@ jobs:
           done
           echo "gateway never became ready"; tail -n 150 /tmp/gateway.log; exit 1
 
-      # Inkbox-signed escalation + GitHub-signed (valid & forged) escalation.
+      # Signed model turn + GitHub HMAC acceptance/rejection.
       - name: Live external-event tests
         env:
-          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
-          CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           CLAUDE_CODE_INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
-          LIVE_EXTERNAL_TIMEOUT: ${{ github.event.inputs.timeout_s || '300' }}
+          LIVE_EXTERNAL_TIMEOUT: ${{ inputs.timeout_s || '200' }}
           LIVE_REAL_MODEL: "1"
           LIVE_EXTERNAL_EVENTS: "1"
+          GATEWAY_LOG: /tmp/gateway.log
         run: >-
           python3 -m pytest
           tests/live/test_external_event_intelligence.py
@@ -124,7 +125,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: live-external-events-logs
           path: /tmp/gateway.log

@@ -50,6 +50,14 @@ IMESSAGE_MAX_LENGTH = 18995
 CURRENT_SESSION: ContextVar[Any] = ContextVar("inkbox_claude_current_session", default=None)
 
 
+def _mark_tool_delivery(mode: str, target: str) -> None:
+    """Tell the active session that this tool already delivered its reply."""
+    session = CURRENT_SESSION.get()
+    mark = getattr(session, "mark_tool_delivery", None)
+    if callable(mark):
+        mark(mode, target)
+
+
 def _current_channel_hint() -> Optional[str]:
     """Which Inkbox channel is the current agent turn happening on?
 
@@ -287,11 +295,13 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         {"to": str, "subject": str, "body": str, "attachment_paths": list},
     )
     async def inkbox_send_email(args: Dict[str, Any]) -> Dict[str, Any]:
+        target = str(args["to"])
+
         def _run():
             paths = args.get("attachment_paths") or []
             attachments = [file_to_email_attachment(str(p)) for p in paths] or None
             msg = _identity().send_email(
-                to=[str(args["to"])],
+                to=[target],
                 subject=str(args.get("subject") or ""),
                 body_text=str(args.get("body") or ""),
                 attachments=attachments,
@@ -299,7 +309,9 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return {"sent": True, "id": str(getattr(msg, "id", "")), "attachments": len(paths)}
 
         try:
-            return _result(await asyncio.to_thread(_run))
+            result = await asyncio.to_thread(_run)
+            _mark_tool_delivery("email", target)
+            return _result(result)
         except Exception as exc:
             return _error(str(exc))
 
@@ -314,6 +326,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
     )
     async def inkbox_send_sms(args: Dict[str, Any]) -> Dict[str, Any]:
         text = str(args.get("text") or "")
+        target = str(args.get("to") or "").strip()
         if len(text) > SMS_MAX_LENGTH:
             return _error(
                 _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
@@ -325,7 +338,6 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         def _run():
             identity = _identity()
             kwargs: Dict[str, Any] = {"text": text}
-            target = str(args.get("to") or "").strip()
             if target.startswith("+"):
                 kwargs["to"] = target
             else:
@@ -340,7 +352,9 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls)}
 
         try:
-            return _result(await asyncio.to_thread(_run))
+            result = await asyncio.to_thread(_run)
+            _mark_tool_delivery("sms", target)
+            return _result(result)
         except Exception as exc:
             _log_send_rejection("inkbox_send_sms", exc)
             return _error(str(exc))
@@ -356,6 +370,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
     )
     async def inkbox_send_imessage(args: Dict[str, Any]) -> Dict[str, Any]:
         text = str(args.get("text") or "")
+        conversation_id = str(args["conversation_id"])
         if len(text) > IMESSAGE_MAX_LENGTH:
             return _error(
                 _message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH),
@@ -367,7 +382,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         def _run():
             identity = _identity()
             kwargs: Dict[str, Any] = {
-                "conversation_id": str(args["conversation_id"]),
+                "conversation_id": conversation_id,
                 "text": text,
             }
             media_path = str(args.get("media_path") or "").strip()
@@ -378,7 +393,9 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return {"sent": True, "id": str(getattr(msg, "id", ""))}
 
         try:
-            return _result(await asyncio.to_thread(_run))
+            result = await asyncio.to_thread(_run)
+            _mark_tool_delivery("imessage", conversation_id)
+            return _result(result)
         except Exception as exc:
             _log_send_rejection("inkbox_send_imessage", exc)
             return _error(str(exc))
