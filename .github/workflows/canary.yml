@@ -33,8 +33,11 @@ jobs:
       - name: Install latest Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code
 
-      - name: Contract tests vs latest host
-        run: pytest -q tests/contract
+      # Re-run the complete offline suite twice daily against the newest SDK
+      # and CLI. Live tests self-skip here and are run by Full stack e2e after
+      # this canary passes.
+      - name: Full offline suite vs latest host
+        run: pytest -q
 
       # Unattended runs page the team; manual dispatches don't.
       - name: Notify Google Chat on failure

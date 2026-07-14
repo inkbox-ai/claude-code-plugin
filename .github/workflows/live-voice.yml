@@ -8,22 +8,23 @@ name: Live voice e2e
 # of the call, bridged over the driver identity's own Inkbox tunnel.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_call:
+    inputs:
+      orchestrated:
+        description: "True when the full-stack workflow owns the shared live lock"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
 
 # Shares the AUT tunnel lock with the channels suite.
 concurrency:
-  group: inkbox-live-aut-tunnel
+  group: ${{ inputs.orchestrated && format('inkbox-live-child-{0}', github.run_id) || 'inkbox-live-aut-tunnel' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   voice:
-    if: >
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.draft == false &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

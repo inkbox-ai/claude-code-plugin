@@ -8,34 +8,34 @@ name: Live channels e2e
 #   * real — a real Claude model: proves reasoning + tool use end to end.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_call:
+    inputs:
+      timeout_s:
+        description: "Per-question reply timeout (seconds)"
+        required: false
+        type: string
+        default: "150"
+      orchestrated:
+        description: "True when the full-stack workflow owns the shared live lock"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       timeout_s:
         description: "Per-question reply timeout (seconds)"
         required: false
         default: "150"
-  workflow_run:
-    workflows: ["Canary — plugin vs Claude Code latest"]
-    types: [completed]
 
 # Only one holder of the AUT identity's Inkbox tunnel at a time — the voice
 # suite shares this group, so live runs queue instead of fighting the tunnel.
 concurrency:
-  group: inkbox-live-aut-tunnel
+  group: ${{ inputs.orchestrated && format('inkbox-live-child-{0}', github.run_id) || 'inkbox-live-aut-tunnel' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   live:
-    # Draft PRs and fork PRs (no secrets) skip; chained runs only follow a
-    # PASSING canary.
-    if: >
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.draft == false &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -121,7 +121,7 @@ jobs:
         env:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
           CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
-          LIVE_EMAIL_TIMEOUT: ${{ github.event.inputs.timeout_s || '150' }}
+          LIVE_EMAIL_TIMEOUT: ${{ inputs.timeout_s || '150' }}
           LIVE_REAL_MODEL: ${{ matrix.leg == 'real' && '1' || '' }}
           LIVE_CONTACT_CRUD: ${{ matrix.leg == 'real' && '1' || '' }}
           # The delivery-failure retry tests read the gateway log for the loop's
@@ -154,19 +154,3 @@ jobs:
         if: always()
         run: |
           [ -f /tmp/gateway.pid ] && kill "$(cat /tmp/gateway.pid)" 2>/dev/null || true
-
-  # Page the team only when an UNATTENDED run breaks (the canary chain);
-  # PR authors and manual dispatchers are already watching.
-  notify:
-    needs: live
-    if: always() && needs.live.result == 'failure' && github.event_name == 'workflow_run'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Notify Google Chat
-        env:
-          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
-        run: |
-          [ -n "$WEBHOOK_URL" ] || exit 0
-          curl -sS -X POST -H 'Content-Type: application/json' \
-            -d "{\"text\": \"🚨 claude-code-plugin live channels e2e FAILED (chained off the canary): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
-            "$WEBHOOK_URL" || true
