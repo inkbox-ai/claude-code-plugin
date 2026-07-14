@@ -69,6 +69,7 @@ class _FakeIdentity:
         self.place_call_error = None
         self.list_calls_kwargs = None
         self.transcript_call_id = None
+        self.sent_emails = []
         self.sent_texts = []
         self.sent_imessages = []
 
@@ -92,6 +93,10 @@ class _FakeIdentity:
     def send_imessage(self, **kwargs):
         self.sent_imessages.append(kwargs)
         return type("Message", (), {"id": "im-1"})()
+
+    def send_email(self, **kwargs):
+        self.sent_emails.append(kwargs)
+        return type("Message", (), {"id": "email-1"})()
 
     def send_text(self, **kwargs):
         self.sent_texts.append(kwargs)
@@ -347,3 +352,36 @@ def test_send_imessage_rejects_text_over_limit():
     assert data["error_code"] == "imessage_too_long"
     assert data["char_count"] == tools_mod.IMESSAGE_MAX_LENGTH + 1
     assert client.identity.sent_imessages == []
+
+
+def test_successful_message_tool_notifies_current_session():
+    client = _FakeClient()
+    deliveries = []
+
+    class _Session:
+        def mark_tool_delivery(self, mode, target):
+            deliveries.append((mode, target))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        data = _call(
+            client,
+            "inkbox_send_email",
+            {
+                "to": "ada@example.com",
+                "subject": "Details",
+                "body": "Here they are.",
+                "attachment_paths": [],
+            },
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert data["sent"] is True
+    assert client.identity.sent_emails == [{
+        "to": ["ada@example.com"],
+        "subject": "Details",
+        "body_text": "Here they are.",
+        "attachments": None,
+    }]
+    assert deliveries == [("email", "ada@example.com")]

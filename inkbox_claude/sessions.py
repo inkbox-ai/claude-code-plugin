@@ -348,6 +348,10 @@ class ContactSession:
         self._turn_active = False     # a Claude turn is mid-flight
         self._interrupting = False    # a new message asked us to abort it
         self._current_turn: Optional[_Turn] = None  # the turn the worker is running
+        # Set when an Inkbox tool successfully delivers to the same channel
+        # and recipient as the inbound turn. The tool's message is the reply;
+        # do not follow it with Claude's usually-redundant "sent it" result.
+        self._current_channel_tool_delivery = False
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -592,8 +596,54 @@ class ContactSession:
     # Claude Code turn
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _phone_key(value: Any) -> str:
+        """Normalize a phone-like target for same-recipient comparisons."""
+        raw = str(value or "").strip()
+        digits = re.sub(r"\D", "", raw)
+        return digits or raw.lower()
+
+    def mark_tool_delivery(self, mode: str, target: str) -> None:
+        """Record a successful tool send that already answered this turn.
+
+        Only a send on the inbound channel to the inbound counterparty counts.
+        Cross-channel sends and sends to third parties still need the normal
+        automatic reply so the human hears that the action completed.
+        """
+        if not self._turn_active or str(mode or "").strip().lower() != self.mode:
+            return
+
+        target = str(target or "").strip()
+        matched = False
+        if self.mode == "email":
+            current = str(
+                self.reply_meta.get("to") or self.reply_meta.get("sender") or ""
+            ).strip()
+            matched = bool(target and current and target.lower() == current.lower())
+        elif self.mode == "sms":
+            conversation_id = str(self.reply_meta.get("conversation_id") or "").strip()
+            current = str(
+                self.reply_meta.get("to") or self.reply_meta.get("sender") or ""
+            ).strip()
+            matched = bool(
+                (conversation_id and target == conversation_id)
+                or (target and current and self._phone_key(target) == self._phone_key(current))
+            )
+        elif self.mode == "imessage":
+            conversation_id = str(self.reply_meta.get("conversation_id") or "").strip()
+            matched = bool(conversation_id and target == conversation_id)
+
+        if matched:
+            self._current_channel_tool_delivery = True
+            logger.info(
+                "[session %s] current-channel %s tool delivered the reply",
+                self.chat_id,
+                self.mode,
+            )
+
     async def _run_turn(self, turn: _Turn) -> None:
         self._interrupting = False  # fresh turn starts un-interrupted
+        self._current_channel_tool_delivery = False
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         retried_missing_resume = False
@@ -665,6 +715,13 @@ class ContactSession:
                 turn.future.set_result(reply or "I finished that, but didn't have anything to say back.")
             return
         if self._interrupting:
+            return
+        if self._current_channel_tool_delivery:
+            logger.info(
+                "[session %s] suppressing automatic %s reply after tool delivery",
+                self.chat_id,
+                self.mode,
+            )
             return
         if reply:
             await self._deliver_reply(turn, reply)

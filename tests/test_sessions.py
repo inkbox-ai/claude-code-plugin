@@ -120,6 +120,86 @@ def test_rejected_reply_send_routes_to_delivery_failure_loop():
     asyncio.run(scenario())
 
 
+def test_current_channel_tool_delivery_suppresses_redundant_reply(monkeypatch):
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.mode = "email"
+        session.reply_meta = {"to": "ada@example.com", "sender": "ada@example.com"}
+
+        class FakeResult:
+            result = "Sent the details by email."
+            session_id = None
+
+        class FakeClient:
+            async def query(self, _text):
+                # Mirrors inkbox_send_email succeeding during this turn.
+                session.mark_tool_delivery("email", "ADA@example.com")
+
+            async def receive_response(self):
+                yield FakeResult()
+
+        monkeypatch.setattr(sessions_mod, "ResultMessage", FakeResult)
+        session._client = FakeClient()
+
+        await session._run_turn(_Turn(text="send me the details"))
+
+        assert sent == []
+        assert session._current_channel_tool_delivery is True
+
+    asyncio.run(scenario())
+
+
+def test_other_recipient_tool_delivery_keeps_normal_reply(monkeypatch):
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        session.mode = "email"
+        session.reply_meta = {"to": "ada@example.com", "sender": "ada@example.com"}
+
+        class FakeResult:
+            result = "I emailed Grace."
+            session_id = None
+
+        class FakeClient:
+            async def query(self, _text):
+                session.mark_tool_delivery("email", "grace@example.com")
+
+            async def receive_response(self):
+                yield FakeResult()
+
+        monkeypatch.setattr(sessions_mod, "ResultMessage", FakeResult)
+        session._client = FakeClient()
+
+        await session._run_turn(_Turn(text="email Grace"))
+
+        assert len(sent) == 1
+        assert sent[0][1] == "I emailed Grace."
+        assert session._current_channel_tool_delivery is False
+
+    asyncio.run(scenario())
+
+
+def test_tool_delivery_matches_sms_and_imessage_routing():
+    session = make_session([])
+    session._turn_active = True
+
+    session.mode = "sms"
+    session.reply_meta = {"to": "+1 (555) 111-2222", "conversation_id": "sms-conv"}
+    session.mark_tool_delivery("sms", "+15551112222")
+    assert session._current_channel_tool_delivery is True
+
+    session._current_channel_tool_delivery = False
+    session.mark_tool_delivery("sms", "sms-conv")
+    assert session._current_channel_tool_delivery is True
+
+    session._current_channel_tool_delivery = False
+    session.mode = "imessage"
+    session.reply_meta = {"conversation_id": "imessage-conv"}
+    session.mark_tool_delivery("imessage", "imessage-conv")
+    assert session._current_channel_tool_delivery is True
+
+
 def test_pending_escalation_consumes_next_inbound():
     async def scenario():
         sent = []
