@@ -858,8 +858,25 @@ class InkboxGateway:
         """
         if event_type and event_type.startswith(("message.", "text.", "imessage.")):
             return True
+        # ``id`` by itself is not a call discriminator: generic external
+        # webhook schemas commonly use a top-level event id.  Treat an
+        # explicit call_id as call-shaped, or require a generic id to travel
+        # with at least one call-specific field.
+        explicit_call_id = envelope.get("call_id") or envelope.get("callId")
+        generic_id = envelope.get("id")
+        has_call_field = any(
+            envelope.get(name) not in (None, "")
+            for name in (
+                "direction",
+                "local_phone_number",
+                "remote_phone_number",
+                "from_number",
+                "to_number",
+            )
+        )
         return bool(
-            cls._call_context_id(envelope)
+            explicit_call_id
+            or (generic_id and has_call_field)
             or (envelope.get("direction") == "inbound" and envelope.get("local_phone_number"))
         )
 
