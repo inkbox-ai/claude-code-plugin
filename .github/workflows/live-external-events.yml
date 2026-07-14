@@ -1,16 +1,16 @@
 name: Live external events e2e
 
 # Boots a REAL bridge with this checkout, then tests both external-event trust
-# paths at its local /webhook listener: an explicitly signed escalation must
-# make a real call, while GitHub HMAC tests prove forged rejection and valid
-# delivery into an agent session. The call driver sits on auto_reject — we
-# monitor the escalation, not the call media.
+# paths at its local /webhook listener: an Inkbox-signed event must complete a
+# real-model turn, while GitHub HMAC tests prove forged rejection and valid
+# delivery into an agent session. Outbound calls are covered by live-voice,
+# which verifies call placement, media, transcript, and speech mode together.
 
 on:
   workflow_call:
     inputs:
       timeout_s:
-        description: "Seconds to wait for the agent to place the call"
+        description: "Seconds to wait for the external-event model turn"
         required: false
         type: string
         default: "200"
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       timeout_s:
-        description: "Seconds to wait for the agent to place the call"
+        description: "Seconds to wait for the external-event model turn"
         required: false
         default: "200"
 
@@ -48,7 +48,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       # The whole point of this suite — let external webhooks reach the agent.
       INKBOX_EXTERNAL_EVENTS_ENABLED: "true"
-      # No realtime needed — the driver auto-rejects, so no media leg runs.
+      # No realtime needed: this suite verifies the external-event boundary.
       INKBOX_REALTIME_ENABLED: "false"
 
     steps:
@@ -104,11 +104,9 @@ jobs:
           done
           echo "gateway never became ready"; tail -n 150 /tmp/gateway.log; exit 1
 
-      # Signed escalation call + GitHub HMAC acceptance/rejection.
+      # Signed model turn + GitHub HMAC acceptance/rejection.
       - name: Live external-event tests
         env:
-          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
-          CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           CLAUDE_CODE_INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
           LIVE_EXTERNAL_TIMEOUT: ${{ inputs.timeout_s || '200' }}
           LIVE_REAL_MODEL: "1"

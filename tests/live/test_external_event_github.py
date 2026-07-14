@@ -7,10 +7,9 @@ This suite exercises the third-party provider boundary with a realistic
 * a valid signature is accepted and starts an external-event agent session.
 
 GitHub's signature authenticates delivery from GitHub; it does not turn
-arbitrary, non-schema payload fields into operator instructions. Actual model
-reasoning and outward call placement are covered separately by
-``test_external_event_intelligence.py`` using the gateway's explicit signed
-escalation schema.
+arbitrary, non-schema payload fields into operator instructions. Real-model
+turn completion is covered by ``test_external_event_intelligence.py`` and
+outbound call placement by ``test_voice.py``.
 """
 
 from __future__ import annotations
