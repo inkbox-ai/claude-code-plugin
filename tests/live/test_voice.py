@@ -49,6 +49,7 @@ SCENARIO = os.environ.get("VOICE_SCENARIO", "")
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
 TIMEOUT_S = float(os.environ.get("LIVE_VOICE_TIMEOUT", "220"))
 POLL_EVERY_S = 6.0
+TERMINAL_FAILURE_STATUSES = {"canceled", "failed"}
 
 pytestmark = pytest.mark.skipif(
     not (REMOTE_KEY and AUT_KEY and REAL),
@@ -86,21 +87,44 @@ def _segments(remote, number_id, call_id):
     return segs, rem, loc
 
 
+def _call_state(remote, call_id) -> tuple[str, str]:
+    """Compact current call state for progress and terminal-failure output."""
+    call = remote.calls.get(call_id)
+    status = (getattr(call, "status", "") or "").lower()
+    fields = (
+        f"status={status!r}",
+        f"reason={getattr(call, 'reason', None)!r}",
+        f"hangup_reason={getattr(call, 'hangup_reason', None)!r}",
+        f"started_at={getattr(call, 'started_at', None)!r}",
+        f"ended_at={getattr(call, 'ended_at', None)!r}",
+        f"is_blocked={getattr(call, 'is_blocked', None)!r}",
+    )
+    return status, " ".join(fields)
+
+
 def _wait_for_two_way_call(remote, number_id, call_id):
     """Block until the call transcript shows BOTH the agent and the driver spoke."""
     deadline = time.monotonic() + TIMEOUT_S
     last = ""
     while time.monotonic() < deadline:
+        transcript_state = ""
         try:
             _all, rem, loc = _segments(remote, number_id, call_id)
         except Exception as exc:  # transcripts may 404 until the call is set up
-            last = f"transcripts not ready: {exc!r}"
-            time.sleep(POLL_EVERY_S)
-            continue
-        if rem and loc:
+            rem, loc = [], []
+            transcript_state = f"transcripts not ready: {exc!r}"
+        if not transcript_state and rem and loc:
             agent_said = " | ".join(s.text.strip() for s in rem)
             return agent_said  # the agent reached the caller out loud, in a two-way call
-        last = f"segments so far: remote={len(rem)} local={len(loc)}"
+        try:
+            status, state = _call_state(remote, call_id)
+        except Exception as exc:
+            state = f"call state unavailable: {exc!r}"
+            status = ""
+        progress = transcript_state or f"segments so far: remote={len(rem)} local={len(loc)}"
+        last = f"{progress}; {state}"
+        if status in TERMINAL_FAILURE_STATUSES:
+            pytest.fail(f"call ended before a two-way conversation ({last})")
         time.sleep(POLL_EVERY_S)
     pytest.fail(f"agent never held a two-way call within {TIMEOUT_S:.0f}s ({last})")
 
