@@ -5,7 +5,7 @@ description = "Inkbox bridge for Claude Code — talk to your coding agent over 
 requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9",
-  "inkbox>=0.4.24,<1.0.0",
+  "inkbox>=0.5.0,<1.0.0",
   "claude-agent-sdk>=0.1.0",
   "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]

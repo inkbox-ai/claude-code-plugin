@@ -35,8 +35,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's other dependency (claude-agent-sdk) is checked by doctor.
-INKBOX_MIN_VERSION = (0, 4, 15)
-INKBOX_REQUIREMENTS = ("inkbox>=0.4.20,<1.0.0", "aiohttp>=3.9")
+INKBOX_MIN_VERSION = (0, 5, 0)
+INKBOX_REQUIREMENTS = ("inkbox>=0.5.0,<1.0.0", "aiohttp>=3.9")
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
