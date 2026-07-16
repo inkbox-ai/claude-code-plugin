@@ -148,7 +148,6 @@ def main() -> None:
     log.info("tunnel ready: %s", ws_url)
 
     # Auto-accept inbound calls (agent → driver) straight onto this WS.
-    prev_action = getattr(num, "incoming_call_action", None)
     client.phone_numbers.update(num.id, incoming_call_action="auto_accept", client_websocket_url=ws_url)
 
     Path(STATE_FILE).write_text(json.dumps({
@@ -159,9 +158,12 @@ def main() -> None:
     try:
         listener.wait()
     finally:
-        # Leave the number as we found it so other suites aren't affected.
+        # auto_reject is the driver's known idle baseline. Restoring an
+        # arbitrary previous value can preserve a stale auto-accept setting,
+        # causing earlier call-placement probes to remain active and collide
+        # with the next voice run.
         try:
-            client.phone_numbers.update(num.id, incoming_call_action=prev_action or "auto_reject")
+            client.phone_numbers.update(num.id, incoming_call_action="auto_reject")
         except Exception as exc:  # noqa: BLE001
             log.info("number revert failed: %r", exc)
         listener.close()

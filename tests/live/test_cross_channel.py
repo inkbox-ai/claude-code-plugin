@@ -68,7 +68,8 @@ def xc():
     rnums = remote.phone_numbers.list()
     anums = aut.phone_numbers.list()
     assert rnums and anums, "both identities need a phone number for cross-channel"
-    remote_phone, remote_pid = rnums[0].number, str(rnums[0].id)
+    remote_number = rnums[0]
+    remote_phone, remote_pid = remote_number.number, str(remote_number.id)
     aut_phone = anums[0].number
 
     # The agent can only cross channels if the sender's card has BOTH an email and a
@@ -95,11 +96,20 @@ def xc():
         if changed:
             aut.contacts.update(c.id, emails=emails, phones=phones)
 
-    return {
-        "remote": remote, "aut": aut,
-        "remote_email": remote_email, "remote_pid": remote_pid,
-        "aut_email": aut_email, "aut_phone": aut_phone,
-    }
+    # These tests only need proof that the AUT attempted a fresh dial. Keep the
+    # driver parked on auto-reject so each probe terminates immediately instead
+    # of occupying both identities until the server's ten-minute duration cap.
+    # Re-assert the known idle baseline during teardown as well: preserving a
+    # stale auto-accept value here contaminates the voice suite that runs next.
+    remote.phone_numbers.update(remote_pid, incoming_call_action="auto_reject")
+    try:
+        yield {
+            "remote": remote, "aut": aut,
+            "remote_email": remote_email, "remote_pid": remote_pid,
+            "aut_email": aut_email, "aut_phone": aut_phone,
+        }
+    finally:
+        remote.phone_numbers.update(remote_pid, incoming_call_action="auto_reject")
 
 
 def test_email_request_gets_sms_response(xc):
@@ -180,14 +190,13 @@ def _wait_for_new_call(remote, remote_pid: str, aut_phone: str, before: set):
     pytest.fail(f"agent did not place a call to the driver within {TIMEOUT_S:.0f}s")
 
 
-# The bridge has no way to hang up a call it placed (the SDK exposes only
-# list/get/place), so a test call rides the server's max-duration cap and stays
-# "active" for the whole run. The AUT also keys ONE session per contact across
-# channels, so back-to-back call legs share context: after the first dial the
-# agent reasons "I already called this person" and answers the next "call me"
-# with a text instead of dialing again. Resetting the session before each leg
-# (the bridge's ``/clear`` control command, intercepted locally and never sent to
-# Claude) drops that context so every ask lands in a fresh conversation.
+# The driver auto-rejects these call probes so they cannot leak into the voice
+# suite. The AUT still keys ONE session per contact across channels, however, so
+# back-to-back call legs share context: after the first dial the agent reasons
+# "I already called this person" and answers the next "call me" with a text
+# instead of dialing again. Resetting the session before each leg (the bridge's
+# ``/clear`` control command, intercepted locally and never sent to Claude)
+# drops that context so every ask lands in a fresh conversation.
 RESET_SETTLE_S = 5.0
 
 
