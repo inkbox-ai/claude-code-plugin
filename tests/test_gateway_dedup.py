@@ -69,3 +69,116 @@ def test_request_id_rolls_back_after_dispatch_failure(monkeypatch):
         asyncio.run(gw._handle_webhook(_FakeRequest(body)))
 
     assert calls["count"] == 2
+
+
+def test_email_replay_with_stable_event_id_queues_once(monkeypatch):
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
+    calls = []
+
+    async def capture(envelope):
+        calls.append(envelope)
+        return _FakeResponse()
+
+    monkeypatch.setattr(gw, "_on_mail_received_once", capture)
+    envelope = {"id": "event-1", "data": {"message": {"id": "message-1"}}}
+
+    first = asyncio.run(gw._on_mail_received(envelope))
+    second = asyncio.run(gw._on_mail_received(envelope))
+
+    assert first.status == 200 and json.loads(second.text)["deduped"] is True
+    assert len(calls) == 1
+
+
+def test_email_replay_with_different_request_ids_dispatches_once(monkeypatch):
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
+    calls = []
+
+    async def capture(envelope):
+        calls.append(envelope)
+        return _FakeResponse()
+
+    monkeypatch.setattr(gw, "_on_mail_received_once", capture)
+    body = json.dumps({
+        "id": "event-1",
+        "event_type": "message.received",
+        "data": {"message": {"id": "message-1"}},
+    }).encode()
+
+    asyncio.run(gw._handle_webhook(_FakeRequest(body, request_id="delivery-1")))
+    second = asyncio.run(gw._handle_webhook(_FakeRequest(body, request_id="delivery-2")))
+
+    assert json.loads(second.text)["deduped"] is True
+    assert len(calls) == 1
+
+
+def test_distinct_email_events_in_same_thread_queue_separately(monkeypatch):
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
+    calls = []
+
+    async def capture(envelope):
+        calls.append(envelope)
+        return _FakeResponse()
+
+    monkeypatch.setattr(gw, "_on_mail_received_once", capture)
+    first = {"id": "event-1", "data": {"message": {"id": "message-1", "thread_id": "thread"}}}
+    second = {"id": "event-2", "data": {"message": {"id": "message-2", "thread_id": "thread"}}}
+
+    asyncio.run(gw._on_mail_received(first))
+    asyncio.run(gw._on_mail_received(second))
+
+    assert len(calls) == 2
+
+
+def test_email_message_id_is_fallback_when_event_id_is_missing(monkeypatch):
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
+    calls = []
+
+    async def capture(envelope):
+        calls.append(envelope)
+        return _FakeResponse()
+
+    monkeypatch.setattr(gw, "_on_mail_received_once", capture)
+    envelope = {"data": {"message": {"id": "message-1"}}}
+
+    asyncio.run(gw._on_mail_received(envelope))
+    asyncio.run(gw._on_mail_received(envelope))
+
+    assert len(calls) == 1
+
+
+def test_email_missing_stable_ids_preserves_current_behavior(monkeypatch):
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
+    calls = []
+
+    async def capture(envelope):
+        calls.append(envelope)
+        return _FakeResponse()
+
+    monkeypatch.setattr(gw, "_on_mail_received_once", capture)
+    envelope = {"data": {"message": {"thread_id": "thread"}}}
+
+    asyncio.run(gw._on_mail_received(envelope))
+    asyncio.run(gw._on_mail_received(envelope))
+
+    assert len(calls) == 2
+
+
+def test_email_stable_dedup_rolls_back_after_handler_failure(monkeypatch):
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
+    calls = {"count": 0}
+
+    async def fail_once(_envelope):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("boom")
+        return _FakeResponse()
+
+    monkeypatch.setattr(gw, "_on_mail_received_once", fail_once)
+    envelope = {"id": "event-1", "data": {"message": {"id": "message-1"}}}
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(gw._on_mail_received(envelope))
+    response = asyncio.run(gw._on_mail_received(envelope))
+
+    assert response.status == 200
+    assert calls["count"] == 2
