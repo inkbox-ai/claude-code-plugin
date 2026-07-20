@@ -587,8 +587,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return _error(str(exc))
 
     # ------------------------------------------------------------------
-    # Contacts and generated facts are organization-wide. Channel history is
-    # still scoped to this identity.
+    # Contacts — the org address book, filtered server-side to what this
+    # identity may see.
     # ------------------------------------------------------------------
 
     @tool(
@@ -615,7 +615,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
     @tool(
         "inkbox_list_contacts",
         "Search the address book by free text (matches name, company, job "
-        "title, user-managed notes). Use for name-based queries like 'find Ada'. "
+        "title, notes). Use for name-based queries like 'find Ada'. "
         "order is 'recent' or 'name'.",
         {"q": str, "order": str, "limit": int},
     )
@@ -649,7 +649,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
     @tool(
         "inkbox_create_contact",
         "Save a new contact in the address book. Provide any of given_name, "
-        "family_name, preferred_name, company_name, job_title, user-managed notes, and "
+        "family_name, preferred_name, company_name, job_title, notes, and "
         "emails / phones as lists of strings (first entry is marked primary).",
         {"given_name": str, "family_name": str, "preferred_name": str,
          "company_name": str, "job_title": str, "notes": str,

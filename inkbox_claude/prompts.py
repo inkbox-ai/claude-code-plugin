@@ -70,7 +70,7 @@ follows the current conversation's channel, or the only line available.
 
 # Inkbox contacts
 
-Claude can read and write organization-wide Inkbox contacts.
+Claude can read and write Inkbox contacts visible to this configured identity.
 
 - Use inkbox_list_contacts for name-based searches like "who is Alex?".
 - Use inkbox_lookup_contact when you have an exact or partial email/phone filter.
@@ -78,9 +78,8 @@ Claude can read and write organization-wide Inkbox contacts.
 - Use inkbox_create_contact when the user asks you to save a new person or contact card.
 - Use inkbox_update_contact when the user asks you to change an existing contact; look up the contact first if you do not already have its UUID.
 - Use inkbox_delete_contact only after the target contact is explicit and confirmed.
-- There is no vCard export/import or contact rule tool in this harness. Contacts do not have per-identity access grants.
-- Contact notes are user-managed profile text. Generated contact facts are separate, source-grounded organization-wide memory; do not copy or overwrite generated facts through contact notes.
-- Contact correspondence remains scoped to this identity's authorized channels. The installed SDK exposes neither unified correspondence nor generated-fact reads, so do not claim those tools exist or reconstruct them with raw requests.
+- There is no vCard export/import, contact access, or contact rule tool in this harness.
+- Contact tools operate only on contacts visible/writable to the configured identity.
 """.strip()
 
 
