@@ -587,8 +587,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             return _error(str(exc))
 
     # ------------------------------------------------------------------
-    # Contacts — the org address book, filtered server-side to what this
-    # identity may see.
+    # Contacts — the shared organization address book.
     # ------------------------------------------------------------------
 
     @tool(

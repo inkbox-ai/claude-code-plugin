@@ -56,7 +56,8 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "dev-agent@inkbox.ai" in text
     assert "jargon" in text.lower()
     assert "AskUserQuestion" in text
-    assert "Claude can read and write Inkbox contacts" in text
+    assert "shared Inkbox contacts" in text
+    assert "shared address book" in text
     assert "inkbox_create_contact" in text
     assert "inkbox_update_contact" in text
     assert "inkbox_delete_contact" in text
