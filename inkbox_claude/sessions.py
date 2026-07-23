@@ -88,6 +88,7 @@ class _Turn:
 
     text: str
     future: Optional["asyncio.Future[str]"] = None
+    a2a_context: Optional[Dict[str, Any]] = None
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Claude as a turn.
@@ -647,6 +648,13 @@ class ContactSession:
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         retried_missing_resume = False
+        a2a_token = None
+        if turn.a2a_context is not None:
+            try:
+                from .tools import A2A_TURN_CONTEXT
+            except ImportError:  # pragma: no cover
+                from tools import A2A_TURN_CONTEXT
+            a2a_token = A2A_TURN_CONTEXT.set(turn.a2a_context)
         try:
             while True:
                 try:
@@ -697,6 +705,8 @@ class ContactSession:
                 return
             raise
         finally:
+            if a2a_token is not None:
+                A2A_TURN_CONTEXT.reset(a2a_token)
             self._turn_active = False
             self._current_turn = None
             if typing_task is not None:
@@ -766,7 +776,12 @@ class ContactSession:
                     self.chat_id, self.mode, self.reply_meta, reply, exc
                 )
 
-    async def run_consult(self, query: str) -> str:
+    async def run_consult(
+        self,
+        query: str,
+        *,
+        a2a_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Run one Claude Code turn and RETURN its text (don't send it).
 
         Used by the Realtime voice bridge, post-call actions, and delivery-
@@ -786,7 +801,9 @@ class ContactSession:
         """
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
-        await self._queue.put(_Turn(text=query, future=future))
+        await self._queue.put(
+            _Turn(text=query, future=future, a2a_context=a2a_context)
+        )
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
         return await future
