@@ -729,6 +729,78 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
+    @tool(
+        "inkbox_a2a_call",
+        "Send a task to an A2A 1.0 Agent Card. Keep the returned task and "
+        "context ids for later checks or replies.",
+        {"card_url": str, "text": str, "context_id": str, "task_id": str,
+         "message_id": str},
+    )
+    async def inkbox_a2a_call(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            a2a = _identity().a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                return a2a.send(
+                    target,
+                    text=str(args["text"]),
+                    context_id=args.get("context_id") or None,
+                    task_id=args.get("task_id") or None,
+                    message_id=args.get("message_id") or None,
+                )
+            finally:
+                a2a.close()
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_a2a_check",
+        "Fetch an A2A task, or wait until it reaches a final or input-required state.",
+        {"card_url": str, "task_id": str, "wait": bool},
+    )
+    async def inkbox_a2a_check(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            a2a = _identity().a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                if args.get("wait"):
+                    return a2a.wait(target, str(args["task_id"]))
+                return a2a.get_task(target, str(args["task_id"]))
+            finally:
+                a2a.close()
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_a2a_reply",
+        "Reply to a remote A2A task that requested more input.",
+        {"card_url": str, "task_id": str, "text": str, "message_id": str},
+    )
+    async def inkbox_a2a_reply(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            a2a = _identity().a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                return a2a.send(
+                    target,
+                    task_id=str(args["task_id"]),
+                    text=str(args["text"]),
+                    message_id=args.get("message_id") or None,
+                )
+            finally:
+                a2a.close()
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
     tools = [
         inkbox_whoami,
         inkbox_send_email,
@@ -747,6 +819,9 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_create_contact,
         inkbox_update_contact,
         inkbox_delete_contact,
+        inkbox_a2a_call,
+        inkbox_a2a_check,
+        inkbox_a2a_reply,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
     tool_names = [
@@ -767,5 +842,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_create_contact",
         "mcp__inkbox__inkbox_update_contact",
         "mcp__inkbox__inkbox_delete_contact",
+        "mcp__inkbox__inkbox_a2a_call",
+        "mcp__inkbox__inkbox_a2a_check",
+        "mcp__inkbox__inkbox_a2a_reply",
     ]
     return server, tool_names
