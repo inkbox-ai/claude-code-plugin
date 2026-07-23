@@ -238,6 +238,12 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_imessage_conversations` · `inkbox_get_imessage_conversation` — browse iMessage threads and history (find the `conversation_id` to send into).
 - `inkbox_lookup_contact` · `inkbox_list_contacts` · `inkbox_get_contact` — resolve and read address-book contacts (reverse-lookup by email/phone, free-text search, or full record by id).
 - `inkbox_create_contact` · `inkbox_update_contact` · `inkbox_delete_contact` — save, edit, and remove organization-wide contacts. Changes affect the shared address book. vCard export/import is not exposed.
+- `inkbox_a2a_call` · `inkbox_a2a_check` · `inkbox_a2a_reply` — delegate work to another agent and follow its task.
+- `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
+
+Inbound A2A serving and A2A client tools require Inkbox SDK 0.5.5 or newer.
+Other bridge features continue to support the base SDK range in
+`pyproject.toml`.
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 
