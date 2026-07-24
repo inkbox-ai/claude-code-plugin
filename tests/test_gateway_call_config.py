@@ -12,14 +12,19 @@ from inkbox_claude.config import BridgeConfig
 
 
 class _FakeSubscriptions:
-    def __init__(self):
+    def __init__(self, existing=()):
         self.created = []
+        self.existing = list(existing)
+        self.deleted = []
 
     def list(self, **_owner):
-        return []
+        return list(self.existing)
 
     def create(self, **kwargs):
         self.created.append(kwargs)
+
+    def delete(self, sub_id):
+        self.deleted.append(sub_id)
 
 
 class _UnsupportedA2ASubscriptions(_FakeSubscriptions):
@@ -175,6 +180,22 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
         "https://agent.example/webhook?channel=a2a",
         "https://agent.example/webhook",
     ]
+
+
+def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
+    a2a = types.SimpleNamespace(
+        id="sub-a2a",
+        url="https://agent.example/webhook?channel=a2a",
+        event_types=gateway.A2A_EVENTS,
+    )
+    subscriptions = _FakeSubscriptions([a2a])
+    _patched_gateway(
+        _Identity(phone=None, imessage_enabled=True),
+        subscriptions=subscriptions,
+    )
+
+    assert subscriptions.deleted == []
+    assert subscriptions.created[-1]["event_types"] == gateway.IMESSAGE_EVENTS
 
 
 def test_a2a_only_subscription_is_skipped_on_older_api():
