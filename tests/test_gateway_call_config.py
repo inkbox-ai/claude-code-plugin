@@ -30,10 +30,9 @@ class _UnsupportedA2ASubscriptions(_FakeSubscriptions):
     def create(self, **kwargs):
         self.attempted.append(kwargs)
         if any(event.startswith("a2a.") for event in kwargs["event_types"]):
-            error = RuntimeError("unsupported A2A events")
-            error.status_code = 422
-            error.detail = "a2a.task.created is not a valid event type"
-            raise error
+            raise ValueError(
+                "event_type 'a2a.task.created' does not belong to any known channel"
+            )
         return super().create(**kwargs)
 
 
