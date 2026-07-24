@@ -402,8 +402,11 @@ A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
     detail = str(getattr(exc, "detail", exc))
     return (
-        getattr(exc, "status_code", None) == 422
-        and any(event_type in detail for event_type in A2A_EVENTS)
+        any(event_type in detail for event_type in A2A_EVENTS)
+        and (
+            getattr(exc, "status_code", None) == 422
+            or "does not belong to any known channel" in detail
+        )
     )
 
 
