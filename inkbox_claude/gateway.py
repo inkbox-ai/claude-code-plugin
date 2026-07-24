@@ -399,6 +399,14 @@ A2A_EVENTS = [
 A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
 
+def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
+    detail = str(getattr(exc, "detail", exc))
+    return (
+        getattr(exc, "status_code", None) == 422
+        and any(event_type in detail for event_type in A2A_EVENTS)
+    )
+
+
 def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
     char_count = len(content or "")
     return (
@@ -653,7 +661,17 @@ class InkboxGateway:
         identity_events = list(A2A_EVENTS)
         if getattr(identity, "imessage_enabled", False):
             identity_events = [*IMESSAGE_EVENTS, *identity_events]
-        _reconcile({"agent_identity_id": identity.id}, identity_events)
+        try:
+            _reconcile({"agent_identity_id": identity.id}, identity_events)
+        except Exception as exc:
+            if not _is_unsupported_a2a_event_types(exc):
+                raise
+            logger.warning(
+                "[bridge] Inkbox API does not support A2A webhook events yet; "
+                "continuing without A2A delivery until the backend is upgraded"
+            )
+            if getattr(identity, "imessage_enabled", False):
+                _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
