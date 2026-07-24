@@ -64,6 +64,7 @@ try:
         call_contexts_dir,
         inkbox_client_kwargs,
     )
+    from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
     from .prompts import contact_marker, strip_markdown
     from .realtime import (
@@ -76,6 +77,7 @@ try:
     from .webhook_providers import match_provider
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, call_contexts_dir, inkbox_client_kwargs
+    from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
     from prompts import contact_marker, strip_markdown
     from realtime import (
@@ -388,6 +390,24 @@ IMESSAGE_EVENTS = [
     "imessage.delivery_failed",
     "imessage.reaction_received",
 ]
+A2A_EVENTS = [
+    "a2a.task.created",
+    "a2a.task.message",
+    "a2a.task.canceled",
+    "a2a.sent_task.updated",
+]
+A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
+
+
+def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
+    detail = str(getattr(exc, "detail", exc))
+    return (
+        any(event_type in detail for event_type in A2A_EVENTS)
+        and (
+            getattr(exc, "status_code", None) == 422
+            or "does not belong to any known channel" in detail
+        )
+    )
 
 
 def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
@@ -474,6 +494,10 @@ class InkboxGateway:
         # delivery-failure feedback loop stops waking the agent after
         # OUTBOUND_FAILURE_MAX_ATTEMPTS. Reset on inbound / delivered / TTL.
         self._outbound_failure_state: Dict[str, Dict[str, float]] = {}
+        self._a2a_registry_path = (
+            Path.home() / ".inkbox-claude" / "a2a_tasks.json"
+        )
+        self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -528,6 +552,7 @@ class InkboxGateway:
             on_send_rejected=self._note_send_rejection,
             health_fn=self.health_report,
         )
+        await self._catch_up_a2a_tasks()
 
         logger.info(
             "[bridge] ready — %s / %s / %s → Claude Code in %s",
@@ -636,9 +661,21 @@ class InkboxGateway:
                 "[bridge] incoming-call action for %s → %s + %s",
                 self.cfg.identity, webhook_url, ws_url,
             )
+        identity_events = list(A2A_EVENTS)
         if getattr(identity, "imessage_enabled", False):
-            _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
-            logger.info("[bridge] iMessage for %s → %s", self.cfg.identity, webhook_url)
+            identity_events = [*IMESSAGE_EVENTS, *identity_events]
+        try:
+            _reconcile({"agent_identity_id": identity.id}, identity_events)
+        except Exception as exc:
+            if not _is_unsupported_a2a_event_types(exc):
+                raise
+            logger.warning(
+                "[bridge] Inkbox API does not support A2A webhook events yet; "
+                "continuing without A2A delivery until the backend is upgraded"
+            )
+            if getattr(identity, "imessage_enabled", False):
+                _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
+        logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:
         if self.sessions is not None:
@@ -787,6 +824,8 @@ class InkboxGateway:
                     response = await self._on_imessage_received(envelope)
                 elif event_type == "imessage.reaction_received":
                     response = await self._on_imessage_reaction_received(envelope)
+                elif event_type.startswith("a2a."):
+                    response = await self._on_a2a_event(envelope)
                 # Outbound delivery failures: tell the agent its message didn't
                 # land so it can retry or reach the human another way.
                 elif event_type == "text.delivery_failed":
@@ -856,7 +895,9 @@ class InkboxGateway:
         Returns:
             bool: True for a recognised Inkbox event shape.
         """
-        if event_type and event_type.startswith(("message.", "text.", "imessage.")):
+        if event_type and event_type.startswith(
+            ("message.", "text.", "imessage.", "a2a.")
+        ):
             return True
         # ``id`` by itself is not a call discriminator: generic external
         # webhook schemas commonly use a top-level event id.  Treat an
@@ -2151,6 +2192,227 @@ class InkboxGateway:
         # take a while (the agent may call/message someone).
         asyncio.create_task(self._run_external_turn(chat_id, prompt, directive))
         return web.json_response({"ok": True})
+
+    def _read_a2a_registry(self) -> Dict[str, Any]:
+        try:
+            loaded = json.loads(self._a2a_registry_path.read_text())
+            return loaded if isinstance(loaded, dict) else {}
+        except FileNotFoundError:
+            return {}
+
+    def _write_a2a_registry(
+        self,
+        key: str,
+        data: Dict[str, Any],
+        state: str,
+    ) -> None:
+        current = self._read_a2a_registry()
+        current[key] = {
+            "task_id": str(data.get("task_id") or ""),
+            "message_id": str(data.get("message_id") or ""),
+            "context_id": str(data.get("context_id") or ""),
+            "state": state,
+            "updated_at": time.time(),
+        }
+        self._a2a_registry_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._a2a_registry_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+        tmp.chmod(0o600)
+        os.replace(tmp, self._a2a_registry_path)
+        self._a2a_registry_path.chmod(0o600)
+
+    def _track_a2a_job(
+        self,
+        task_id: str,
+        registry_key: str,
+        data: Dict[str, Any],
+    ) -> None:
+        job = asyncio.create_task(self._run_a2a_turn(registry_key, data))
+        self._a2a_jobs.setdefault(task_id, set()).add(job)
+        job.add_done_callback(
+            lambda done, value=task_id: self._a2a_jobs.get(value, set()).discard(done)
+        )
+
+    @staticmethod
+    def _a2a_event_data(task: Any) -> Dict[str, Any]:
+        message = task.messages[-1] if task.messages else None
+        return {
+            "task_id": str(task.id),
+            "context_id": str(task.context_id),
+            "state": str(getattr(task.state, "value", task.state)),
+            "caller": {
+                "identity_id": str(task.caller.identity_id),
+                "organization_id": task.caller.organization_id,
+                "handle": task.caller.handle,
+            },
+            "message_id": (
+                str(message.message_id)
+                if message is not None
+                else f"task:{task.id}"
+            ),
+            "parts": message.parts if message is not None else [],
+        }
+
+    async def _on_a2a_event(
+        self,
+        envelope: Dict[str, Any],
+    ) -> "web.Response":
+        event_type = str(envelope.get("event_type") or "")
+        data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        task_id = str(data.get("task_id") or "")
+        context_id = str(data.get("context_id") or "")
+        message_id = str(data.get("message_id") or envelope.get("id") or "")
+        if not task_id or not context_id:
+            return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
+
+        if event_type == "a2a.task.canceled":
+            for job in list(self._a2a_jobs.get(task_id, set())):
+                job.cancel()
+            self._a2a_jobs.pop(task_id, None)
+            return web.json_response({"ok": True})
+        if event_type == "a2a.sent_task.updated":
+            delegation = find_a2a_delegation(task_id)
+            session_key = str((delegation or {}).get("session_key") or "")
+            if self.sessions is not None and session_key:
+                parts = data.get("parts") if isinstance(data.get("parts"), list) else []
+                text = "\n".join(
+                    str(part.get("text"))
+                    for part in parts
+                    if isinstance(part, dict) and part.get("text")
+                )
+                prompt = (
+                    f"[inkbox:a2a_sent_task_updated task_id={task_id} "
+                    f"context_id={context_id} state={data.get('state') or 'unknown'}]\n"
+                    "An A2A task you delegated changed state. Use "
+                    "inkbox_a2a_check or inkbox_a2a_reply with the stored "
+                    f"Agent Card URL {(delegation or {}).get('card_url') or 'unknown'} "
+                    "if follow-up is needed."
+                )
+                if text:
+                    prompt = f"{prompt}\n\nRemote agent message:\n{text}"
+                await self.sessions.get(session_key).handle_inbound(
+                    prompt,
+                    "external",
+                    {
+                        "a2a_task_id": task_id,
+                        "a2a_context_id": context_id,
+                    },
+                )
+            else:
+                logger.info(
+                    "[bridge] outbound A2A task updated without a local session: %s",
+                    task_id,
+                )
+            return web.json_response({"ok": True})
+
+        key = f"{task_id}:{message_id}"
+        if key in self._read_a2a_registry():
+            return web.json_response({"ok": True, "deduped": True})
+        self._write_a2a_registry(key, data, "queued")
+        self._track_a2a_job(task_id, key, data)
+        return web.json_response({"ok": True})
+
+    async def _run_a2a_turn(
+        self,
+        registry_key: str,
+        data: Dict[str, Any],
+    ) -> None:
+        task_id = str(data["task_id"])
+        context_id = str(data["context_id"])
+        caller = data.get("caller") if isinstance(data.get("caller"), dict) else {}
+        parts = data.get("parts") if isinstance(data.get("parts"), list) else []
+        text = "\n".join(
+            str(part.get("text"))
+            for part in parts
+            if isinstance(part, dict) and part.get("text")
+        )
+        marker = (
+            f"[inkbox:a2a_task caller=@{str(caller.get('handle') or 'unknown').lstrip('@')} "
+            f"caller_org={caller.get('organization_id') or 'unknown'}]"
+        )
+        context = {
+            "task_id": task_id,
+            "message_id": str(data.get("message_id") or ""),
+            "context_id": context_id,
+            "reply_intent_committed": False,
+        }
+        self._write_a2a_registry(registry_key, data, "running")
+        try:
+            if self.sessions is None:
+                return
+            session = self.sessions.get(
+                f"a2a:{self._identity.id}:{context_id}",
+                system_prompt_extra=(
+                    "You are handling an inbound A2A task. Use "
+                    "inkbox_a2a_complete, inkbox_a2a_ask_caller, or "
+                    "inkbox_a2a_fail when an explicit outcome is appropriate."
+                ),
+            )
+            reply = await session.run_consult(
+                f"{marker}\n{text}".rstrip(),
+                a2a_context=context,
+            )
+            if (
+                not context["reply_intent_committed"]
+                and reply.strip()
+                and reply.strip().upper() != "[SILENT]"
+            ):
+                authoritative = await asyncio.to_thread(
+                    self._identity.a2a_task, task_id
+                )
+                state = str(
+                    getattr(authoritative.state, "value", authoritative.state)
+                )
+                if state not in A2A_TERMINAL_STATES:
+                    await asyncio.to_thread(
+                        self._identity.a2a_reply,
+                        task_id,
+                        intent="complete",
+                        text=reply,
+                    )
+            self._write_a2a_registry(registry_key, data, "finalized")
+        except asyncio.CancelledError:
+            authoritative = await asyncio.to_thread(
+                self._identity.a2a_task, task_id
+            )
+            state = str(getattr(authoritative.state, "value", authoritative.state))
+            if state in A2A_TERMINAL_STATES:
+                self._write_a2a_registry(registry_key, data, "finalized")
+            raise
+        except Exception:
+            logger.exception("[bridge] A2A turn failed: %s", task_id)
+
+    async def _catch_up_a2a_tasks(self) -> None:
+        try:
+            for key, entry in self._read_a2a_registry().items():
+                if entry.get("state") == "finalized":
+                    continue
+                task_id = str(entry.get("task_id") or "")
+                if not task_id or self._a2a_jobs.get(task_id):
+                    continue
+                full = await asyncio.to_thread(self._identity.a2a_task, task_id)
+                state = str(getattr(full.state, "value", full.state))
+                data = self._a2a_event_data(full)
+                if state in A2A_TERMINAL_STATES:
+                    self._write_a2a_registry(key, data, "finalized")
+                else:
+                    self._track_a2a_job(task_id, key, data)
+
+            tasks = await asyncio.to_thread(
+                lambda: list(self._identity.iter_a2a_tasks(state="submitted"))
+            )
+            for task in tasks:
+                full = await asyncio.to_thread(self._identity.a2a_task, task.id)
+                data = self._a2a_event_data(full)
+                await self._on_a2a_event(
+                    {
+                        "id": f"catchup:{task.id}:{data['message_id']}",
+                        "event_type": "a2a.task.created",
+                        "data": data,
+                    }
+                )
+        except Exception:
+            logger.exception("[bridge] A2A catch-up failed")
 
     async def _run_external_turn(self, chat_id: str, prompt: str, directive: str) -> None:
         try:

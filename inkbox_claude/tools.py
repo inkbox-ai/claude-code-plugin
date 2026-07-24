@@ -14,6 +14,7 @@ import logging
 import mimetypes
 import secrets
 import time
+import uuid
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,8 +27,18 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 try:
     from .config import INKBOX_WS_PATH, call_contexts_dir
+    from .a2a_delegations import (
+        find_by_task,
+        promote_after_send,
+        record_before_send,
+    )
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import INKBOX_WS_PATH, call_contexts_dir
+    from a2a_delegations import (
+        find_by_task,
+        promote_after_send,
+        record_before_send,
+    )
 
 try:
     from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -48,6 +59,10 @@ IMESSAGE_MAX_LENGTH = 18995
 # is long-lived and its ``mode`` mutates per inbound message, giving tools a
 # live view of the conversation's channel.
 CURRENT_SESSION: ContextVar[Any] = ContextVar("inkbox_claude_current_session", default=None)
+A2A_TURN_CONTEXT: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "inkbox_claude_a2a_turn",
+    default=None,
+)
 
 
 def _mark_tool_delivery(mode: str, target: str) -> None:
@@ -729,6 +744,198 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
+    @tool(
+        "inkbox_a2a_call",
+        "Send a task to an A2A 1.0 Agent Card. Keep the returned task and "
+        "context ids for later checks or replies.",
+        {"card_url": str, "text": str, "context_id": str, "task_id": str,
+         "message_id": str},
+    )
+    async def inkbox_a2a_call(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            identity = _identity()
+            a2a = identity.a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                message_id = str(args.get("message_id") or uuid.uuid4())
+                session = CURRENT_SESSION.get()
+                pending_key = record_before_send(
+                    identity_id=str(identity.id),
+                    rpc_url=str(
+                        getattr(target, "rpc_url", None)
+                        or target["rpc_url"]
+                    ),
+                    card_url=str(args["card_url"]),
+                    message_id=message_id,
+                    context_id=args.get("context_id") or None,
+                    task_id=args.get("task_id") or None,
+                    session_key=getattr(session, "chat_id", None),
+                )
+                result = a2a.send(
+                    target,
+                    text=str(args["text"]),
+                    context_id=args.get("context_id") or None,
+                    task_id=args.get("task_id") or None,
+                    message_id=message_id,
+                )
+                task = getattr(result, "task", None)
+                if task is None and isinstance(result, dict):
+                    task = result.get("task")
+                task_id = getattr(task, "id", None)
+                context_id = getattr(task, "context_id", None)
+                if isinstance(task, dict):
+                    task_id = task.get("id")
+                    context_id = task.get("context_id") or task.get("contextId")
+                if task_id and context_id:
+                    promote_after_send(
+                        pending_key,
+                        context_id=str(context_id),
+                        task_id=str(task_id),
+                    )
+                return result
+            finally:
+                a2a.close()
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_a2a_check",
+        "Fetch an A2A task, or wait until it reaches a final or input-required state.",
+        {"card_url": str, "task_id": str, "wait": bool},
+    )
+    async def inkbox_a2a_check(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            a2a = _identity().a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                if args.get("wait"):
+                    return a2a.wait(target, str(args["task_id"]))
+                return a2a.get_task(target, str(args["task_id"]))
+            finally:
+                a2a.close()
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_a2a_reply",
+        "Reply to a remote A2A task that requested more input.",
+        {"card_url": str, "task_id": str, "text": str, "message_id": str},
+    )
+    async def inkbox_a2a_reply(args: Dict[str, Any]) -> Dict[str, Any]:
+        def _run():
+            identity = _identity()
+            a2a = identity.a2a_client()
+            try:
+                target = a2a.fetch_card(str(args["card_url"]))
+                task_id = str(args["task_id"])
+                existing = find_by_task(task_id) or {}
+                message_id = str(args.get("message_id") or uuid.uuid4())
+                session = CURRENT_SESSION.get()
+                pending_key = record_before_send(
+                    identity_id=str(identity.id),
+                    rpc_url=str(
+                        getattr(target, "rpc_url", None)
+                        or target["rpc_url"]
+                    ),
+                    card_url=str(args["card_url"]),
+                    message_id=message_id,
+                    context_id=existing.get("context_id"),
+                    task_id=task_id,
+                    session_key=(
+                        getattr(session, "chat_id", None)
+                        or existing.get("session_key")
+                    ),
+                )
+                result = a2a.send(
+                    target,
+                    task_id=task_id,
+                    text=str(args["text"]),
+                    message_id=message_id,
+                )
+                task = getattr(result, "task", None)
+                if task is None and isinstance(result, dict):
+                    task = result.get("task")
+                context_id = getattr(task, "context_id", None)
+                if isinstance(task, dict):
+                    context_id = task.get("context_id") or task.get("contextId")
+                if context_id:
+                    promote_after_send(
+                        pending_key,
+                        context_id=str(context_id),
+                        task_id=task_id,
+                    )
+                return result
+            finally:
+                a2a.close()
+
+        try:
+            return _result(await asyncio.to_thread(_run))
+        except Exception as exc:
+            return _error(str(exc))
+
+    def _a2a_intent(intent: str, text: str) -> Any:
+        context = A2A_TURN_CONTEXT.get()
+        if context is None:
+            raise RuntimeError("This tool is only available during an inbound A2A task")
+        result = _identity().a2a_reply(
+            context["task_id"],
+            intent=intent,
+            text=text,
+        )
+        context["reply_intent_committed"] = True
+        return result
+
+    @tool(
+        "inkbox_a2a_complete",
+        "Complete the active inbound A2A task with a final answer.",
+        {"text": str},
+    )
+    async def inkbox_a2a_complete(args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _result(
+                await asyncio.to_thread(
+                    _a2a_intent, "complete", str(args["text"])
+                )
+            )
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_a2a_ask_caller",
+        "Ask the caller for more input on the active inbound A2A task.",
+        {"text": str},
+    )
+    async def inkbox_a2a_ask_caller(args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _result(
+                await asyncio.to_thread(
+                    _a2a_intent, "ask_caller", str(args["text"])
+                )
+            )
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_a2a_fail",
+        "Fail the active inbound A2A task with a reason.",
+        {"reason": str},
+    )
+    async def inkbox_a2a_fail(args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _result(
+                await asyncio.to_thread(
+                    _a2a_intent, "fail", str(args["reason"])
+                )
+            )
+        except Exception as exc:
+            return _error(str(exc))
+
     tools = [
         inkbox_whoami,
         inkbox_send_email,
@@ -747,6 +954,12 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_create_contact,
         inkbox_update_contact,
         inkbox_delete_contact,
+        inkbox_a2a_call,
+        inkbox_a2a_check,
+        inkbox_a2a_reply,
+        inkbox_a2a_complete,
+        inkbox_a2a_ask_caller,
+        inkbox_a2a_fail,
     ]
     server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
     tool_names = [
@@ -767,5 +980,11 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_create_contact",
         "mcp__inkbox__inkbox_update_contact",
         "mcp__inkbox__inkbox_delete_contact",
+        "mcp__inkbox__inkbox_a2a_call",
+        "mcp__inkbox__inkbox_a2a_check",
+        "mcp__inkbox__inkbox_a2a_reply",
+        "mcp__inkbox__inkbox_a2a_complete",
+        "mcp__inkbox__inkbox_a2a_ask_caller",
+        "mcp__inkbox__inkbox_a2a_fail",
     ]
     return server, tool_names
