@@ -635,16 +635,34 @@ class InkboxGateway:
         ws_url = f"wss://{self._public_host}{INKBOX_WS_PATH}"
         identity = self._inkbox.get_identity(self.cfg.identity)
 
-        def _reconcile(owner_kw: Dict[str, Any], event_types: List[str]) -> None:
+        def _reconcile(
+            owner_kw: Dict[str, Any],
+            event_types: List[str],
+            *,
+            subscription_url: str = webhook_url,
+        ) -> None:
             existing = self._inkbox.webhooks.subscriptions.list(**owner_kw)
+            desired_families = {
+                event_type.split(".", 1)[0] for event_type in event_types
+            }
             for sub in existing:
-                if sub.url == webhook_url and set(sub.event_types) == set(event_types):
+                if (
+                    sub.url == subscription_url
+                    and set(sub.event_types) == set(event_types)
+                ):
                     return  # already wired
-                if sub.url.endswith(DEFAULT_WEBHOOK_PATH):
-                    # A previous bridge install — replace it.
+                existing_families = {
+                    event_type.split(".", 1)[0] for event_type in sub.event_types
+                }
+                if (
+                    sub.url.split("?", 1)[0].endswith(DEFAULT_WEBHOOK_PATH)
+                    and desired_families & existing_families
+                ):
+                    # Replace only this event channel. One identity may have
+                    # separate iMessage and A2A subscriptions at the same URL.
                     self._inkbox.webhooks.subscriptions.delete(sub.id)
             self._inkbox.webhooks.subscriptions.create(
-                url=webhook_url, event_types=event_types, **owner_kw
+                url=subscription_url, event_types=event_types, **owner_kw
             )
 
         if identity.mailbox is not None:
@@ -682,11 +700,12 @@ class InkboxGateway:
                 "[bridge] incoming-call action for %s → %s + %s",
                 self.cfg.identity, webhook_url, ws_url,
             )
-        identity_events = list(A2A_EVENTS)
-        if getattr(identity, "imessage_enabled", False):
-            identity_events = [*IMESSAGE_EVENTS, *identity_events]
         try:
-            _reconcile({"agent_identity_id": identity.id}, identity_events)
+            _reconcile(
+                {"agent_identity_id": identity.id},
+                A2A_EVENTS,
+                subscription_url=f"{webhook_url}?channel=a2a",
+            )
         except Exception as exc:
             if not _is_unsupported_a2a_event_types(exc):
                 raise
@@ -694,8 +713,8 @@ class InkboxGateway:
                 "[bridge] Inkbox API does not support A2A webhook events yet; "
                 "continuing without A2A delivery until the backend is upgraded"
             )
-            if getattr(identity, "imessage_enabled", False):
-                _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
+        if getattr(identity, "imessage_enabled", False):
+            _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     async def _cleanup(self) -> None:

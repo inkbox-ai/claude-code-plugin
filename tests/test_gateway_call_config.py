@@ -160,6 +160,23 @@ def test_a2a_subscription_falls_back_to_imessage_on_older_api():
     assert subscriptions.created[-1]["event_types"] == gateway.IMESSAGE_EVENTS
 
 
+def test_a2a_and_imessage_use_channel_coherent_subscriptions():
+    subscriptions = _FakeSubscriptions()
+    _patched_gateway(
+        _Identity(phone=None, imessage_enabled=True),
+        subscriptions=subscriptions,
+    )
+
+    assert [created["event_types"] for created in subscriptions.created] == [
+        gateway.A2A_EVENTS,
+        gateway.IMESSAGE_EVENTS,
+    ]
+    assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.example/webhook?channel=a2a",
+        "https://agent.example/webhook",
+    ]
+
+
 def test_a2a_only_subscription_is_skipped_on_older_api():
     subscriptions = _UnsupportedA2ASubscriptions()
     _patched_gateway(
