@@ -879,6 +879,71 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         except Exception as exc:
             return _error(str(exc))
 
+    def _a2a_history_options(args: Dict[str, Any], *, messages: bool) -> Dict[str, Any]:
+        limit = int(args.get("limit") or 50)
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        options: Dict[str, Any] = {
+            "direction": str(args.get("direction") or "").strip() or None,
+            "requester_handle": str(args.get("requester_handle") or "").strip() or None,
+            "worker_handle": str(args.get("worker_handle") or "").strip() or None,
+            "context_id": str(args.get("context_id") or "").strip() or None,
+            "q": str(args.get("query") or "").strip() or None,
+            "since": str(args.get("since") or "").strip() or None,
+            "cursor": str(args.get("cursor") or "").strip() or None,
+            "limit": limit,
+        }
+        if messages:
+            options["task_id"] = str(args.get("task_id") or "").strip() or None
+            options["role"] = str(args.get("role") or "").strip() or None
+        else:
+            options["state"] = str(args.get("state") or "").strip() or None
+        return options
+
+    @tool(
+        "inkbox_list_a2a_tasks",
+        "List this identity's A2A task history with optional direction, "
+        "participant, state, context, keyword, timestamp, and cursor filters. "
+        "Direction defaults to inbound.",
+        {
+            "direction": str, "requester_handle": str, "worker_handle": str,
+            "state": str, "context_id": str, "query": str, "since": str,
+            "cursor": str, "limit": int,
+        },
+    )
+    async def inkbox_list_a2a_tasks(args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _result(
+                await asyncio.to_thread(
+                    _identity().a2a_tasks,
+                    **_a2a_history_options(args, messages=False),
+                )
+            )
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_list_a2a_messages",
+        "List messages from this identity's inbound and outbound A2A history "
+        "with optional participant, task, context, role, keyword, timestamp, "
+        "and cursor filters.",
+        {
+            "direction": str, "requester_handle": str, "worker_handle": str,
+            "task_id": str, "context_id": str, "role": str, "query": str,
+            "since": str, "cursor": str, "limit": int,
+        },
+    )
+    async def inkbox_list_a2a_messages(args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _result(
+                await asyncio.to_thread(
+                    _identity().a2a_messages,
+                    **_a2a_history_options(args, messages=True),
+                )
+            )
+        except Exception as exc:
+            return _error(str(exc))
+
     def _a2a_intent(intent: str, text: str) -> Any:
         context = A2A_TURN_CONTEXT.get()
         if context is None:
@@ -957,6 +1022,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_a2a_call,
         inkbox_a2a_check,
         inkbox_a2a_reply,
+        inkbox_list_a2a_tasks,
+        inkbox_list_a2a_messages,
         inkbox_a2a_complete,
         inkbox_a2a_ask_caller,
         inkbox_a2a_fail,
@@ -983,6 +1050,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "mcp__inkbox__inkbox_a2a_call",
         "mcp__inkbox__inkbox_a2a_check",
         "mcp__inkbox__inkbox_a2a_reply",
+        "mcp__inkbox__inkbox_list_a2a_tasks",
+        "mcp__inkbox__inkbox_list_a2a_messages",
         "mcp__inkbox__inkbox_a2a_complete",
         "mcp__inkbox__inkbox_a2a_ask_caller",
         "mcp__inkbox__inkbox_a2a_fail",

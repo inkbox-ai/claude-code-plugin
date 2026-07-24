@@ -76,6 +76,7 @@ class _FakeIdentity:
         self.sent_imessages = []
         self.a2a = _FakeA2AClient()
         self.a2a_replies = []
+        self.a2a_history_calls = []
 
     def place_call(self, **kwargs):
         self.place_call_kwargs = kwargs
@@ -112,6 +113,14 @@ class _FakeIdentity:
     def a2a_reply(self, task_id, **kwargs):
         self.a2a_replies.append((task_id, kwargs))
         return {"id": task_id, "state": kwargs["intent"]}
+
+    def a2a_tasks(self, **kwargs):
+        self.a2a_history_calls.append(("tasks", kwargs))
+        return {"items": [{"id": "task-1"}], "next_cursor": "task-next"}
+
+    def a2a_messages(self, **kwargs):
+        self.a2a_history_calls.append(("messages", kwargs))
+        return {"items": [{"id": "message-1"}], "next_cursor": "message-next"}
 
 
 class _FakeA2AClient:
@@ -207,6 +216,8 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_a2a_call",
         "inkbox_a2a_check",
         "inkbox_a2a_reply",
+        "inkbox_list_a2a_tasks",
+        "inkbox_list_a2a_messages",
         "inkbox_a2a_complete",
         "inkbox_a2a_ask_caller",
         "inkbox_a2a_fail",
@@ -261,6 +272,78 @@ def test_a2a_tools_send_check_and_reply():
         "task-1",
     ) in client.identity.a2a.calls
     assert client.identity.a2a.closed is True
+
+
+def test_a2a_history_tools_forward_filters_and_pagination():
+    client = _FakeClient()
+    tasks = _call(
+        client,
+        "inkbox_list_a2a_tasks",
+        {
+            "direction": "both",
+            "requester_handle": "requester",
+            "worker_handle": "worker",
+            "state": "completed",
+            "context_id": "context-1",
+            "query": "summary",
+            "since": "2026-07-01T00:00:00Z",
+            "cursor": "task-cursor",
+            "limit": 3,
+        },
+    )
+    messages = _call(
+        client,
+        "inkbox_list_a2a_messages",
+        {
+            "direction": "outbound",
+            "requester_handle": "requester",
+            "worker_handle": "worker",
+            "task_id": "task-1",
+            "context_id": "context-1",
+            "role": "agent",
+            "query": "done",
+            "since": "2026-07-01T00:00:00Z",
+            "cursor": "message-cursor",
+            "limit": 4,
+        },
+    )
+
+    assert tasks["next_cursor"] == "task-next"
+    assert messages["next_cursor"] == "message-next"
+    assert client.identity.a2a_history_calls == [
+        (
+            "tasks",
+            {
+                "direction": "both",
+                "requester_handle": "requester",
+                "worker_handle": "worker",
+                "context_id": "context-1",
+                "q": "summary",
+                "since": "2026-07-01T00:00:00Z",
+                "cursor": "task-cursor",
+                "limit": 3,
+                "state": "completed",
+            },
+        ),
+        (
+            "messages",
+            {
+                "direction": "outbound",
+                "requester_handle": "requester",
+                "worker_handle": "worker",
+                "context_id": "context-1",
+                "q": "done",
+                "since": "2026-07-01T00:00:00Z",
+                "cursor": "message-cursor",
+                "limit": 4,
+                "task_id": "task-1",
+                "role": "agent",
+            },
+        ),
+    ]
+
+    invalid = _call(client, "inkbox_list_a2a_tasks", {"limit": 101})
+    assert invalid["error"] == "limit must be between 1 and 100"
 
 
 def test_a2a_intent_tools_require_trusted_turn_context():
