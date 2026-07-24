@@ -27,7 +27,9 @@ jobs:
 
       - name: Install bridge + latest SDK
         run: |
-          pip install -e . pytest
+          pip install \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@fdea6e55ac117f246624852aedeef0feabe08b9a#subdirectory=sdk/python" \
+            -e . pytest
           pip install -U claude-agent-sdk
 
       - name: Install latest Claude Code CLI

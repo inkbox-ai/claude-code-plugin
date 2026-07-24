@@ -56,7 +56,10 @@ jobs:
       # uvicorn[standard] matters: the bare install can't accept WebSocket
       # upgrades, and the driver's call-media endpoint is a WebSocket.
       - name: Install bridge + driver deps
-        run: pip install -e . pytest fastapi 'uvicorn[standard]'
+        run: |
+          pip install \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@fdea6e55ac117f246624852aedeef0feabe08b9a#subdirectory=sdk/python" \
+            -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code
