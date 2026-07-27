@@ -159,10 +159,11 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     Returns:
         str: ``text`` prefixed with a one-line bracketed channel tag.
     """
-    if text.lstrip().startswith("[inkbox:"):
-        return text
-
     meta = meta or {}
+    webhook_context = str(meta.get("webhook_context") or "").strip()
+    if text.lstrip().startswith("[inkbox:"):
+        return f"{text}\n\n{webhook_context}" if webhook_context else text
+
     sender = str(meta.get("sender") or "").strip()
     from_part = f" from={sender}" if sender else ""
     marker = contact_marker(meta.get("contact"), meta.get("agent_identity"))
@@ -185,6 +186,8 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
         header = f"[inkbox:voice_call{call_part} | {marker}]"
     else:
         header = f"[inkbox:{mode}{from_part} | {marker}]"
+    if webhook_context:
+        return f"{header}\n\n{text}\n\n{webhook_context}"
     return f"{header}\n{text}"
 
 
