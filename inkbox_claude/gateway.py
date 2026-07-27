@@ -90,6 +90,27 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 logger = logging.getLogger(__name__)
 
 
+def _webhook_mail_body(message: Dict[str, Any]) -> str:
+    """Body text carried by the webhook, with a notice when it is a prefix.
+
+    Falls back to the 200-char snippet for payloads that carry no body.
+    """
+    body = str(message.get("body") or "")
+    if not body.strip():
+        return str(message.get("snippet") or "")
+    if str(message.get("body_state") or "") != "truncated":
+        return body
+    total = message.get("body_total_chars")
+    included = message.get("body_included_chars")
+    msg_id = str(message.get("id") or "")
+    counts = f"{included} of {total} characters" if total and included else "part"
+    return (
+        f"{body}\n\n[inkbox: this email was too long to deliver in full. "
+        f"You are seeing {counts}."
+        + (f" Fetch email {msg_id} to read the rest.]" if msg_id else "]")
+    )
+
+
 def _format_transcript(transcript: Any, limit: int = 30) -> str:
     """Render the last ``limit`` (role, text) turns as plain lines."""
     rows = list(transcript or [])[-limit:]
@@ -1250,7 +1271,11 @@ class InkboxGateway:
         return await download_media(items, prefix=f"mail-{msg_id}")
 
     def _fetch_mail_body(self, message: Dict[str, Any]) -> str:
-        # The webhook only carries a snippet; pull the full body when we can.
+        # message.received carries the body, so the common case needs no
+        # round-trip; only a truncated or absent body is worth fetching.
+        body = str(message.get("body") or "")
+        if body.strip() and str(message.get("body_state") or "") != "truncated":
+            return body
         try:
             detail = self._identity.get_message(str(message.get("id")))
             for attr in ("body_text", "text_body", "body"):
@@ -1258,8 +1283,8 @@ class InkboxGateway:
                 if value:
                     return str(value)
         except Exception:
-            logger.debug("[bridge] full-body fetch failed; using snippet", exc_info=True)
-        return str(message.get("snippet") or "")
+            logger.debug("[bridge] full-body fetch failed; using the webhook body", exc_info=True)
+        return _webhook_mail_body(message)
 
     async def _lookup_text_conversation_summary(self, conversation_id: str) -> Any:
         if not conversation_id:
