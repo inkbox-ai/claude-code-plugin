@@ -12,14 +12,33 @@ from inkbox_claude.config import BridgeConfig
 
 
 class _FakeSubscriptions:
-    def __init__(self):
+    def __init__(self, existing=()):
         self.created = []
+        self.existing = list(existing)
+        self.deleted = []
 
     def list(self, **_owner):
-        return []
+        return list(self.existing)
 
     def create(self, **kwargs):
         self.created.append(kwargs)
+
+    def delete(self, sub_id):
+        self.deleted.append(sub_id)
+
+
+class _UnsupportedA2ASubscriptions(_FakeSubscriptions):
+    def __init__(self):
+        super().__init__()
+        self.attempted = []
+
+    def create(self, **kwargs):
+        self.attempted.append(kwargs)
+        if any(event.startswith("a2a.") for event in kwargs["event_types"]):
+            raise ValueError(
+                "event_type 'a2a.task.created' does not belong to any known channel"
+            )
+        return super().create(**kwargs)
 
 
 class _FakePhoneNumbers:
@@ -31,9 +50,11 @@ class _FakePhoneNumbers:
 
 
 class _FakeInkbox:
-    def __init__(self, identity):
+    def __init__(self, identity, subscriptions=None):
         self._identity = identity
-        self.webhooks = types.SimpleNamespace(subscriptions=_FakeSubscriptions())
+        self.webhooks = types.SimpleNamespace(
+            subscriptions=subscriptions or _FakeSubscriptions()
+        )
         self.phone_numbers = _FakePhoneNumbers()
 
     def get_identity(self, _handle):
@@ -70,9 +91,9 @@ def _phone():
     return types.SimpleNamespace(id="phone-1", number="+15550001111")
 
 
-def _patched_gateway(identity):
+def _patched_gateway(identity, subscriptions=None):
     gw = gateway.InkboxGateway(BridgeConfig(identity="claude", require_signature=False))
-    gw._inkbox = _FakeInkbox(identity)
+    gw._inkbox = _FakeInkbox(identity, subscriptions)
     gw._public_url = "https://agent.example"
     gw._public_host = "agent.example"
     gw._patch_identity_objects()
@@ -132,3 +153,56 @@ def test_legacy_sdk_cannot_configure_imessage_only_identity():
     gw = _patched_gateway(identity)
 
     assert gw._inkbox.phone_numbers.updated == []
+
+
+def test_a2a_subscription_falls_back_to_imessage_on_older_api():
+    subscriptions = _UnsupportedA2ASubscriptions()
+    _patched_gateway(
+        _Identity(phone=None, imessage_enabled=True),
+        subscriptions=subscriptions,
+    )
+
+    assert subscriptions.created[-1]["event_types"] == gateway.IMESSAGE_EVENTS
+
+
+def test_a2a_and_imessage_use_channel_coherent_subscriptions():
+    subscriptions = _FakeSubscriptions()
+    _patched_gateway(
+        _Identity(phone=None, imessage_enabled=True),
+        subscriptions=subscriptions,
+    )
+
+    assert [created["event_types"] for created in subscriptions.created] == [
+        gateway.A2A_EVENTS,
+        gateway.IMESSAGE_EVENTS,
+    ]
+    assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.example/webhook?channel=a2a",
+        "https://agent.example/webhook",
+    ]
+
+
+def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
+    a2a = types.SimpleNamespace(
+        id="sub-a2a",
+        url="https://agent.example/webhook?channel=a2a",
+        event_types=gateway.A2A_EVENTS,
+    )
+    subscriptions = _FakeSubscriptions([a2a])
+    _patched_gateway(
+        _Identity(phone=None, imessage_enabled=True),
+        subscriptions=subscriptions,
+    )
+
+    assert subscriptions.deleted == []
+    assert subscriptions.created[-1]["event_types"] == gateway.IMESSAGE_EVENTS
+
+
+def test_a2a_only_subscription_is_skipped_on_older_api():
+    subscriptions = _UnsupportedA2ASubscriptions()
+    _patched_gateway(
+        _Identity(phone=None, imessage_enabled=False),
+        subscriptions=subscriptions,
+    )
+
+    assert subscriptions.created == []

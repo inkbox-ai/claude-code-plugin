@@ -1,0 +1,118 @@
+name: Live — Agent2Agent
+
+# Four real protocol legs cover both roles and conversation lengths:
+# inbound/outbound × single-turn/multi-turn. The plugin and remote identities
+# are preconfigured to allow one another in both directions.
+on:
+  workflow_call:
+    inputs:
+      timeout_s:
+        description: "Seconds to wait for each A2A transition"
+        required: false
+        type: string
+        default: "300"
+      orchestrated:
+        description: "True when the full-stack workflow owns the shared live lock"
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      timeout_s:
+        description: "Seconds to wait for each A2A transition"
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.orchestrated && format('inkbox-live-child-{0}', github.run_id) || 'inkbox-live-aut-tunnel' }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  a2a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        scenario:
+          - inbound-single
+          - inbound-multi
+          - outbound-single
+          - outbound-multi
+    env:
+      INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
+      CLAUDE_PROJECT_DIR: ${{ github.workspace }}
+      INKBOX_PERMISSION_TIMEOUT_S: "30"
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install bridge and protocol driver
+        run: pip install -e .
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Configure the real model and AUT identity
+        env:
+          ANTHROPIC_API_KEY_VALUE: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          HANDLE=$(python3 - <<'PY'
+          import os
+          from inkbox import Inkbox
+          client = Inkbox(api_key=os.environ["INKBOX_API_KEY"])
+          print(client.mailboxes.list()[0].email_address.split("@", 1)[0])
+          PY
+          )
+          {
+            echo "INKBOX_IDENTITY=$HANDLE"
+            echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_VALUE"
+          } >> "$GITHUB_ENV"
+
+      - name: Start bridge gateway
+        run: |
+          nohup inkbox-claude run > "$RUNNER_TEMP/gateway.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/gateway.pid"
+          for _ in $(seq 1 36); do
+            grep -q "\[bridge\] ready" "$RUNNER_TEMP/gateway.log" && exit 0
+            if ! kill -0 "$(cat "$RUNNER_TEMP/gateway.pid")" 2>/dev/null; then
+              echo "::error::gateway exited during startup"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::gateway did not become ready"
+          exit 1
+
+      - name: Run ${{ matrix.scenario }}
+        env:
+          A2A_SCENARIO: ${{ matrix.scenario }}
+          A2A_TIMEOUT_S: ${{ inputs.timeout_s || '300' }}
+          AUT_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+          REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+        run: python3 tests/live/a2a_driver.py
+
+      - name: Dump gateway log on failure
+        if: failure()
+        run: tail -n 300 "$RUNNER_TEMP/gateway.log" 2>/dev/null || true
+
+      - name: Stop bridge gateway
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/gateway.pid" 2>/dev/null)" 2>/dev/null || true
