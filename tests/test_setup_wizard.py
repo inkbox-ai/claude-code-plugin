@@ -1,3 +1,4 @@
+import os
 import sys
 import types
 
@@ -827,6 +828,7 @@ def _patch_daemon(monkeypatch, *, pid, calls):
     daemon.start = lambda: (calls.append("start"), 0)[1]
     daemon.restart = lambda: (calls.append("restart"), 0)[1]
     daemon.install_autostart = lambda _env_file: calls.append("install_autostart") or False
+    daemon.state_dir = lambda: __import__("pathlib").Path(os.environ.get("INKBOX_CLAUDE_HOME", "/tmp"))
     monkeypatch.setitem(sys.modules, "inkbox_claude.daemon", daemon)
     monkeypatch.setattr(setup_wizard, "_confirm_bridge_running", lambda *_a, **_k: True)
     return daemon
