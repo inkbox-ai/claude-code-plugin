@@ -50,6 +50,12 @@ STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json"
 TIMEOUT_S = float(os.environ.get("LIVE_VOICE_TIMEOUT", "220"))
 POLL_EVERY_S = 6.0
 TERMINAL_FAILURE_STATUSES = {"canceled", "failed"}
+# A call can end normally and still never carry a conversation - answering-machine
+# detection hanging up on the driver ends it `completed`, hangup_reason=voicemail.
+# Transcript rows can still land during teardown, so allow a short grace period
+# before giving up rather than polling a finished call for the full timeout.
+ENDED_STATUSES = {"completed"}
+ENDED_GRACE_S = float(os.environ.get("LIVE_VOICE_ENDED_GRACE", "15"))
 
 pytestmark = pytest.mark.skipif(
     not (REMOTE_KEY and AUT_KEY and REAL),
@@ -106,6 +112,7 @@ def _wait_for_two_way_call(remote, number_id, call_id):
     """Block until the call transcript shows BOTH the agent and the driver spoke."""
     deadline = time.monotonic() + TIMEOUT_S
     last = ""
+    ended_at = None
     while time.monotonic() < deadline:
         transcript_state = ""
         try:
@@ -125,6 +132,11 @@ def _wait_for_two_way_call(remote, number_id, call_id):
         last = f"{progress}; {state}"
         if status in TERMINAL_FAILURE_STATUSES:
             pytest.fail(f"call ended before a two-way conversation ({last})")
+        if status in ENDED_STATUSES:
+            if ended_at is None:
+                ended_at = time.monotonic()
+            elif time.monotonic() - ended_at > ENDED_GRACE_S:
+                pytest.fail(f"call ended without a two-way conversation ({last})")
         time.sleep(POLL_EVERY_S)
     pytest.fail(f"agent never held a two-way call within {TIMEOUT_S:.0f}s ({last})")
 
