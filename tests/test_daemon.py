@@ -1,4 +1,5 @@
 import os
+import time
 
 from inkbox_claude import cli, daemon
 
@@ -199,3 +200,34 @@ def test_running_pid_mirrors_the_pid_probe(tmp_path, monkeypatch):
 
     daemon._pid_file().write_text(f"{os.getpid()}\n")
     assert daemon.running_pid() == os.getpid()
+
+
+def test_read_pid_does_not_report_a_zombie_child_as_alive(tmp_path, monkeypatch):
+    # `start` forks the gateway from the launching process, so a crashed bridge
+    # stays a zombie under it — and os.kill(pid, 0) succeeds on a zombie. This
+    # is what let a dead bridge print a "started successfully" banner.
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(1)  # the bridge crashing on a bad bind
+    time.sleep(0.3)
+
+    daemon._pid_file().write_text(f"{pid}\n")
+    assert daemon._read_pid() is None
+    assert not daemon._pid_file().exists()
+
+
+def test_read_pid_still_reports_a_live_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(5)
+        os._exit(0)
+    try:
+        daemon._pid_file().write_text(f"{pid}\n")
+        assert daemon._read_pid() == pid
+    finally:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)

@@ -52,6 +52,29 @@ def _log_file() -> Path:
     return _state_dir() / "gateway.log"
 
 
+def _exited_as_our_child(pid: int) -> bool:
+    """Reap ``pid`` if it is our own child and has already exited.
+
+    ``start`` forks the gateway from whatever process launched it, so a crashed
+    gateway stays a zombie until that parent waits on it - and ``os.kill(pid, 0)``
+    succeeds on a zombie. Without this reap, a dead bridge probes as alive for as
+    long as the launching process lives, which no amount of extra waiting fixes.
+
+    Args:
+        pid (int): PID recorded in the PID file.
+
+    Returns:
+        bool: True when the process was our child and has exited. False when it
+        is still running, or is not our child at all (a separate ``status`` or
+        ``stop`` invocation), in which case the signal probe is authoritative.
+    """
+    try:
+        reaped, _status = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError, AttributeError):
+        return False
+    return reaped == pid
+
+
 def _read_pid() -> int | None:
     """Return the PID of a live daemon, or None (clearing a stale PID file).
 
@@ -61,6 +84,9 @@ def _read_pid() -> int | None:
     try:
         pid = int(_pid_file().read_text().strip())
     except (FileNotFoundError, ValueError):
+        return None
+    if _exited_as_our_child(pid):
+        _pid_file().unlink(missing_ok=True)  # crashed under us — not a live pid
         return None
     try:
         os.kill(pid, 0)  # signal 0 just probes liveness
