@@ -1616,9 +1616,22 @@ def _configure_autostart() -> None:
     print_info("  The bridge has to stay running to receive your messages and reply.")
 
     try:
-        from .daemon import install_autostart, start as daemon_start
+        from .daemon import install_autostart, restart as daemon_restart, running_pid
+        from .daemon import start as daemon_start
     except ImportError:  # pragma: no cover - direct local import/test fallback
-        from daemon import install_autostart, start as daemon_start
+        from daemon import install_autostart, restart as daemon_restart, running_pid
+        from daemon import start as daemon_start
+
+    def bring_up() -> None:
+        # `start` no-ops on a live PID, so a rerun would leave the bridge on
+        # the .env this wizard just replaced. Restart it instead.
+        pid = running_pid()
+        if pid:
+            print_info(f"  A background bridge is already running (pid {pid}) on the old config.")
+            print_info("  Restarting it so it picks up the new settings.")
+            daemon_restart()
+            return
+        daemon_start()
 
     env_file = str(_env_file_path().resolve())
 
@@ -1626,11 +1639,11 @@ def _configure_autostart() -> None:
         if install_autostart(env_file):
             return
         print_warning("  Couldn't set up boot autostart — starting in the background for now.")
-        daemon_start()
+        bring_up()
         return
 
     if prompt_yes_no("  Start it in the background now (until you reboot)?", True):
-        daemon_start()
+        bring_up()
         return
 
     print_info("  Start it yourself anytime with:  inkbox-claude start")

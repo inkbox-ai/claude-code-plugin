@@ -1,3 +1,4 @@
+import sys
 import types
 
 import pytest
@@ -812,3 +813,67 @@ def test_wizard_walks_imessage_before_dedicated_number(tmp_path, monkeypatch):
     # No number was provisioned this run, so the START wait never blocks.
     assert "sms_opt_in" not in order
     assert seen["imessage_enabled"] is True
+
+
+# ----------------------------------------------------------------------
+# Keeping the bridge running
+# ----------------------------------------------------------------------
+
+
+def _patch_daemon(monkeypatch, *, pid, calls):
+    """Stub the daemon module the autostart step imports lazily."""
+    daemon = types.ModuleType("daemon")
+    daemon.running_pid = lambda: pid
+    daemon.start = lambda: calls.append("start") or 0
+    daemon.restart = lambda: calls.append("restart") or 0
+    daemon.install_autostart = lambda _env_file: calls.append("install_autostart") or False
+    monkeypatch.setitem(sys.modules, "inkbox_claude.daemon", daemon)
+    return daemon
+
+
+def test_background_start_restarts_an_already_running_bridge(monkeypatch, capsys):
+    calls = []
+    _patch_daemon(monkeypatch, pid=4242, calls=calls)
+    # Decline boot autostart, accept the background start.
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    setup_wizard._configure_autostart()
+
+    # A live bridge is still on the old .env — starting it again would no-op.
+    assert calls == ["restart"]
+    assert "pid 4242" in capsys.readouterr().out
+
+
+def test_background_start_starts_when_nothing_is_running(monkeypatch):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    setup_wizard._configure_autostart()
+
+    assert calls == ["start"]
+
+
+def test_autostart_fallback_also_restarts_a_live_bridge(monkeypatch):
+    # install_autostart() fails, so the step falls back to a background run —
+    # which must reload a bridge that is already up, not no-op on it.
+    calls = []
+    _patch_daemon(monkeypatch, pid=99, calls=calls)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: True)
+
+    setup_wizard._configure_autostart()
+
+    assert calls == ["install_autostart", "restart"]
+
+
+def test_declining_both_offers_starts_nothing(monkeypatch, capsys):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: False)
+
+    setup_wizard._configure_autostart()
+
+    assert calls == []
+    assert "inkbox-claude start" in capsys.readouterr().out

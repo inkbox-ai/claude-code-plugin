@@ -210,6 +210,18 @@ def stop() -> int:
     return 0
 
 
+def running_pid() -> int | None:
+    """Return the PID of the background gateway, or None when it is not running.
+
+    Public wrapper over the PID-file probe so callers outside this module can
+    ask "is one already up?" without reaching for a private helper.
+
+    Returns:
+        int | None: Live background gateway PID, else None.
+    """
+    return _read_pid()
+
+
 def status() -> int:
     """Report whether the background gateway is running.
 

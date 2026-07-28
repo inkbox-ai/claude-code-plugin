@@ -191,3 +191,11 @@ def test_cli_routes_daemon_commands(monkeypatch):
     for cmd in ("run", "start", "stop", "restart", "status"):
         assert cli.main([cmd]) == 0
     assert calls == ["run", "start", "stop", "restart", "status"]
+
+
+def test_running_pid_mirrors_the_pid_probe(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    assert daemon.running_pid() is None
+
+    daemon._pid_file().write_text(f"{os.getpid()}\n")
+    assert daemon.running_pid() == os.getpid()
