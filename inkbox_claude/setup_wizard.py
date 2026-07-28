@@ -1605,11 +1605,12 @@ def _configure_project_dir() -> None:
     print_success(f"  Claude Code will work in {chosen}")
 
 
-def _configure_autostart() -> None:
+def _configure_autostart() -> bool:
     """Offer to keep the gateway running — on boot, or just in the background.
 
     Returns:
-        None
+        bool: True when a bridge is running by the time this returns, so the
+        caller can close on a status banner instead of a to-do list.
     """
     print()
     print(color("  --- Keep the bridge running ---", Colors.CYAN))
@@ -1622,36 +1623,62 @@ def _configure_autostart() -> None:
         from daemon import install_autostart, restart as daemon_restart, running_pid
         from daemon import start as daemon_start
 
-    def bring_up() -> None:
+    def bring_up() -> bool:
         # `start` no-ops on a live PID, so a rerun would leave the bridge on
         # the .env this wizard just replaced. Restart it instead.
         pid = running_pid()
         if pid:
             print_info(f"  A background bridge is already running (pid {pid}) on the old config.")
             print_info("  Restarting it so it picks up the new settings.")
-            daemon_restart()
-            return
-        daemon_start()
+            return daemon_restart() == 0
+        return daemon_start() == 0
 
     env_file = str(_env_file_path().resolve())
 
     if prompt_yes_no("  Start it now and automatically on every boot?", True):
         if install_autostart(env_file):
-            return
+            return True
         print_warning("  Couldn't set up boot autostart — starting in the background for now.")
-        bring_up()
-        return
+        return bring_up()
 
     if prompt_yes_no("  Start it in the background now (until you reboot)?", True):
-        bring_up()
-        return
+        return bring_up()
 
     print_info("  Start it yourself anytime with:  inkbox-claude start")
+    return False
 
 
 # ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
+
+
+def _print_ready_banner(handle: str) -> None:
+    """Print the closing banner for a setup that ended with a live bridge.
+
+    Args:
+        handle (str): Inkbox agent identity the bridge is now running as.
+
+    Returns:
+        None: Replaces the closing to-do lines - there is nothing left to run.
+    """
+    rows = (("Inkbox identity", handle), ("Check its health", "inkbox-claude doctor"))
+    label_width = max(len(label) for label, _ in rows) + 1  # +1 for the colon
+    body = [
+        "Your Claude Code agent is set up and running on Inkbox.",
+        "",
+        *(f"  {(label + ':').ljust(label_width)}  {value}" for label, value in rows),
+    ]
+    width = max(len(line) for line in body) + 4
+    print()
+    print(color("╭" + "─" * (width - 2) + "╮", Colors.GREEN))
+    for line in body:
+        print(
+            color("│ ", Colors.GREEN)
+            + color(line.ljust(width - 4), Colors.GREEN, Colors.BOLD)
+            + color(" │", Colors.GREEN)
+        )
+    print(color("╰" + "─" * (width - 2) + "╯", Colors.GREEN))
 
 
 def _print_agent_summary(identity: Any) -> None:
@@ -1812,9 +1839,15 @@ def interactive_setup() -> None:
 
     _configure_project_dir()
 
-    _configure_autostart()
+    # A live bridge means setup finished the job, so close on that rather than
+    # a to-do list. Only when nothing is listening is there a step left.
+    if _configure_autostart():
+        _print_ready_banner(identity.agent_handle)
+        print_info("  Logs: ~/.inkbox-claude/gateway.log")
+        return
 
     print()
     print(color("Setup complete.", Colors.GREEN, Colors.BOLD))
+    print("  Start it with:          inkbox-claude start")
     print("  Check it anytime with:  inkbox-claude doctor")
     print("  Logs:                   ~/.inkbox-claude/gateway.log")

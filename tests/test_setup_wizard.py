@@ -824,8 +824,8 @@ def _patch_daemon(monkeypatch, *, pid, calls):
     """Stub the daemon module the autostart step imports lazily."""
     daemon = types.ModuleType("daemon")
     daemon.running_pid = lambda: pid
-    daemon.start = lambda: calls.append("start") or 0
-    daemon.restart = lambda: calls.append("restart") or 0
+    daemon.start = lambda: (calls.append("start"), 0)[1]
+    daemon.restart = lambda: (calls.append("restart"), 0)[1]
     daemon.install_autostart = lambda _env_file: calls.append("install_autostart") or False
     monkeypatch.setitem(sys.modules, "inkbox_claude.daemon", daemon)
     return daemon
@@ -877,3 +877,47 @@ def test_declining_both_offers_starts_nothing(monkeypatch, capsys):
 
     assert calls == []
     assert "inkbox-claude start" in capsys.readouterr().out
+
+
+def test_ready_banner_names_the_identity_and_the_health_command(capsys):
+    setup_wizard._print_ready_banner("dev-agent")
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert any("dev-agent" in line for line in lines)
+    assert any("inkbox-claude doctor" in line for line in lines)
+    # Every row is the same width, so the box closes cleanly.
+    assert len({len(line) for line in lines}) == 1
+
+
+def test_ready_banner_box_fits_a_long_handle(capsys):
+    setup_wizard._print_ready_banner("a-very-long-agent-handle-that-sets-the-width")
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert len({len(line) for line in lines}) == 1
+
+
+def test_autostart_reports_a_live_bridge(monkeypatch):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    assert setup_wizard._configure_autostart() is True
+
+
+def test_autostart_reports_no_bridge_when_both_offers_declined(monkeypatch):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: False)
+
+    assert setup_wizard._configure_autostart() is False
+
+
+def test_autostart_reports_failure_when_the_daemon_will_not_start(monkeypatch):
+    calls = []
+    daemon = _patch_daemon(monkeypatch, pid=None, calls=calls)
+    daemon.start = lambda: 1  # e.g. bad config, or the port is taken
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    assert setup_wizard._configure_autostart() is False
