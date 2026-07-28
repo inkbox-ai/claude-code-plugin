@@ -32,12 +32,47 @@ def _state_dir() -> Path:
     return root
 
 
+def state_dir() -> Path:
+    """Return the bridge's state directory, creating it if needed.
+
+    Public wrapper so the setup wizard can resolve the same ``.env`` the daemon
+    falls back to, instead of keeping its own copy of the path rule.
+
+    Returns:
+        Path: ``$INKBOX_CLAUDE_HOME`` or ``~/.inkbox-claude``.
+    """
+    return _state_dir()
+
+
 def _pid_file() -> Path:
     return _state_dir() / "gateway.pid"
 
 
 def _log_file() -> Path:
     return _state_dir() / "gateway.log"
+
+
+def _exited_as_our_child(pid: int) -> bool:
+    """Reap ``pid`` if it is our own child and has already exited.
+
+    ``start`` forks the gateway from whatever process launched it, so a crashed
+    gateway stays a zombie until that parent waits on it - and ``os.kill(pid, 0)``
+    succeeds on a zombie. Without this reap, a dead bridge probes as alive for as
+    long as the launching process lives, which no amount of extra waiting fixes.
+
+    Args:
+        pid (int): PID recorded in the PID file.
+
+    Returns:
+        bool: True when the process was our child and has exited. False when it
+        is still running, or is not our child at all (a separate ``status`` or
+        ``stop`` invocation), in which case the signal probe is authoritative.
+    """
+    try:
+        reaped, _status = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError, AttributeError):
+        return False
+    return reaped == pid
 
 
 def _read_pid() -> int | None:
@@ -49,6 +84,9 @@ def _read_pid() -> int | None:
     try:
         pid = int(_pid_file().read_text().strip())
     except (FileNotFoundError, ValueError):
+        return None
+    if _exited_as_our_child(pid):
+        _pid_file().unlink(missing_ok=True)  # crashed under us — not a live pid
         return None
     try:
         os.kill(pid, 0)  # signal 0 just probes liveness
@@ -142,37 +180,45 @@ def start() -> int:
         return 1
 
     log_path = _log_file()
-    pid = os.fork()
-    if pid > 0:
-        # Parent: record the daemon's PID, then give it a moment to fail fast
-        # (bad tunnel, 401, ...) so we can surface that instead of "started".
-        _pid_file().write_text(f"{pid}\n")
-        time.sleep(1.5)
-        if _read_pid() != pid:
-            print("Gateway exited right after starting — check the log:")
-            print(f"  {log_path}")
-            return 1
-        print(f"inkbox-claude gateway started in the background (pid {pid}).")
-        print(f"  logs:  {log_path}")
-        print(f"  tail:  tail -f {log_path}")
-        print("  stop:  inkbox-claude stop")
-        return 0
+    # Spawn a FRESH interpreter instead of os.fork(). Forking a process that has
+    # already driven the SDK hands the child a half-initialised copy of httpx's
+    # connection pools and threads, and it can die before logging is even
+    # configured -- which is why a start from the setup wizard could fail while
+    # the identical `start` from a shell seconds later worked. This is also the
+    # exact command the systemd/launchd units run.
+    try:
+        logf = open(log_path, "a", buffering=1)  # line-buffered so `tail -f` is live
+    except OSError as exc:
+        print(f"Could not open the log at {log_path}: {exc}")
+        return 1
+    try:
+        proc = subprocess.Popen(
+            [_launcher_path(), "run"],
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=logf,
+            start_new_session=True,  # own session, so it outlives this terminal
+            env=os.environ.copy(),   # carry values the wizard just saved
+        )
+    except OSError as exc:
+        print(f"Could not start the gateway: {exc}")
+        return 1
+    finally:
+        logf.close()  # the child holds its own dup of the fd
 
-    # Child: detach from the terminal and run the gateway.
-    os.setsid()
-    _redirect_stdio(log_path)
-    run_foreground()
-    os._exit(0)
-
-
-def _redirect_stdio(log_path: Path) -> None:
-    sys.stdout.flush()
-    sys.stderr.flush()
-    with open(os.devnull, "rb") as devnull:
-        os.dup2(devnull.fileno(), sys.stdin.fileno())
-    logf = open(log_path, "a", buffering=1)  # line-buffered so `tail -f` is live
-    os.dup2(logf.fileno(), sys.stdout.fileno())
-    os.dup2(logf.fileno(), sys.stderr.fileno())
+    # Give it a moment to fail fast (bad tunnel, port in use, 401) so we can
+    # surface that instead of reporting "started".
+    _pid_file().write_text(f"{proc.pid}\n")
+    time.sleep(1.5)
+    if _read_pid() != proc.pid:
+        print("Gateway exited right after starting — check the log:")
+        print(f"  {log_path}")
+        return 1
+    print(f"inkbox-claude gateway started in the background (pid {proc.pid}).")
+    print(f"  logs:  {log_path}")
+    print(f"  tail:  tail -f {log_path}")
+    print("  stop:  inkbox-claude stop")
+    return 0
 
 
 def stop() -> int:
@@ -208,6 +254,18 @@ def stop() -> int:
     _pid_file().unlink(missing_ok=True)
     print("Stopped.")
     return 0
+
+
+def running_pid() -> int | None:
+    """Return the PID of the background gateway, or None when it is not running.
+
+    Public wrapper over the PID-file probe so callers outside this module can
+    ask "is one already up?" without reaching for a private helper.
+
+    Returns:
+        int | None: Live background gateway PID, else None.
+    """
+    return _read_pid()
 
 
 def status() -> int:

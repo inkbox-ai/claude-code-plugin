@@ -1,4 +1,5 @@
 import os
+import time
 
 from inkbox_claude import cli, daemon
 
@@ -191,3 +192,109 @@ def test_cli_routes_daemon_commands(monkeypatch):
     for cmd in ("run", "start", "stop", "restart", "status"):
         assert cli.main([cmd]) == 0
     assert calls == ["run", "start", "stop", "restart", "status"]
+
+
+def test_running_pid_mirrors_the_pid_probe(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    assert daemon.running_pid() is None
+
+    daemon._pid_file().write_text(f"{os.getpid()}\n")
+    assert daemon.running_pid() == os.getpid()
+
+
+def test_read_pid_does_not_report_a_zombie_child_as_alive(tmp_path, monkeypatch):
+    # `start` forks the gateway from the launching process, so a crashed bridge
+    # stays a zombie under it — and os.kill(pid, 0) succeeds on a zombie. This
+    # is what let a dead bridge print a "started successfully" banner.
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(1)  # the bridge crashing on a bad bind
+    time.sleep(0.3)
+
+    daemon._pid_file().write_text(f"{pid}\n")
+    assert daemon._read_pid() is None
+    assert not daemon._pid_file().exists()
+
+
+def test_read_pid_still_reports_a_live_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(5)
+        os._exit(0)
+    try:
+        daemon._pid_file().write_text(f"{pid}\n")
+        assert daemon._read_pid() == pid
+    finally:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+
+
+def test_start_spawns_a_fresh_interpreter_not_a_fork(tmp_path, monkeypatch):
+    # Forking a wizard that has already driven the SDK gives the child a
+    # half-initialised copy of httpx's pools; spawn the launcher instead, the
+    # same command the systemd/launchd units run.
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_API_KEY", "ApiKey_x")
+    monkeypatch.setenv("INKBOX_IDENTITY", "probe")
+    monkeypatch.setattr(daemon, "_launcher_path", lambda: "/opt/venv/bin/inkbox-claude")
+    monkeypatch.setattr(
+        daemon.os, "fork", lambda: (_ for _ in ()).throw(AssertionError("must not fork"))
+    )
+    monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
+
+    seen = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+    pids = iter([None, 4242])  # not running, then the spawned pid
+    monkeypatch.setattr(daemon, "_read_pid", lambda: next(pids))
+
+    assert daemon.start() == 0
+
+    assert seen["argv"] == ["/opt/venv/bin/inkbox-claude", "run"]
+    # Detached into its own session so it survives the launching terminal.
+    assert seen["kwargs"]["start_new_session"] is True
+    assert daemon._pid_file().read_text().strip() == "4242"
+
+
+def test_start_reports_a_gateway_that_dies_immediately(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_API_KEY", "ApiKey_x")
+    monkeypatch.setenv("INKBOX_IDENTITY", "probe")
+    monkeypatch.setattr(daemon, "_launcher_path", lambda: "/opt/venv/bin/inkbox-claude")
+    monkeypatch.setattr(daemon.time, "sleep", lambda _s: None)
+
+    class FakeProc:
+        pid = 4242
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda _argv, **_kw: FakeProc())
+    monkeypatch.setattr(daemon, "_read_pid", lambda: None)  # never came up
+
+    assert daemon.start() == 1
+    assert "exited right after starting" in capsys.readouterr().out
+
+
+def test_start_surfaces_a_missing_launcher(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_API_KEY", "ApiKey_x")
+    monkeypatch.setenv("INKBOX_IDENTITY", "probe")
+    monkeypatch.setattr(daemon, "_launcher_path", lambda: "/nope/inkbox-claude")
+
+    def boom(_argv, **_kw):
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", boom)
+
+    assert daemon.start() == 1
+    assert "Could not start the gateway" in capsys.readouterr().out

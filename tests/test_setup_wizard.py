@@ -1,3 +1,5 @@
+import os
+import sys
 import types
 
 import pytest
@@ -812,3 +814,157 @@ def test_wizard_walks_imessage_before_dedicated_number(tmp_path, monkeypatch):
     # No number was provisioned this run, so the START wait never blocks.
     assert "sms_opt_in" not in order
     assert seen["imessage_enabled"] is True
+
+
+# ----------------------------------------------------------------------
+# Keeping the bridge running
+# ----------------------------------------------------------------------
+
+
+def _patch_daemon(monkeypatch, *, pid, calls):
+    """Stub the daemon module the autostart step imports lazily."""
+    daemon = types.ModuleType("daemon")
+    daemon.running_pid = lambda: pid
+    daemon.start = lambda: (calls.append("start"), 0)[1]
+    daemon.restart = lambda: (calls.append("restart"), 0)[1]
+    daemon.install_autostart = lambda _env_file: calls.append("install_autostart") or False
+    daemon.state_dir = lambda: __import__("pathlib").Path(os.environ.get("INKBOX_CLAUDE_HOME", "/tmp"))
+    monkeypatch.setitem(sys.modules, "inkbox_claude.daemon", daemon)
+    monkeypatch.setattr(setup_wizard, "_confirm_bridge_running", lambda *_a, **_k: True)
+    return daemon
+
+
+def test_background_start_restarts_an_already_running_bridge(monkeypatch, capsys):
+    calls = []
+    _patch_daemon(monkeypatch, pid=4242, calls=calls)
+    # Decline boot autostart, accept the background start.
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    setup_wizard._configure_autostart()
+
+    # A live bridge is still on the old .env — starting it again would no-op.
+    assert calls == ["restart"]
+    assert "pid 4242" in capsys.readouterr().out
+
+
+def test_background_start_starts_when_nothing_is_running(monkeypatch):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    setup_wizard._configure_autostart()
+
+    assert calls == ["start"]
+
+
+def test_autostart_fallback_also_restarts_a_live_bridge(monkeypatch):
+    # install_autostart() fails, so the step falls back to a background run —
+    # which must reload a bridge that is already up, not no-op on it.
+    calls = []
+    _patch_daemon(monkeypatch, pid=99, calls=calls)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: True)
+
+    setup_wizard._configure_autostart()
+
+    assert calls == ["install_autostart", "restart"]
+
+
+def test_declining_both_offers_starts_nothing(monkeypatch, capsys):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: False)
+
+    setup_wizard._configure_autostart()
+
+    assert calls == []
+    assert "inkbox-claude start" in capsys.readouterr().out
+
+
+def test_ready_banner_names_the_identity_and_the_health_command(capsys):
+    setup_wizard._print_ready_banner("dev-agent")
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert any("dev-agent" in line for line in lines)
+    assert any("inkbox-claude doctor" in line for line in lines)
+    # Every row is the same width, so the box closes cleanly.
+    assert len({len(line) for line in lines}) == 1
+
+
+def test_ready_banner_box_fits_a_long_handle(capsys):
+    setup_wizard._print_ready_banner("a-very-long-agent-handle-that-sets-the-width")
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert len({len(line) for line in lines}) == 1
+
+
+def test_autostart_reports_a_live_bridge(monkeypatch):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    assert setup_wizard._configure_autostart() is True
+
+
+def test_autostart_reports_no_bridge_when_both_offers_declined(monkeypatch):
+    calls = []
+    _patch_daemon(monkeypatch, pid=None, calls=calls)
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: False)
+
+    assert setup_wizard._configure_autostart() is False
+
+
+def test_autostart_reports_failure_when_the_daemon_will_not_start(monkeypatch):
+    calls = []
+    daemon = _patch_daemon(monkeypatch, pid=None, calls=calls)
+    daemon.start = lambda: 1  # e.g. bad config, or the port is taken
+    answers = iter([False, True])
+    monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
+
+    assert setup_wizard._configure_autostart() is False
+
+
+def test_confirm_bridge_running_reports_a_pid_that_stays_up(monkeypatch):
+    monkeypatch.setattr(setup_wizard.time, "sleep", lambda _s: None)
+
+    assert setup_wizard._confirm_bridge_running(lambda: 4242, timeout=0.0) is True
+
+
+def test_confirm_bridge_running_catches_a_bridge_that_dies(monkeypatch, capsys):
+    # daemon.start() only watches the child for ~1.5s; a bridge that exits on
+    # bad config just after that still leaves the operator a pid and a banner.
+    pids = iter([4242, 4242, None])
+    monkeypatch.setattr(setup_wizard.time, "sleep", lambda _s: None)
+
+    assert setup_wizard._confirm_bridge_running(lambda: next(pids), timeout=30.0) is False
+
+    out = capsys.readouterr().out
+    assert "exited right after starting" in out
+    assert "gateway.log" in out
+
+
+def test_env_file_prefers_an_existing_local_dotenv(monkeypatch, tmp_path):
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    (tmp_path / ".env").write_text("INKBOX_IDENTITY=local\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert setup_wizard._env_file_path() == tmp_path / ".env"
+
+
+def test_env_file_falls_back_to_the_state_dir_not_cwd(monkeypatch, tmp_path):
+    # Running setup from a home directory used to drop an API key into ~/.env,
+    # which a globally installed bridge never reads.
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    state = tmp_path / "state"
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(state))
+    monkeypatch.chdir(tmp_path)
+
+    assert setup_wizard._env_file_path() == state / ".env"
+
+
+def test_env_file_honours_the_explicit_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / "custom.env"))
+
+    assert setup_wizard._env_file_path() == tmp_path / "custom.env"

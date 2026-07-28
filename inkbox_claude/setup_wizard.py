@@ -112,16 +112,35 @@ def _show_qr(data: str) -> bool:
 # ----------------------------------------------------------------------
 
 
+# A bridge that dies on bad config can outlive the daemon's own ~1.5s startup
+# probe, so re-check for a beat before calling the start a success.
+BRIDGE_CONFIRM_TIMEOUT = 5.0
+
+
 def _env_file_path() -> Path:
     """Resolve the ``.env`` file the wizard reads from and writes to.
 
+    Mirrors the daemon's candidate order exactly (see
+    ``daemon._maybe_load_env_file``) so the file this writes is the file the
+    bridge later reads. Writing to cwd unconditionally meant running setup from
+    a home directory dropped an API key into ``~/.env`` that a globally
+    installed bridge never looks at.
+
     Returns:
-        Path: ``$INKBOX_CLAUDE_ENV_FILE`` if set, else ``.env`` in cwd.
+        Path: ``$INKBOX_CLAUDE_ENV_FILE`` if set, else an existing ``./.env``
+        (a repo-local setup already in use), else the state dir's ``.env``.
     """
     override = os.getenv("INKBOX_CLAUDE_ENV_FILE")
     if override:
         return Path(override).expanduser()
-    return Path.cwd() / ".env"
+    local = Path.cwd() / ".env"
+    if local.exists():
+        return local
+    try:
+        from .daemon import state_dir
+    except ImportError:  # pragma: no cover - direct local import/test fallback
+        from daemon import state_dir
+    return state_dir() / ".env"
 
 
 def _save(name: str, value: str) -> None:
@@ -1605,40 +1624,112 @@ def _configure_project_dir() -> None:
     print_success(f"  Claude Code will work in {chosen}")
 
 
-def _configure_autostart() -> None:
+def _confirm_bridge_running(running_pid: Any, timeout: float = BRIDGE_CONFIRM_TIMEOUT) -> bool:
+    """Re-check that a just-started bridge is still alive.
+
+    Args:
+        running_pid (Any): Callable returning the live bridge PID, or None.
+        timeout (float): Seconds to keep re-checking before giving up.
+
+    Returns:
+        bool: True while a PID stays live across the window. A bridge that
+        exits on bad config can outlive the daemon's own short startup probe,
+        so a single check right after start can report a process that is gone.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        pid = running_pid()
+        if pid is None:
+            print_warning("  The bridge exited right after starting.")
+            print_info("  Check the log: ~/.inkbox-claude/gateway.log")
+            print_info("  Then rerun:    inkbox-claude start")
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.5)
+
+
+def _configure_autostart() -> bool:
     """Offer to keep the gateway running — on boot, or just in the background.
 
     Returns:
-        None
+        bool: True when a bridge is running by the time this returns, so the
+        caller can close on a status banner instead of a to-do list.
     """
     print()
     print(color("  --- Keep the bridge running ---", Colors.CYAN))
     print_info("  The bridge has to stay running to receive your messages and reply.")
 
     try:
-        from .daemon import install_autostart, start as daemon_start
+        from .daemon import install_autostart, restart as daemon_restart, running_pid
+        from .daemon import start as daemon_start
     except ImportError:  # pragma: no cover - direct local import/test fallback
-        from daemon import install_autostart, start as daemon_start
+        from daemon import install_autostart, restart as daemon_restart, running_pid
+        from daemon import start as daemon_start
+
+    def bring_up() -> bool:
+        # `start` no-ops on a live PID, so a rerun would leave the bridge on
+        # the .env this wizard just replaced. Restart it instead.
+        pid = running_pid()
+        if pid:
+            print_info(f"  A background bridge is already running (pid {pid}) on the old config.")
+            print_info("  Restarting it so it picks up the new settings.")
+            code = daemon_restart()
+        else:
+            code = daemon_start()
+        if code != 0:
+            return False
+        # `start` only watches the child for ~1.5s before reporting success, and
+        # a bridge that dies just after that still prints a pid. Confirm it is
+        # actually still there rather than take the exit code's word for it.
+        return _confirm_bridge_running(running_pid)
 
     env_file = str(_env_file_path().resolve())
 
     if prompt_yes_no("  Start it now and automatically on every boot?", True):
         if install_autostart(env_file):
-            return
+            return True
         print_warning("  Couldn't set up boot autostart — starting in the background for now.")
-        daemon_start()
-        return
+        return bring_up()
 
     if prompt_yes_no("  Start it in the background now (until you reboot)?", True):
-        daemon_start()
-        return
+        return bring_up()
 
     print_info("  Start it yourself anytime with:  inkbox-claude start")
+    return False
 
 
 # ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
+
+
+def _print_ready_banner(handle: str) -> None:
+    """Print the closing banner for a setup that ended with a live bridge.
+
+    Args:
+        handle (str): Inkbox agent identity the bridge is now running as.
+
+    Returns:
+        None: Replaces the closing to-do lines - there is nothing left to run.
+    """
+    rows = (("Inkbox identity", handle), ("Check its health", "inkbox-claude doctor"))
+    label_width = max(len(label) for label, _ in rows) + 1  # +1 for the colon
+    body = [
+        "Your Claude Code agent is set up and running on Inkbox.",
+        "",
+        *(f"  {(label + ':').ljust(label_width)}  {value}" for label, value in rows),
+    ]
+    width = max(len(line) for line in body) + 4
+    print()
+    print(color("╭" + "─" * (width - 2) + "╮", Colors.GREEN))
+    for line in body:
+        print(
+            color("│ ", Colors.GREEN)
+            + color(line.ljust(width - 4), Colors.GREEN, Colors.BOLD)
+            + color(" │", Colors.GREEN)
+        )
+    print(color("╰" + "─" * (width - 2) + "╯", Colors.GREEN))
 
 
 def _print_agent_summary(identity: Any) -> None:
@@ -1799,9 +1890,15 @@ def interactive_setup() -> None:
 
     _configure_project_dir()
 
-    _configure_autostart()
+    # A live bridge means setup finished the job, so close on that rather than
+    # a to-do list. Only when nothing is listening is there a step left.
+    if _configure_autostart():
+        _print_ready_banner(identity.agent_handle)
+        print_info("  Logs: ~/.inkbox-claude/gateway.log")
+        return
 
     print()
     print(color("Setup complete.", Colors.GREEN, Colors.BOLD))
+    print("  Start it with:          inkbox-claude start")
     print("  Check it anytime with:  inkbox-claude doctor")
     print("  Logs:                   ~/.inkbox-claude/gateway.log")
