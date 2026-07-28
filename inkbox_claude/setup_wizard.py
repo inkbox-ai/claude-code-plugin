@@ -112,16 +112,35 @@ def _show_qr(data: str) -> bool:
 # ----------------------------------------------------------------------
 
 
+# A bridge that dies on bad config can outlive the daemon's own ~1.5s startup
+# probe, so re-check for a beat before calling the start a success.
+BRIDGE_CONFIRM_TIMEOUT = 5.0
+
+
 def _env_file_path() -> Path:
     """Resolve the ``.env`` file the wizard reads from and writes to.
 
+    Mirrors the daemon's candidate order exactly (see
+    ``daemon._maybe_load_env_file``) so the file this writes is the file the
+    bridge later reads. Writing to cwd unconditionally meant running setup from
+    a home directory dropped an API key into ``~/.env`` that a globally
+    installed bridge never looks at.
+
     Returns:
-        Path: ``$INKBOX_CLAUDE_ENV_FILE`` if set, else ``.env`` in cwd.
+        Path: ``$INKBOX_CLAUDE_ENV_FILE`` if set, else an existing ``./.env``
+        (a repo-local setup already in use), else the state dir's ``.env``.
     """
     override = os.getenv("INKBOX_CLAUDE_ENV_FILE")
     if override:
         return Path(override).expanduser()
-    return Path.cwd() / ".env"
+    local = Path.cwd() / ".env"
+    if local.exists():
+        return local
+    try:
+        from .daemon import state_dir
+    except ImportError:  # pragma: no cover - direct local import/test fallback
+        from daemon import state_dir
+    return state_dir() / ".env"
 
 
 def _save(name: str, value: str) -> None:
@@ -1605,6 +1624,31 @@ def _configure_project_dir() -> None:
     print_success(f"  Claude Code will work in {chosen}")
 
 
+def _confirm_bridge_running(running_pid: Any, timeout: float = BRIDGE_CONFIRM_TIMEOUT) -> bool:
+    """Re-check that a just-started bridge is still alive.
+
+    Args:
+        running_pid (Any): Callable returning the live bridge PID, or None.
+        timeout (float): Seconds to keep re-checking before giving up.
+
+    Returns:
+        bool: True while a PID stays live across the window. A bridge that
+        exits on bad config can outlive the daemon's own short startup probe,
+        so a single check right after start can report a process that is gone.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        pid = running_pid()
+        if pid is None:
+            print_warning("  The bridge exited right after starting.")
+            print_info("  Check the log: ~/.inkbox-claude/gateway.log")
+            print_info("  Then rerun:    inkbox-claude start")
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.5)
+
+
 def _configure_autostart() -> bool:
     """Offer to keep the gateway running — on boot, or just in the background.
 
@@ -1630,8 +1674,15 @@ def _configure_autostart() -> bool:
         if pid:
             print_info(f"  A background bridge is already running (pid {pid}) on the old config.")
             print_info("  Restarting it so it picks up the new settings.")
-            return daemon_restart() == 0
-        return daemon_start() == 0
+            code = daemon_restart()
+        else:
+            code = daemon_start()
+        if code != 0:
+            return False
+        # `start` only watches the child for ~1.5s before reporting success, and
+        # a bridge that dies just after that still prints a pid. Confirm it is
+        # actually still there rather than take the exit code's word for it.
+        return _confirm_bridge_running(running_pid)
 
     env_file = str(_env_file_path().resolve())
 

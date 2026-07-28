@@ -828,6 +828,7 @@ def _patch_daemon(monkeypatch, *, pid, calls):
     daemon.restart = lambda: (calls.append("restart"), 0)[1]
     daemon.install_autostart = lambda _env_file: calls.append("install_autostart") or False
     monkeypatch.setitem(sys.modules, "inkbox_claude.daemon", daemon)
+    monkeypatch.setattr(setup_wizard, "_confirm_bridge_running", lambda *_a, **_k: True)
     return daemon
 
 
@@ -921,3 +922,47 @@ def test_autostart_reports_failure_when_the_daemon_will_not_start(monkeypatch):
     monkeypatch.setattr(setup_wizard, "prompt_yes_no", lambda *_a, **_k: next(answers))
 
     assert setup_wizard._configure_autostart() is False
+
+
+def test_confirm_bridge_running_reports_a_pid_that_stays_up(monkeypatch):
+    monkeypatch.setattr(setup_wizard.time, "sleep", lambda _s: None)
+
+    assert setup_wizard._confirm_bridge_running(lambda: 4242, timeout=0.0) is True
+
+
+def test_confirm_bridge_running_catches_a_bridge_that_dies(monkeypatch, capsys):
+    # daemon.start() only watches the child for ~1.5s; a bridge that exits on
+    # bad config just after that still leaves the operator a pid and a banner.
+    pids = iter([4242, 4242, None])
+    monkeypatch.setattr(setup_wizard.time, "sleep", lambda _s: None)
+
+    assert setup_wizard._confirm_bridge_running(lambda: next(pids), timeout=30.0) is False
+
+    out = capsys.readouterr().out
+    assert "exited right after starting" in out
+    assert "gateway.log" in out
+
+
+def test_env_file_prefers_an_existing_local_dotenv(monkeypatch, tmp_path):
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    (tmp_path / ".env").write_text("INKBOX_IDENTITY=local\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert setup_wizard._env_file_path() == tmp_path / ".env"
+
+
+def test_env_file_falls_back_to_the_state_dir_not_cwd(monkeypatch, tmp_path):
+    # Running setup from a home directory used to drop an API key into ~/.env,
+    # which a globally installed bridge never reads.
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    state = tmp_path / "state"
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(state))
+    monkeypatch.chdir(tmp_path)
+
+    assert setup_wizard._env_file_path() == state / ".env"
+
+
+def test_env_file_honours_the_explicit_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / "custom.env"))
+
+    assert setup_wizard._env_file_path() == tmp_path / "custom.env"

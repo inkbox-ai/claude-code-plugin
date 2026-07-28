@@ -18,6 +18,15 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
     Returns:
         List[Tuple[str, bool, str]]: (check name, passed, detail) rows.
     """
+    # Read the same .env the bridge does before judging anything missing —
+    # otherwise doctor reports "missing" for credentials that are on disk and
+    # working, purely because this process did not inherit them.
+    try:
+        from .daemon import _maybe_load_env_file
+    except ImportError:  # pragma: no cover - direct local import/test fallback
+        from daemon import _maybe_load_env_file
+    _maybe_load_env_file()
+
     cfg = read_config()
     checks: List[Tuple[str, bool, str]] = []
 
