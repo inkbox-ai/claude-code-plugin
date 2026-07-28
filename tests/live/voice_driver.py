@@ -47,8 +47,12 @@ LINE = os.environ.get(
     "VOICE_DRIVER_LINE",
     "Hi, this is a quick test call. Please reply out loud with one short sentence, then say goodbye.",
 )
-# Speak shortly after the pipeline is ready so the agent's greeting lands first.
-SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "3"))
+# Answering-machine detection scores whoever answers: a greeting longer than the
+# carrier's `greeting_duration_millis` (3.5s) reads as a voicemail announcement
+# and the call is hung up before the agent ever speaks. Answer the way a person
+# does - one word, then silence - and hold the prompt until that window closes.
+GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
+SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
@@ -75,16 +79,20 @@ async def phone_media_ws(ws: WebSocket) -> None:
     spoke = asyncio.Event()
     convo: asyncio.Task | None = None
 
-    async def _speak(text: str) -> None:
-        if spoke.is_set():
-            return
-        spoke.set()
+    async def _say(text: str) -> None:
         await ws.send_text(json.dumps({"event": "text", "delta": text}))
         await ws.send_text(json.dumps({"event": "text", "done": True}))
         log.info("spoke: %s", text)
 
+    async def _speak(text: str) -> None:
+        if spoke.is_set():
+            return
+        spoke.set()
+        await _say(text)
+
     async def _run_turn() -> None:
         # Speak one line, give the agent a turn, then hang up so the call ends fast.
+        await _say(GREETING)
         await asyncio.sleep(SPEAK_AFTER_S)
         await _speak(LINE)
         await asyncio.sleep(LISTEN_S)
