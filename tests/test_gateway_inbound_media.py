@@ -368,3 +368,52 @@ def test_empty_message_no_text_no_media_is_ignored(monkeypatch):
     resp = asyncio.run(gw._on_text_received(envelope))
     assert json.loads(resp.text)["ignored"] == "empty"
     assert "+15550000001" not in gw.sessions.by_id
+
+
+def test_group_imessage_injects_silent_policy(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {
+        "message": {
+            "id": "im-group",
+            "direction": "inbound",
+            "remote_number": "+15550000000",
+            "conversation_id": "imconv-777",
+            "participants": ["+15550000000", "+15550000002"],
+            "content": "Dinner moved to 7.",
+        },
+    }}
+
+    asyncio.run(gw._on_imessage_received(envelope))
+
+    # The group is one shared context, so the conversation is the chat — not the sender.
+    session = gw.sessions.by_id["imessage:imconv-777"]
+    body, mode, meta = session.inbound[0]
+    assert mode == "imessage"
+    assert body.startswith("[inkbox:group_imessage conversation_id=imconv-777")
+    assert "participants=+15550000000,+15550000002" in body
+    assert "reply_mode=conversation_id" in body
+    assert "Group iMessage response policy" in body
+    assert "return exactly [SILENT]" in body
+    assert meta["conversation_id"] == "imconv-777"
+    assert meta["conversation_kind"] == "group"
+
+
+def test_one_to_one_imessage_keeps_per_contact_chat(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {
+        "message": {
+            "id": "im-dm",
+            "direction": "inbound",
+            "remote_number": "+15550000000",
+            "conversation_id": "imconv-778",
+            "content": "hey",
+        },
+    }}
+
+    asyncio.run(gw._on_imessage_received(envelope))
+
+    body, mode, meta = next(iter(gw.sessions.by_id.values())).inbound[0]
+    assert mode == "imessage"
+    assert "group_imessage" not in body
+    assert "Group iMessage response policy" not in body
+    assert meta["conversation_kind"] == "direct"
