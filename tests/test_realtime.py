@@ -8,7 +8,6 @@ from inkbox_claude.realtime import (
     DELETE_POST_CALL_ACTION_TOOL_NAME,
     EDIT_POST_CALL_ACTION_TOOL_NAME,
     HANG_UP_CALL_TOOL_NAME,
-    HANGUP_CLOSE_DELAY_S,
     POST_CALL_ACTION_TOOL_NAME,
     RealtimeCallMeta,
     RealtimeConfig,
@@ -106,6 +105,7 @@ def test_instructions_name_the_consult_tool_and_project():
         contact_company="Inkbox",
         contact_job_title="Engineer",
         contact_notes="Prefers calls in the morning.",
+        contact_memories=["Prefers calls in the morning."],
     )
     text = build_realtime_instructions(meta)
     assert CONSULT_TOOL_NAME in text
@@ -114,6 +114,9 @@ def test_instructions_name_the_consult_tool_and_project():
     assert "claude@example.com" in text
     assert "Ada Lovelace" in text
     assert "ada@example.com" in text
+    assert "Contact notes: Prefers calls in the morning." in text
+    assert "[inkbox:contact_memories]" in text
+    assert '"Prefers calls in the morning."' in text
     assert "Do not perform a context lookup before greeting" in text
     assert "look up contacts" in text
 

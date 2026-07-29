@@ -74,6 +74,7 @@ class BridgeConfig:
     # Wake the agent on unrecognised/unverified external webhooks (default
     # off: only registered, signature-verified sources get through).
     external_events_enabled: bool = False
+    contact_memories_enabled: bool = True
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Claude Code side
@@ -143,6 +144,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         allow_all_users=env_flag("INKBOX_ALLOW_ALL_USERS", False),
         require_signature=env_flag("INKBOX_REQUIRE_SIGNATURE", True),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
+        contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(os.getenv("CLAUDE_PROJECT_DIR") or extra.get("project_dir") or os.getcwd()).strip(),

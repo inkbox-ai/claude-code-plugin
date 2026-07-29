@@ -236,6 +236,7 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
                 "sender": "",
                 "contact": None,
                 "direction": "inbound",
+                "contact_memories": [],
             },
         )
     ]
@@ -410,7 +411,9 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     request.headers = {
         "X-Call-Context": (
             '{"id":"call-1","remote_phone_number":"+15551234567",'
-            '"contacts":[{"id":"contact-1","name":"Ada Lovelace"}]}'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace",'
+            '"notes":"Prefers calls after lunch.",'
+            '"memories":["Prefers concise updates."]}]}'
         )
     }
 
@@ -422,6 +425,41 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
     assert seen["meta"].contact_known is True
     assert seen["meta"].contact_id == "contact-1"
     assert seen["meta"].contact_name == "Ada Lovelace"
+    assert seen["meta"].contact_notes == "Prefers calls after lunch."
+    assert seen["meta"].contact_memories == ["Prefers concise updates."]
+
+
+def test_call_ws_memory_opt_out_suppresses_realtime_context(monkeypatch):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    bridge = _FakeBridge()
+    seen = {}
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_claude.realtime import RealtimeConfig
+
+    cfg = BridgeConfig(
+        require_signature=False,
+        contact_memories_enabled=False,
+        realtime=RealtimeConfig(enabled=True, api_key="sk-x"),
+    )
+    gw = gateway.InkboxGateway(cfg)
+    request = _FakeRequest()
+    request.headers = {
+        "X-Call-Context": (
+            '{"id":"call-2","remote_phone_number":"+15551234567",'
+            '"contacts":[{"id":"contact-2","memories":["hidden"]}]}'
+        )
+    }
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert seen["meta"].contact_memories == []
 
 
 def test_call_ws_realtime_falls_back_to_stt_tts_on_connect_failure(monkeypatch):

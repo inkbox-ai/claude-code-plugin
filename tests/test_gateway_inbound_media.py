@@ -175,6 +175,31 @@ def test_inbound_email_lookup_injects_contact_without_webhook_contact(monkeypatc
     assert meta["contact"]["emails"] == ["dima@inkbox.ai"]
 
 
+def test_email_memories_select_from_bucket_and_sender_without_merging(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    envelope = {"data": {
+        "message": {
+            "id": "m-memory",
+            "from_address": "sender@example.com",
+            "thread_id": "thread-memory",
+            "snippet": "hello",
+        },
+        "contacts": [
+            {
+                "bucket": "from",
+                "address": " SENDER@example.com ",
+                "memories": ["first", " ", "first", "second"],
+            },
+            {"bucket": "to", "address": "agent@example.com", "memories": ["wrong"]},
+        ],
+    }}
+
+    asyncio.run(gw._on_mail_received(envelope))
+
+    _, _, meta = gw.sessions.by_id["email:thread-memory"].inbound[0]
+    assert meta["contact_memories"] == ["first", "second"]
+
+
 def test_unknown_direct_sms_uses_conversation_session_key(monkeypatch):
     gw = _gw(monkeypatch, [])
     envelope = {"data": {"text_message": {
@@ -290,6 +315,64 @@ def test_group_sms_injects_silent_policy(monkeypatch):
     assert "return exactly [SILENT]" in body
     assert meta["conversation_id"] == "conv-123"
     assert meta["conversation_kind"] == "group"
+
+
+def test_group_sms_selects_only_resolved_sender_contact_memories(monkeypatch):
+    gw = _gw(monkeypatch, [])
+    gw._inkbox = types.SimpleNamespace(contacts=types.SimpleNamespace(
+        lookup=lambda **_kwargs: [types.SimpleNamespace(
+            id="contact-sender",
+            preferred_name="Sender",
+            phones=[types.SimpleNamespace(value="+15550000001", is_primary=True)],
+        )],
+    ))
+    envelope = {"data": {
+        "text_message": {
+            "id": "t-group-memory",
+            "direction": "inbound",
+            "remote_phone_number": "+15550000001",
+            "conversation_id": "conv-memory",
+            "participants": ["+15550000001", "+15550000002"],
+            "text": "hello",
+        },
+        "contacts": [
+            {"id": "contact-sender", "memories": ["sender memory"]},
+            {"id": "contact-other", "memories": ["other memory"]},
+        ],
+    }}
+
+    asyncio.run(gw._on_text_received(envelope))
+
+    body, _, meta = gw.sessions.by_id["contact-sender"].inbound[0]
+    assert body.startswith("[inkbox:group_sms")
+    assert meta["contact_memories"] == ["sender memory"]
+
+
+def test_sms_memory_opt_out_suppresses_webhook_memories(monkeypatch):
+    async def fake_download(items, *, prefix):
+        return []
+
+    monkeypatch.setattr(gateway, "download_media", fake_download)
+    gw = gateway.InkboxGateway(BridgeConfig(
+        require_signature=False,
+        allow_all_users=True,
+        contact_memories_enabled=False,
+    ))
+    gw.sessions = _FakeSessions()
+    envelope = {"data": {
+        "text_message": {
+            "id": "t-opt-out",
+            "direction": "inbound",
+            "remote_phone_number": "+15551234567",
+            "text": "hello",
+        },
+        "contacts": [{"id": "contact-1", "memories": ["hidden"]}],
+    }}
+
+    asyncio.run(gw._on_text_received(envelope))
+
+    _, _, meta = gw.sessions.by_id["+15551234567"].inbound[0]
+    assert meta["contact_memories"] == []
 
 
 def test_imessage_reaction_injects_silent_policy(monkeypatch):

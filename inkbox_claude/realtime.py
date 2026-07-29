@@ -30,6 +30,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 try:
+    from .prompts import contact_memories_block
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from prompts import contact_memories_block
+
+try:
     import aiohttp
 except ImportError:  # pragma: no cover - aiohttp is a runtime dep
     aiohttp = None  # type: ignore
@@ -119,6 +124,7 @@ class RealtimeCallMeta:
     contact_company: Optional[str] = None
     contact_job_title: Optional[str] = None
     contact_notes: Optional[str] = None
+    contact_memories: List[str] = field(default_factory=list)
     # Outbound calls only: why this agent placed the call, threaded from
     # ``inkbox_place_call`` so the live session opens with context, not cold.
     outbound_purpose: Optional[str] = None
@@ -208,6 +214,9 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
             lines.append(f"Contact phone(s): {', '.join(meta.contact_phones)}.")
         if meta.contact_notes:
             lines.append(f"Contact notes: {meta.contact_notes}")
+        memories = contact_memories_block(meta.contact_memories)
+        if memories:
+            lines.append(memories)
     else:
         lines.append(
             "No matching Inkbox contact record is loaded; use the phone number or a neutral greeting.",
