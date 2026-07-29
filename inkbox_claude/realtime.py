@@ -30,9 +30,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 try:
-    from .prompts import contact_memories_block
+    from .prompts import _escape_contact_memory_tags, contact_memories_block
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from prompts import contact_memories_block
+    from prompts import _escape_contact_memory_tags, contact_memories_block
 
 try:
     import aiohttp
@@ -201,19 +201,19 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
             "Known Inkbox contact info is already loaded; do not look them up or ask for details you already have.",
         )
         if meta.contact_name:
-            lines.append(f"Contact name: {meta.contact_name}.")
+            lines.append(f"Contact name: {_escape_contact_memory_tags(meta.contact_name)}.")
         if meta.contact_id:
             lines.append(f"Inkbox contact id: {meta.contact_id}.")
         if meta.contact_company:
-            lines.append(f"Contact company: {meta.contact_company}.")
+            lines.append(f"Contact company: {_escape_contact_memory_tags(meta.contact_company)}.")
         if meta.contact_job_title:
-            lines.append(f"Contact title: {meta.contact_job_title}.")
+            lines.append(f"Contact title: {_escape_contact_memory_tags(meta.contact_job_title)}.")
         if meta.contact_emails:
             lines.append(f"Contact email(s): {', '.join(meta.contact_emails)}.")
         if meta.contact_phones:
             lines.append(f"Contact phone(s): {', '.join(meta.contact_phones)}.")
         if meta.contact_notes:
-            lines.append(f"Contact notes: {meta.contact_notes}")
+            lines.append(f"Contact notes: {_escape_contact_memory_tags(meta.contact_notes)}")
         memories = contact_memories_block(meta.contact_memories)
         if memories:
             lines.append(memories)
@@ -223,20 +223,30 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
         )
     if meta.direction == "outbound":
         if meta.outbound_purpose:
-            lines.append(f"This is an outbound call you placed. Purpose: {meta.outbound_purpose}")
+            lines.append(
+                "This is an outbound call you placed. Purpose: "
+                + _escape_contact_memory_tags(meta.outbound_purpose)
+            )
         if meta.outbound_reason:
-            lines.append(f"Reason for the call: {meta.outbound_reason}")
+            lines.append(f"Reason for the call: {_escape_contact_memory_tags(meta.outbound_reason)}")
         if meta.outbound_scheduled_by:
-            lines.append(f"This call was scheduled by: {meta.outbound_scheduled_by}")
+            lines.append(
+                "This call was scheduled by: "
+                + _escape_contact_memory_tags(meta.outbound_scheduled_by)
+            )
         if meta.outbound_conversation_summary:
             lines.append(
-                f"Summary of the prior conversation that led to this call:\n{meta.outbound_conversation_summary}",
+                "Summary of the prior conversation that led to this call:\n"
+                + _escape_contact_memory_tags(meta.outbound_conversation_summary),
             )
         if meta.outbound_context:
-            lines.append(f"Relevant outbound-call context:\n{meta.outbound_context}")
+            lines.append(
+                f"Relevant outbound-call context:\n{_escape_contact_memory_tags(meta.outbound_context)}"
+            )
         if meta.outbound_opening:
             lines.append(
-                f"Preferred opening message (say this naturally as your first turn): {meta.outbound_opening}",
+                "Preferred opening message (say this naturally as your first turn): "
+                + _escape_contact_memory_tags(meta.outbound_opening),
             )
         lines.append(
             "For outbound calls, do not open with a generic offer to help. Start by explaining why you are calling, then ask the next specific question or give the requested update.",
@@ -271,16 +281,21 @@ def build_realtime_instructions(meta: RealtimeCallMeta, additional: str = "") ->
 
 def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
     """Instructions for the proactive opening line spoken at pickup."""
-    first_name = meta.contact_name.split()[0] if meta.contact_known and meta.contact_name else "there"
+    first_name = (
+        _escape_contact_memory_tags(meta.contact_name.split()[0])
+        if meta.contact_known and meta.contact_name
+        else "there"
+    )
     if meta.direction == "outbound" and meta.outbound_opening:
         return (
             "Open the call by saying this naturally as the very first thing, with no greeting before it:\n"
-            f"{meta.outbound_opening}"
+            f"{_escape_contact_memory_tags(meta.outbound_opening)}"
         )
     if meta.direction == "outbound" and meta.outbound_purpose:
         return (
             f"Greet {first_name} briefly, then immediately explain that you are calling because: "
-            f"{meta.outbound_purpose}. Do not ask a generic how-can-I-help question."
+            f"{_escape_contact_memory_tags(meta.outbound_purpose)}. "
+            "Do not ask a generic how-can-I-help question."
         )
     return (
         f"Greet the caller now as the very first thing you say. Say something like "
