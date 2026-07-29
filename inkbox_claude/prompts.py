@@ -228,7 +228,7 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
     memories = meta.get("contact_memories") or []
     is_preframed_group = (
         meta.get("conversation_kind") == "group"
-        and text.startswith("[inkbox:group_sms ")
+        and text.startswith(("[inkbox:group_sms ", "[inkbox:group_imessage "))
     )
     is_preframed_reaction = bool(meta.get("reaction")) and text.startswith(
         "[inkbox:imessage_reaction "
