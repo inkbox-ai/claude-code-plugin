@@ -223,6 +223,10 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
 
     session = _FakeContactSession()
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw._inkbox = types.SimpleNamespace(calls=types.SimpleNamespace(get=lambda _call_id: types.SimpleNamespace(
+        remote_phone_number="+15551234567",
+        direction="inbound",
+    )))
     gw.sessions = _FakeSessions(session)
 
     asyncio.run(gw._handle_call_ws(_FakeRequest()))
@@ -236,6 +240,7 @@ def test_call_ws_stt_tts_runs_call_ended_reflection(monkeypatch):
                 "sender": "",
                 "contact": None,
                 "direction": "inbound",
+                "contact_memories": [],
             },
         )
     ]
@@ -274,6 +279,56 @@ def test_call_ws_uses_stored_call_contact_session_for_stt_tts(monkeypatch):
     assert session.inbound[0][2]["contact"]["id"] == "contact-1"
     assert session.inbound[0][2]["contact"]["name"] == "Ada Lovelace"
     assert "call-1" not in gw._call_meta_by_id
+
+
+def test_call_ws_consumes_signed_context_for_stt_tts_and_post_call(monkeypatch):
+    fake_ws = _ScriptedWS([
+        _FakeTextMsg('{"event":"transcript","text":"Send me the notes.","is_final":true}'),
+        _FakeTextMsg('{"event":"stop"}'),
+    ])
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    monkeypatch.setattr(gateway, "WSMsgType", types.SimpleNamespace(TEXT="text"))
+
+    session = _FakeContactSession()
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False))
+    gw._inkbox = types.SimpleNamespace(calls=types.SimpleNamespace(get=lambda _call_id: types.SimpleNamespace(
+        remote_phone_number="+15551234567",
+        direction="inbound",
+    )))
+    gw.sessions = _FakeSessions(session)
+    request = _FakeRequest()
+    request.headers = {
+        "X-Call-Context": (
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace",'
+            '"memories":["Prefers concise updates."]}]}'
+        )
+    }
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert session.inbound == [(
+        "Send me the notes.",
+        "voice",
+        {
+            "call_id": "call-1",
+            "sender": "+15551234567",
+            "contact": {
+                "id": "contact-1",
+                "name": "Ada Lovelace",
+                "emails": [],
+                "phones": [],
+                "company": None,
+                "job_title": None,
+                "notes": None,
+            },
+            "direction": "inbound",
+            "contact_memories": ["Prefers concise updates."],
+        },
+    )]
+    assert len(session.consults) == 1
+    assert session.consults[0].count("[inkbox:contact_memories]") == 1
+    assert '"Prefers concise updates."' in session.consults[0]
 
 
 def test_call_ws_backfills_remote_via_identity_centered_call_read(monkeypatch):
@@ -325,6 +380,14 @@ class _FakeBridge:
 
     async def close(self):
         self.closed = True
+
+
+class _CallbackBridge(_FakeBridge):
+    async def run(self, *, inkbox_ws, on_agent_consult, on_post_call_actions, on_call_ended):
+        self.ran = True
+        await on_agent_consult("check the account", [])
+        await on_post_call_actions([{"action": "send summary", "details": "email it"}], [])
+        await on_call_ended([])
 
 
 def test_call_ws_realtime_path_sets_rawmedia_headers_and_runs_bridge(monkeypatch):
@@ -385,7 +448,59 @@ def test_call_ws_passes_outbound_context_to_realtime(monkeypatch, tmp_path):
     assert seen["meta"].outbound_context == "PR 12"
 
 
-def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
+def test_call_ws_consumes_signed_context_for_realtime_and_callbacks(monkeypatch):
+    fake_ws = _FakeWS()
+    monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
+    bridge = _CallbackBridge()
+    seen = {}
+
+    async def fake_open(*, config, meta):
+        seen["meta"] = meta
+        return bridge
+
+    monkeypatch.setattr(gateway, "open_inkbox_realtime_bridge", fake_open)
+
+    from inkbox_claude.realtime import RealtimeConfig
+
+    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
+    gw = gateway.InkboxGateway(cfg)
+    gw._inkbox = types.SimpleNamespace(calls=types.SimpleNamespace(get=lambda _call_id: types.SimpleNamespace(
+        remote_phone_number="+15551234567",
+        direction="inbound",
+    )))
+    gw._identity = types.SimpleNamespace(
+        agent_handle="claude",
+        mailbox=types.SimpleNamespace(email_address="claude@example.com"),
+        phone_number=types.SimpleNamespace(number="+15550001111"),
+    )
+    session = _FakeContactSession()
+    gw.sessions = _FakeSessions(session)
+    request = _FakeRequest()
+    request.headers = {
+        "X-Call-Context": (
+            '{"call_id":"call-1","phone_number":"+15551234567","direction":"inbound",'
+            '"contacts":[{"id":"contact-1","name":"Ada Lovelace",'
+            '"memories":["Prefers concise updates."]}]}'
+        )
+    }
+
+    asyncio.run(gw._handle_call_ws(request))
+
+    assert seen["meta"].agent_identity_handle == "claude"
+    assert seen["meta"].agent_identity_email == "claude@example.com"
+    assert seen["meta"].agent_identity_phone == "+15550001111"
+    assert seen["meta"].contact_known is True
+    assert seen["meta"].contact_id == "contact-1"
+    assert seen["meta"].contact_name == "Ada Lovelace"
+    assert seen["meta"].contact_memories == ["Prefers concise updates."]
+    assert seen["meta"].remote_phone_number == "+15551234567"
+    assert seen["meta"].direction == "inbound"
+    assert len(session.consults) == 3
+    assert all(prompt.count("[inkbox:contact_memories]") == 1 for prompt in session.consults)
+    assert all('"Prefers concise updates."' in prompt for prompt in session.consults)
+
+
+def test_call_ws_memory_opt_out_suppresses_realtime_context(monkeypatch):
     fake_ws = _FakeWS()
     monkeypatch.setattr(gateway, "web", types.SimpleNamespace(WebSocketResponse=lambda: fake_ws))
     bridge = _FakeBridge()
@@ -399,29 +514,23 @@ def test_call_ws_passes_contact_and_identity_context_to_realtime(monkeypatch):
 
     from inkbox_claude.realtime import RealtimeConfig
 
-    cfg = BridgeConfig(require_signature=False, realtime=RealtimeConfig(enabled=True, api_key="sk-x"))
-    gw = gateway.InkboxGateway(cfg)
-    gw._identity = types.SimpleNamespace(
-        agent_handle="claude",
-        mailbox=types.SimpleNamespace(email_address="claude@example.com"),
-        phone_number=types.SimpleNamespace(number="+15550001111"),
+    cfg = BridgeConfig(
+        require_signature=False,
+        contact_memories_enabled=False,
+        realtime=RealtimeConfig(enabled=True, api_key="sk-x"),
     )
+    gw = gateway.InkboxGateway(cfg)
     request = _FakeRequest()
     request.headers = {
         "X-Call-Context": (
-            '{"id":"call-1","remote_phone_number":"+15551234567",'
-            '"contacts":[{"id":"contact-1","name":"Ada Lovelace"}]}'
+            '{"id":"call-2","remote_phone_number":"+15551234567",'
+            '"contacts":[{"id":"contact-2","memories":["hidden"]}]}'
         )
     }
 
     asyncio.run(gw._handle_call_ws(request))
 
-    assert seen["meta"].agent_identity_handle == "claude"
-    assert seen["meta"].agent_identity_email == "claude@example.com"
-    assert seen["meta"].agent_identity_phone == "+15550001111"
-    assert seen["meta"].contact_known is True
-    assert seen["meta"].contact_id == "contact-1"
-    assert seen["meta"].contact_name == "Ada Lovelace"
+    assert seen["meta"].contact_memories == []
 
 
 def test_call_ws_realtime_falls_back_to_stt_tts_on_connect_failure(monkeypatch):

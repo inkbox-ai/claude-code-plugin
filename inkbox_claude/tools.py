@@ -1076,7 +1076,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_a2a_ask_caller,
         inkbox_a2a_fail,
     ]
-    server = create_sdk_mcp_server(name="inkbox", version="0.1.0", tools=tools)
+    server = create_sdk_mcp_server(name="inkbox", version="0.2.7", tools=tools)
     tool_names = [
         "mcp__inkbox__inkbox_whoami",
         "mcp__inkbox__inkbox_send_email",

@@ -66,7 +66,7 @@ try:
     )
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
-    from .prompts import contact_marker, strip_markdown
+    from .prompts import contact_marker, frame_inbound, normalize_contact_memories, strip_markdown
     from .realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, call_contexts_dir, inkbox_client_kwargs
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
-    from prompts import contact_marker, strip_markdown
+    from prompts import contact_marker, frame_inbound, normalize_contact_memories, strip_markdown
     from realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -1025,6 +1025,43 @@ class InkboxGateway:
         return [str(value).strip() for value in values if str(value).strip()]
 
     @classmethod
+    def _contact_id(cls, contact: Any) -> str:
+        return str(cls._field(contact, "id", "contact_id", "contactId") or "").strip()
+
+    @classmethod
+    def _webhook_contact_memories(
+        cls,
+        data: Any,
+        *,
+        resolved_contact_id: str = "",
+        sender_email: str = "",
+        allow_sole_fallback: bool = False,
+    ) -> List[str]:
+        """Select only the remote party's contact from verified webhook data."""
+        contacts = cls._webhook_list(data, "contacts", "contact_list", "contactList")
+        selected = None
+        resolved_id = str(resolved_contact_id or "").strip()
+        if resolved_id:
+            matches = [entry for entry in contacts if cls._contact_id(entry) == resolved_id]
+            if len(matches) == 1:
+                selected = matches[0]
+        if selected is None and sender_email:
+            sender_key = sender_email.strip().lower()
+            matches = []
+            for entry in contacts:
+                bucket = str(cls._field(entry, "bucket") or "").strip().lower()
+                address = str(
+                    cls._field(entry, "address", "email", "email_address", "emailAddress") or ""
+                ).strip().lower()
+                if bucket == "from" and address == sender_key:
+                    matches.append(entry)
+            if len(matches) == 1:
+                selected = matches[0]
+        if selected is None and allow_sole_fallback and len(contacts) == 1:
+            selected = contacts[0]
+        return normalize_contact_memories(cls._field(selected, "memories") or [])
+
+    @classmethod
     def _agent_identity_summary(cls, entry: Any) -> Optional[Dict[str, Any]]:
         """Summarize one resolved agent-identity webhook entry (id required)."""
         identity_id = cls._field(entry, "id", "identity_id", "identityId")
@@ -1264,6 +1301,11 @@ class InkboxGateway:
             body_text = (body_text + inbound_media_note(saved)).strip()
         thread_key = self._thread_key("email", message.get("thread_id"))
         contact = await self._resolve_contact_full(kind="email", value=sender)
+        memories = self._webhook_contact_memories(
+            data,
+            resolved_contact_id=(contact or {}).get("id", ""),
+            sender_email=sender,
+        ) if self.cfg.contact_memories_enabled else []
         # An address-book contact always wins over a resolved agent identity.
         agent_identity = None if contact else self._mail_sender_agent_identity(data, sender)
         chat_id = self._chat_key(
@@ -1280,6 +1322,7 @@ class InkboxGateway:
             "thread_id": message.get("thread_id"),
             "contact": contact,
             "agent_identity": agent_identity,
+            "contact_memories": memories,
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("email", None, sender, chat_id=chat_id)
@@ -1561,6 +1604,11 @@ class InkboxGateway:
             or len(agent_identities) > 1
         )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
+        memories = self._webhook_contact_memories(
+            data,
+            resolved_contact_id=(contact or {}).get("id", ""),
+            allow_sole_fallback=True,
+        ) if self.cfg.contact_memories_enabled else []
         # 1:1 only — a group resolves multiple identities, where a single
         # sender marker doesn't apply; a contact match always wins.
         agent_identity = (
@@ -1590,6 +1638,7 @@ class InkboxGateway:
             "conversation_kind": "group" if is_group else "direct",
             "contact": contact,
             "agent_identity": agent_identity,
+            "contact_memories": memories,
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("sms", conversation_id, sender, chat_id=chat_id)
@@ -1642,6 +1691,11 @@ class InkboxGateway:
             or len(participants) > 1
         )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
+        memories = self._webhook_contact_memories(
+            data,
+            resolved_contact_id=(contact or {}).get("id", ""),
+            allow_sole_fallback=True,
+        ) if self.cfg.contact_memories_enabled else []
         # An address-book contact always wins over a resolved agent identity.
         agent_identity = (
             None
@@ -1677,6 +1731,7 @@ class InkboxGateway:
             "sender": sender,
             "contact": contact,
             "agent_identity": agent_identity,
+            "contact_memories": memories,
             "conversation_kind": "group" if is_group else "direct",
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
@@ -1712,6 +1767,11 @@ class InkboxGateway:
                         else reaction_type
                     ) or "unknown"
                     contact = await self._resolve_contact_full(kind="phone", value=sender)
+                    memories = self._webhook_contact_memories(
+                        data,
+                        resolved_contact_id=(contact or {}).get("id", ""),
+                        allow_sole_fallback=True,
+                    ) if self.cfg.contact_memories_enabled else []
                     # An address-book contact always wins over an agent identity.
                     agent_identity = (
                         None
@@ -1745,6 +1805,7 @@ class InkboxGateway:
                         "reaction": reaction_label,
                         "typing": reaction_label == "question",
                         "contact": contact,
+                        "contact_memories": memories,
                     }
                     await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
                     response = web.json_response({"ok": True})
@@ -2574,6 +2635,7 @@ class InkboxGateway:
         outbound: Optional[Dict[str, Any]] = None,
         contact: Optional[Dict[str, Any]] = None,
         direction: str = "inbound",
+        memories: Optional[List[str]] = None,
     ) -> Any:
         """Preflight an OpenAI Realtime session for an incoming call.
 
@@ -2619,6 +2681,7 @@ class InkboxGateway:
             contact_company=contact.get("company"),
             contact_job_title=contact.get("job_title"),
             contact_notes=contact.get("notes"),
+            contact_memories=list(memories or []),
             outbound_purpose=(oc.get("purpose") or None),
             outbound_opening=(oc.get("opening_message") or None),
             outbound_context=(oc.get("context") or None),
@@ -2709,6 +2772,11 @@ class InkboxGateway:
                 except Exception:
                     logger.warning("[bridge] call lookup failed for call_id=%s", call_id, exc_info=True)
         contact = await self._resolve_call_contact(call_context, remote)
+        memories = self._webhook_contact_memories(
+            call_context,
+            resolved_contact_id=(contact or {}).get("id", ""),
+            allow_sole_fallback=True,
+        ) if self.cfg.contact_memories_enabled else []
         chat_id = (contact or {}).get("id") or remote or f"call:{call_id}"
 
         ws = web.WebSocketResponse()
@@ -2719,7 +2787,9 @@ class InkboxGateway:
         # Code via run_consult. If the preflight fails, fall through to Inkbox
         # STT/TTS below (unless fallback is disabled, then refuse the call).
         if self.cfg.realtime.enabled:
-            bridge = await self._open_realtime_bridge(remote, call_id, outbound, contact, direction)
+            bridge = await self._open_realtime_bridge(
+                remote, call_id, outbound, contact, direction, memories
+            )
             if bridge is None and not self.cfg.realtime.fallback_to_inkbox_stt_tts:
                 return web.Response(status=503, text="realtime bridge unavailable")
             if bridge is not None:
@@ -2733,19 +2803,32 @@ class InkboxGateway:
 
                 async def _consult(query: str, _transcript: Any) -> str:
                     # Route the model's request into the caller's shared session.
-                    return await self.sessions.get(chat_id).run_consult(query)
+                    prompt = frame_inbound("voice", {
+                        "call_id": call_id,
+                        "contact": contact,
+                        "contact_memories": memories,
+                    }, query)
+                    return await self.sessions.get(chat_id).run_consult(prompt)
 
                 async def _post_call(actions: List[Dict[str, str]], transcript: Any) -> None:
                     # Run the queued after-call work in the caller's session. The
                     # text reply is discarded; side effects (emails, edits, PRs)
                     # happen via Claude's tools during the turn.
-                    prompt = _post_call_prompt(actions, transcript)
+                    prompt = frame_inbound("voice", {
+                        "call_id": call_id,
+                        "contact": contact,
+                        "contact_memories": memories,
+                    }, _post_call_prompt(actions, transcript))
                     await self.sessions.get(chat_id).run_consult(prompt)
 
                 async def _call_ended(transcript: Any) -> None:
                     # No queued actions: let Claude reflect and do any follow-up
                     # it committed to on the call. Stays silent if nothing to do.
-                    prompt = _call_ended_prompt(transcript)
+                    prompt = frame_inbound("voice", {
+                        "call_id": call_id,
+                        "contact": contact,
+                        "contact_memories": memories,
+                    }, _call_ended_prompt(transcript))
                     await self.sessions.get(chat_id).run_consult(prompt)
 
                 try:
@@ -2797,6 +2880,7 @@ class InkboxGateway:
                         "sender": remote,
                         "contact": contact,
                         "direction": direction,
+                        "contact_memories": memories,
                     }
                     session = self.sessions.get(chat_id)
                     await session.handle_inbound(text, "voice", meta)
@@ -2805,7 +2889,11 @@ class InkboxGateway:
         finally:
             self._active_call_ws.pop(chat_id, None)
             if transcript:
-                prompt = _call_ended_prompt(transcript)
+                prompt = frame_inbound("voice", {
+                    "call_id": call_id,
+                    "contact": contact,
+                    "contact_memories": memories,
+                }, _call_ended_prompt(transcript))
                 await self.sessions.get(chat_id).run_consult(prompt)
             logger.info("[bridge] call ended: %s", chat_id or call_id)
         return ws
