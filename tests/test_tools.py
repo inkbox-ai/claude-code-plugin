@@ -575,3 +575,51 @@ def test_successful_message_tool_notifies_current_session():
         "attachments": None,
     }]
     assert deliveries == [("email", "ada@example.com")]
+
+
+def test_send_imessage_group_requires_dedicated_outbound_line():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"to": ["+15550000001", "+15550000002"], "text": "hi both"},
+    )
+
+    assert data["error_code"] == "imessage_group_requires_dedicated_outbound"
+    assert client.identity.sent_imessages == []
+
+
+def test_send_imessage_rejects_both_target_and_conversation():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"conversation_id": "imconv-1", "to": ["+15550000001"], "text": "hi"},
+    )
+
+    assert "exactly one" in data["error"]
+    assert client.identity.sent_imessages == []
+
+
+def test_send_imessage_rejects_too_many_recipients():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"to": [f"+1555000000{i}" for i in range(9)], "text": "hi"},
+    )
+
+    assert "at most 8" in data["error"]
+    assert client.identity.sent_imessages == []
+
+
+def test_send_imessage_rejects_duplicate_recipients():
+    client = _FakeClient()
+    data = _call(
+        client,
+        "inkbox_send_imessage",
+        {"to": ["+15550000001", "+15550000001"], "text": "hi"},
+    )
+
+    assert "distinct" in data["error"]
+    assert client.identity.sent_imessages == []

@@ -1382,6 +1382,39 @@ class InkboxGateway:
             )
             return None
 
+    async def _lookup_imessage_conversation_summary(self, conversation_id: str) -> Any:
+        """Group flags/participants for events that omit them (mirrors the SMS lookup)."""
+        if not conversation_id:
+            return None
+
+        def _lookup() -> Any:
+            identity = self._identity
+            if identity is None and self._inkbox is not None:
+                identity = self._inkbox.get_identity(self.cfg.identity)
+            if identity is None:
+                return None
+            method = getattr(identity, "list_imessage_conversations", None)
+            if callable(method):
+                try:
+                    conversations = method(limit=200, offset=0, include_groups=True)
+                except TypeError:
+                    conversations = method({"limit": 200, "offset": 0, "includeGroups": True})
+            else:
+                method = getattr(identity, "listImessageConversations", None)
+                if not callable(method):
+                    return None
+                conversations = method({"limit": 200, "offset": 0, "includeGroups": True})
+            for entry in conversations or []:
+                if str(self._field(entry, "id", "conversation_id", "conversationId") or "") == conversation_id:
+                    return entry
+            return None
+
+        try:
+            return await asyncio.to_thread(_lookup)
+        except Exception as exc:
+            logger.debug("[Inkbox] iMessage conversation lookup failed for %s: %s", conversation_id, exc)
+            return None
+
     @classmethod
     def _group_sms_prompt(
         cls,
@@ -1404,6 +1437,32 @@ class InkboxGateway:
         marker = " ".join(part for part in marker_parts if part)
         policy = "\n".join([
             "Group SMS response policy: you receive every message in this group so you can track context.",
+            "Reply only when the latest message clearly addresses this Inkbox agent, asks it to act, or a visible answer would be expected from the agent.",
+            "Treat ordinary group chatter as context only.",
+            "If no visible reply is warranted, return exactly [SILENT].",
+        ])
+        return "\n".join(part for part in [marker, policy, body] if part)
+
+    @classmethod
+    def _group_imessage_prompt(
+        cls,
+        body: str,
+        *,
+        sender: str,
+        conversation_id: str,
+        participants: List[str],
+        contact: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        marker_parts = [
+            f"[inkbox:group_imessage conversation_id={conversation_id or 'unknown'}",
+            f"from={sender}",
+            f"participants={','.join(participants)}" if participants else None,
+            "reply_mode=conversation_id",
+            f"| {contact_marker(contact)}]",
+        ]
+        marker = " ".join(part for part in marker_parts if part)
+        policy = "\n".join([
+            "Group iMessage response policy: you receive every message in this group so you can track context.",
             "Reply only when the latest message clearly addresses this Inkbox agent, asks it to act, or a visible answer would be expected from the agent.",
             "Treat ordinary group chatter as context only.",
             "If no visible reply is warranted, return exactly [SILENT].",
@@ -1566,28 +1625,59 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
 
         body = await self._with_media(text, media, prefix=f"imsg-{message.get('id', '')}")
-        conversation_id = str(message.get("conversation_id") or "").strip()
+        conversation_id = str(
+            message.get("conversation_id") or message.get("conversationId") or ""
+        ).strip()
+        conversation_summary = await self._lookup_imessage_conversation_summary(conversation_id)
+        participants: List[str] = []
+        for entry in (
+            self._string_list_field(conversation_summary, "participants")
+            + self._string_list_field(message, "participants")
+        ):
+            if entry not in participants:
+                participants.append(entry)
+        is_group = (
+            self._conversation_summary_is_group(conversation_summary)
+            or bool(self._field(message, "isGroup", "is_group"))
+            or len(participants) > 1
+        )
         contact = await self._resolve_contact_full(kind="phone", value=sender)
         # An address-book contact always wins over a resolved agent identity.
         agent_identity = (
             None
-            if contact
+            if (contact or is_group)
             else self._single_agent_identity(
                 self._webhook_list(data, "agent_identities", "agentIdentities", "identity_agents")
             )
         )
-        chat_id = self._chat_key(
-            data,
-            sender,
-            self._thread_key("imessage", conversation_id),
-            contact=contact,
-            allow_webhook_contact=False,
+        if is_group:
+            body = self._group_imessage_prompt(
+                body,
+                sender=sender,
+                conversation_id=conversation_id,
+                participants=participants,
+                contact=contact,
+            )
+        thread_key = self._thread_key("imessage", conversation_id)
+        # A group is one shared context for everyone in it, so the conversation -
+        # not the sender - is the chat. 1:1 keeps its per-contact chat.
+        chat_id = (
+            thread_key
+            if is_group
+            else self._chat_key(
+                data,
+                sender,
+                thread_key,
+                contact=contact,
+                allow_webhook_contact=False,
+            )
         )
         meta = {
             "conversation_id": conversation_id or None,
             "sender": sender,
             "contact": contact,
             "agent_identity": agent_identity,
+            "conversation_kind": "group" if is_group else "direct",
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("imessage", conversation_id, sender, chat_id=chat_id)

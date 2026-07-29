@@ -52,6 +52,34 @@ logger = logging.getLogger(__name__)
 
 SMS_MAX_LENGTH = 1600
 IMESSAGE_MAX_LENGTH = 18995
+IMESSAGE_MAX_GROUP_RECIPIENTS = 8
+
+
+def _normalize_imessage_recipients(value: Any) -> Optional[List[str]]:
+    """`to` as a list of E.164 strings, or None when the caller omitted it."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        entry = value.strip()
+        return [entry] if entry else []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return []
+
+
+def _identity_can_start_imessage_conversations(identity: Any) -> bool:
+    """Whether the identity holds a dedicated outbound iMessage line."""
+    number = getattr(identity, "imessage_number", None) or getattr(identity, "imessageNumber", None)
+    if number is None:
+        return False
+    can_start = getattr(number, "can_start_conversations", None)
+    if can_start is None:
+        can_start = getattr(number, "canStartConversations", None)
+    if isinstance(can_start, bool):
+        return can_start
+    number_type = number.get("type") if isinstance(number, dict) else getattr(number, "type", None)
+    number_type = getattr(number_type, "value", number_type)
+    return str(number_type or "").strip().lower() == "dedicated_outbound"
 
 # The contact session whose turn is driving the current tool call. Each
 # session binds itself here right before its agent client connects, so the
@@ -376,16 +404,35 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
     @tool(
         "inkbox_send_imessage",
-        "Send an iMessage. Pass an existing conversation_id — get it from "
-        "inkbox_list_imessage_conversations (iMessage is recipient-first: a "
-        "conversation exists only after the person has messaged this agent). To "
-        "attach an image/file, pass media_path as a local file path (uploaded "
-        "automatically, max 10 MB). Text is limited to 18995 characters.",
-        {"conversation_id": str, "text": str, "media_path": str},
+        "Send an iMessage. Reply into an existing 1:1 or group chat with "
+        "conversation_id — get it from inkbox_list_imessage_conversations. A "
+        "dedicated outbound iMessage line may instead start a conversation with "
+        "to: one E.164 recipient, or 2-8 to open a group; shared and dedicated "
+        "inbound lines stay recipient-first. To attach an image/file, pass "
+        "media_path as a local file path (uploaded automatically, max 10 MB). "
+        "Text is limited to 18995 characters.",
+        {"conversation_id": str, "to": list, "text": str, "media_path": str},
     )
     async def inkbox_send_imessage(args: Dict[str, Any]) -> Dict[str, Any]:
         text = str(args.get("text") or "")
-        conversation_id = str(args["conversation_id"])
+        conversation_id = str(args.get("conversation_id") or "").strip()
+        to_list = _normalize_imessage_recipients(args.get("to"))
+        if bool(to_list) == bool(conversation_id):
+            return _error("Specify exactly one of `to` or `conversation_id`.")
+        if to_list is not None and not to_list:
+            return _error("`to` must include at least one recipient.")
+        if to_list and len(to_list) > IMESSAGE_MAX_GROUP_RECIPIENTS:
+            return _error(
+                f"Inkbox iMessage groups support at most {IMESSAGE_MAX_GROUP_RECIPIENTS} recipients."
+            )
+        if to_list and len(set(to_list)) != len(to_list):
+            return _error("iMessage recipients must be distinct.")
+        if len(to_list or []) > 1 and not _identity_can_start_imessage_conversations(_identity()):
+            return _error(
+                "Starting an iMessage group requires a dedicated outbound iMessage "
+                "line. Reply to an existing group with conversation_id.",
+                error_code="imessage_group_requires_dedicated_outbound",
+            )
         if len(text) > IMESSAGE_MAX_LENGTH:
             return _error(
                 _message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH),
@@ -396,10 +443,11 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
 
         def _run():
             identity = _identity()
-            kwargs: Dict[str, Any] = {
-                "conversation_id": conversation_id,
-                "text": text,
-            }
+            kwargs: Dict[str, Any] = {"text": text}
+            if conversation_id:
+                kwargs["conversation_id"] = conversation_id
+            else:
+                kwargs["to"] = to_list[0] if len(to_list) == 1 else to_list
             media_path = str(args.get("media_path") or "").strip()
             if media_path:
                 # One tool call for the agent; the upload→send two-step is internal.
