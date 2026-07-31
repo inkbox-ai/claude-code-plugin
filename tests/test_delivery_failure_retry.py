@@ -26,6 +26,74 @@ from inkbox_claude.config import BridgeConfig
 MAX = gateway.OUTBOUND_FAILURE_MAX_ATTEMPTS
 
 
+@pytest.mark.parametrize(
+    ("attempt", "error_code", "error_detail", "required", "forbidden"),
+    [
+        (
+            1,
+            "40002",
+            "Temporary spam filter rejection",
+            "FIRST SAFE RETRY REQUIRED",
+            "[SILENT]",
+        ),
+        (
+            2,
+            "40002",
+            "Temporary spam filter rejection",
+            "RETRY OPTIONAL",
+            "FIRST SAFE RETRY REQUIRED",
+        ),
+        (
+            1,
+            "recipient_opted_out",
+            "Recipient opted out",
+            "DO NOT RETRY",
+            "FIRST SAFE RETRY REQUIRED",
+        ),
+        (
+            2,
+            "invalid_phone_number",
+            "Destination unreachable",
+            "DO NOT RETRY",
+            "RETRY OPTIONAL",
+        ),
+        (
+            1,
+            "unknown",
+            "Provider rejected the message",
+            "REVIEW BEFORE RETRY",
+            "FIRST SAFE RETRY REQUIRED",
+        ),
+        (
+            2,
+            "unknown",
+            "Provider rejected the message",
+            "REVIEW BEFORE RETRY",
+            "RETRY OPTIONAL",
+        ),
+    ],
+)
+def test_delivery_failure_instruction_uses_attempt_and_classification(
+    attempt,
+    error_code,
+    error_detail,
+    required,
+    forbidden,
+):
+    instruction = gateway._delivery_failure_reply_instruction(
+        mode="sms",
+        error_code=error_code,
+        error_detail=error_detail,
+        attempt=attempt,
+    )
+    assert required in instruction
+    assert forbidden not in instruction
+    if "DO NOT RETRY" in required or "REVIEW BEFORE RETRY" in required:
+        assert "[SILENT]" in instruction
+    if required == "RETRY OPTIONAL":
+        assert "[SILENT]" in instruction
+
+
 @pytest.fixture(autouse=True)
 def fake_web(monkeypatch):
     """aiohttp isn't installed in tests; stub the json_response the handlers use."""
@@ -153,6 +221,8 @@ def test_sms_spam_block_wakes_agent_with_rule():
     assert "message_blocked_spam_filter rule=markdown_artifacts" in text
     assert "reads as bot traffic in SMS" in text
     assert "**Jane Doe** is on file." in text
+    assert "SMS failure classification: FIRST SAFE RETRY REQUIRED" in text
+    assert "[SILENT]" not in text
 
 
 def test_sms_retry_budget_caps_total_sends():
@@ -167,6 +237,10 @@ def test_sms_retry_budget_caps_total_sends():
     assert len(prompts) == MAX - 1
     assert f"attempt=1/{MAX}" in prompts[0]
     assert f"attempt=2/{MAX}" in prompts[1]
+    assert "FIRST SAFE RETRY REQUIRED" in prompts[0]
+    assert "[SILENT]" not in prompts[0]
+    assert "RETRY OPTIONAL" in prompts[1]
+    assert "[SILENT]" in prompts[1]
 
 
 def test_transient_sms_error_does_not_wake_agent():
@@ -195,6 +269,8 @@ def test_sms_too_long_wakes_agent():
     assert len(prompts) == 1
     assert "channel=sms stage=send_rejected" in prompts[0]
     assert "sms_too_long" in prompts[0]
+    assert "SMS failure classification: FIRST SAFE RETRY REQUIRED" in prompts[0]
+    assert "[SILENT]" not in prompts[0]
 
 
 def test_imessage_opt_out_wakes_agent():
@@ -239,6 +315,8 @@ def test_carrier_delivery_failed_wakes_agent():
     assert "[40002]" in text
     assert "flagged by a SPAM filter" in text
     assert "Sorry Kim — the site isn't built yet." in text
+    assert "SMS failure classification: FIRST SAFE RETRY REQUIRED" in text
+    assert "[SILENT]" not in text
 
 
 def test_carrier_delivery_failed_replay_is_deduped():
