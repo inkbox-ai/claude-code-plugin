@@ -111,6 +111,18 @@ def _call_state(remote, call_id) -> tuple[str, str]:
     return status, " ".join(fields)
 
 
+def _wait_for_call_end(client, call_id) -> None:
+    """Wait for the scripted driver to finish instead of cutting its turn off."""
+    deadline = time.monotonic() + TIMEOUT_S
+    last = ""
+    while time.monotonic() < deadline:
+        status, last = _call_state(client, call_id)
+        if status in ENDED_STATUSES | TERMINAL_FAILURE_STATUSES:
+            return
+        time.sleep(POLL_EVERY_S)
+    pytest.fail(f"call did not end within {TIMEOUT_S:.0f}s ({last})")
+
+
 def _wait_for_two_way_call(remote, number_id, call_id):
     """Block until the call transcript shows BOTH the agent and the driver spoke."""
     deadline = time.monotonic() + TIMEOUT_S
@@ -262,7 +274,15 @@ def test_outbound_call_hosted_and_post_call_wakeup():
                 if (getattr(m, "direction", "") or "").lower() == "inbound"
                 and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == tail]
 
+    driver_tail = _digits(st["number"])[-10:]
+
+    def _outbound_calls():
+        return [c for c in aut.calls.list(limit=30)
+                if (getattr(c, "direction", "") or "").lower() == "outbound"
+                and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == driver_tail]
+
     before_calls = {c.id for c in _inbound_calls()}
+    before_outbound = {c.id for c in _outbound_calls()}
     before_texts = {m.id for m in _inbound_texts()}
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
@@ -278,9 +298,19 @@ def test_outbound_call_hosted_and_post_call_wakeup():
         assert call_id, f"agent never placed a hosted call within {TIMEOUT_S:.0f}s"
         _wait_for_two_way_call(remote, st["number_id"], call_id)
 
-        call = remote.calls.get(call_id)
-        assert str(getattr(getattr(call, "mode", ""), "value", getattr(call, "mode", ""))) == "hosted_agent"
-        assert str(getattr(getattr(call, "voicemail_detection", ""), "value", getattr(call, "voicemail_detection", ""))) == "disabled"
+        # A phone call has two independently handled legs. The driver's inbound
+        # leg is intentionally ``client_websocket`` so the scripted media peer
+        # can answer it; the AUT's outbound leg is the one Voice AI must own.
+        fresh_outbound = [c for c in _outbound_calls() if c.id not in before_outbound]
+        assert fresh_outbound, "AUT has no matching outbound call record"
+        placed = fresh_outbound[0]
+        assert str(getattr(getattr(placed, "mode", ""), "value", getattr(placed, "mode", ""))) == "hosted_agent"
+        assert str(getattr(getattr(placed, "voicemail_detection", ""), "value", getattr(placed, "voicemail_detection", ""))) == "disabled"
+
+        # The driver speaks the action after its short human greeting and then
+        # ends the call itself. Let that complete so Voice AI can acknowledge
+        # and persist the instruction before call.ended wakes Claude Code.
+        _wait_for_call_end(remote, call_id)
     finally:
         _hangup_call(remote, call_id)
 

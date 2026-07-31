@@ -80,3 +80,16 @@ def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unava
 
     assert "transcripts not ready" in str(exc.value)
     assert "status='failed'" in str(exc.value)
+
+
+def test_wait_for_call_end_returns_after_scripted_driver_completes():
+    voice = _load_live_voice_module()
+    client = SimpleNamespace(calls=_Calls(
+        call=SimpleNamespace(
+            status="completed", reason="test", hangup_reason="remote",
+            started_at="before", ended_at="now", is_blocked=False,
+        ),
+        transcripts=[],
+    ))
+
+    assert voice._wait_for_call_end(client, "call-id") is None
