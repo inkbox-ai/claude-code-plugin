@@ -755,7 +755,7 @@ class InkboxGateway:
         *,
         event_id: str,
         state: str,
-        payload: Dict[str, Any],
+        payload: Optional[Dict[str, Any]] = None,
         outcome: str = "",
     ) -> None:
         """Atomically persist completion work before acknowledging a webhook."""
@@ -766,14 +766,28 @@ class InkboxGateway:
             if isinstance(value, dict)
             and now - float(value.get("updated_at") or 0) < 30 * 24 * 60 * 60
         }
-        current[call_id] = {
+        previous = current.get(call_id)
+        replay_payload = (
+            self._hosted_call_replay_payload(payload)
+            if payload is not None
+            else (
+                previous.get("payload")
+                if isinstance(previous, dict)
+                else None
+            )
+        )
+        entry = {
             "event_id": event_id,
             "state": state,
             "outcome": outcome,
             "owner_id": self._hosted_call_registry_owner,
-            "payload": payload,
             "updated_at": now,
         }
+        # Only unfinished/retryable work needs replay data. Completed receipts
+        # retain dedupe metadata but immediately discard call content.
+        if state in {"queued", "running", "failed"} and replay_payload is not None:
+            entry["payload"] = replay_payload
+        current[call_id] = entry
         if len(current) > 1_000:
             current = dict(sorted(
                 current.items(),
@@ -785,6 +799,87 @@ class InkboxGateway:
         tmp.chmod(0o600)
         os.replace(tmp, self._hosted_call_registry_path)
         self._hosted_call_registry_path.chmod(0o600)
+
+    @staticmethod
+    def _hosted_call_replay_payload(
+        payload: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Keep only bounded fields required to retry post-call work.
+
+        The authenticated event can include a transcript and contact memories.
+        Recovery fetches the authoritative transcript from Inkbox, so neither
+        belongs in the durable receipt. Open actions remain because they are
+        the work the recovered Claude turn must reconcile.
+        """
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        call = data.get("call") if isinstance(data, dict) else None
+        if not isinstance(call, dict):
+            return None
+
+        def bounded(value: Any, limit: int) -> str:
+            return str(value or "")[:limit]
+
+        call_snapshot = {
+            key: bounded(call.get(key), limit)
+            for key, limit in (
+                ("id", 128),
+                ("mode", 64),
+                ("direction", 32),
+                ("status", 64),
+                ("hangup_reason", 512),
+                ("remote_phone_number", 128),
+                ("reason", 4_000),
+            )
+            if call.get(key) is not None
+        }
+        contacts = data.get("contacts") if isinstance(data, dict) else None
+        contact_snapshot: List[Dict[str, str]] = []
+        if isinstance(contacts, list) and contacts and isinstance(contacts[0], dict):
+            contact = contacts[0]
+            contact_snapshot.append({
+                key: bounded(contact.get(key), limit)
+                for key, limit in (
+                    ("id", 128),
+                    ("name", 1_000),
+                    ("preferred_name", 1_000),
+                )
+                if contact.get(key) is not None
+            })
+
+        action_snapshot: List[Dict[str, str]] = []
+        raw_actions = (
+            data.get("post_call_action_items")
+            if isinstance(data, dict)
+            else None
+        )
+        for action in raw_actions[:100] if isinstance(raw_actions, list) else []:
+            if not isinstance(action, dict):
+                continue
+            action_snapshot.append({
+                key: bounded(action.get(key), limit)
+                for key, limit in (
+                    ("id", 128),
+                    ("seq", 32),
+                    ("action", 4_000),
+                    ("description", 4_000),
+                    ("details", 8_000),
+                    ("status", 64),
+                )
+                if action.get(key) is not None
+            })
+
+        return {
+            "id": bounded(payload.get("id"), 128),
+            "event_type": "call.ended",
+            "data": {
+                "call": call_snapshot,
+                "contacts": contact_snapshot,
+                "outcome": bounded(data.get("outcome"), 128),
+                "post_call_action_items": action_snapshot,
+            },
+        }
 
     def _schedule_hosted_call_completion(
         self,
@@ -943,7 +1038,7 @@ class InkboxGateway:
                 raise RuntimeError("session manager is not ready")
             await self.sessions.get(chat_id).run_consult("\n".join(lines))
             self._write_hosted_call_registry(
-                call_id, event_id=event_id, state="completed", payload=envelope, outcome=outcome
+                call_id, event_id=event_id, state="completed", outcome=outcome
             )
             logger.info("[bridge] completed hosted call completion call_id=%s", call_id)
         except asyncio.CancelledError:

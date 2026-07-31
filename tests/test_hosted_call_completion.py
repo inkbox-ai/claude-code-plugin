@@ -108,14 +108,37 @@ def test_hosted_completion_runs_once_and_suppresses_plain_text(tmp_path):
     asyncio.run(scenario())
 
 
-def test_hosted_completion_registry_is_private_and_contains_recovery_payload(tmp_path):
+def test_hosted_completion_registry_is_private_bounded_and_drops_completed_payload(tmp_path):
     async def scenario():
         gateway, _ = _gateway(tmp_path)
-        await gateway._on_hosted_call_ended(_payload())
+        payload = _payload()
+        payload["data"]["contacts"][0]["memories"] = ["private" * 20_000]
+        payload["data"]["transcript"]["entries"][0]["text"] = "secret" * 100_000
+        payload["data"]["post_call_action_items"] = [
+            {
+                "id": f"action-{index}",
+                "action": "a" * 10_000,
+                "details": "d" * 20_000,
+                "status": "open",
+            }
+            for index in range(150)
+        ]
+        await gateway._on_hosted_call_ended(payload)
+        queued = json.loads(
+            gateway._hosted_call_registry_path.read_text()
+        )["call-1"]
+        replay = queued["payload"]["data"]
+        assert "transcript" not in replay
+        assert "memories" not in replay["contacts"][0]
+        assert len(replay["post_call_action_items"]) == 100
+        assert len(replay["post_call_action_items"][0]["action"]) == 4_000
+        assert len(replay["post_call_action_items"][0]["details"]) == 8_000
+        assert gateway._hosted_call_registry_path.stat().st_mode & 0o777 == 0o600
+
         await _drain(gateway)
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
-        assert entry["payload"]["event_type"] == "call.ended"
-        assert gateway._hosted_call_registry_path.stat().st_mode & 0o777 == 0o600
+        assert entry["state"] == "completed"
+        assert "payload" not in entry
 
     asyncio.run(scenario())
 
