@@ -414,6 +414,24 @@ def test_place_call_requires_purpose():
     assert "purpose is required" in data["error"]
 
 
+def test_place_call_forwards_disabled_voicemail_detection(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    client = _FakeClient()
+
+    data = _call(
+        client,
+        "inkbox_place_call",
+        {
+            "to_number": "+15551112222",
+            "purpose": "run the CI voice check",
+            "voicemail_detection": "disabled",
+        },
+    )
+
+    assert data["placed"] is True
+    assert client.identity.place_call_kwargs["voicemail_detection"] == "disabled"
+
+
 def test_place_call_explicit_origination_wins():
     client = _FakeClient()
     client.identity.imessage_enabled = True

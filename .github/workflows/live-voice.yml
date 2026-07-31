@@ -58,7 +58,7 @@ jobs:
       - name: Install bridge + driver deps
         run: |
           pip install \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@fdea6e55ac117f246624852aedeef0feabe08b9a#subdirectory=sdk/python" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI
