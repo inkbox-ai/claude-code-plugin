@@ -264,7 +264,6 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     aut_numbers = aut.phone_numbers.list()
     assert aut_numbers, "AUT identity has no phone number"
     aut_phone = aut_numbers[0].number
-    aut_number_id = str(aut_numbers[0].id)
     tail = _digits(aut_phone)[-10:]
 
     def _inbound_calls():
@@ -279,14 +278,14 @@ def test_outbound_call_hosted_and_post_call_wakeup():
                 if (getattr(c, "direction", "") or "").lower() == "outbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == driver_tail]
 
-    def _aut_outbound_texts():
-        return [m for m in aut.texts.list(aut_number_id, limit=30)
-                if (getattr(m, "direction", "") or "").lower() == "outbound"
-                and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == driver_tail]
+    def _driver_inbound_texts():
+        return [m for m in remote.texts.list(st["number_id"], limit=200)
+                if (getattr(m, "direction", "") or "").lower() == "inbound"
+                and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == tail]
 
     before_calls = {c.id for c in _inbound_calls()}
     before_outbound = {c.id for c in _outbound_calls()}
-    before_texts = {m.id for m in _aut_outbound_texts()}
+    before_texts = {m.id for m in _driver_inbound_texts()}
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     call_id = None
@@ -321,7 +320,7 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     delivered = []
     while time.monotonic() < deadline:
         delivered = [
-            message for message in _aut_outbound_texts()
+            message for message in _driver_inbound_texts()
             if message.id not in before_texts
             and HOSTED_POST_CALL_MARKER in (message.text or "")
         ]
@@ -336,7 +335,7 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     # captured model reply must not leak onto the requesting channel.
     time.sleep(2 * POLL_EVERY_S)
     new_texts = [
-        message for message in _aut_outbound_texts()
+        message for message in _driver_inbound_texts()
         if message.id not in before_texts
     ]
     assert len(new_texts) == 1, (
