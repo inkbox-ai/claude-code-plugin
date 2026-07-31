@@ -704,7 +704,6 @@ class InkboxGateway:
             _reconcile(
                 {"agent_identity_id": identity.id},
                 A2A_EVENTS,
-                subscription_url=f"{webhook_url}?channel=a2a",
             )
         except Exception as exc:
             if not _is_unsupported_a2a_event_types(exc):

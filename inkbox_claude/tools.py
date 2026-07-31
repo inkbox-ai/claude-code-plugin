@@ -474,8 +474,16 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         "if they are connected to you over iMessage, otherwise the call is "
         "rejected). If origination is omitted it is resolved automatically. The "
         "call's audio bridges to the running gateway. Always pass purpose so the "
-        "live call opens with context; optionally pass opening_message and context.",
-        {"to_number": str, "purpose": str, "origination": str, "opening_message": str, "context": str},
+        "live call opens with context; optionally pass opening_message, context, "
+        "and voicemail_detection (enabled or disabled).",
+        {
+            "to_number": str,
+            "purpose": str,
+            "origination": str,
+            "opening_message": str,
+            "context": str,
+            "voicemail_detection": str,
+        },
     )
     async def inkbox_place_call(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
@@ -486,6 +494,13 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             if not purpose:
                 raise ValueError(
                     "purpose is required so the live call opens with context"
+                )
+            voicemail_detection = str(
+                args.get("voicemail_detection") or ""
+            ).strip().lower()
+            if voicemail_detection not in {"", "enabled", "disabled"}:
+                raise ValueError(
+                    "voicemail_detection must be enabled or disabled"
                 )
             identity = _identity()
 
@@ -519,13 +534,20 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                 to_number=to_number,
             )
             ws_url = _append_query_param(ws_url, "context_token", token)
+            call_kwargs = {
+                "to_number": to_number,
+                "origination": origination,
+                "client_websocket_url": ws_url,
+            }
+            if voicemail_detection:
+                call_kwargs["voicemail_detection"] = voicemail_detection
             try:
-                call = identity.place_call(
-                    to_number=to_number,
-                    origination=origination,
-                    client_websocket_url=ws_url,
-                )
+                call = identity.place_call(**call_kwargs)
             except TypeError:
+                if voicemail_detection:
+                    raise RuntimeError(
+                        "voicemail_detection requires inkbox SDK 0.5.8 or newer"
+                    )
                 # Older SDK without ``origination`` support → dedicated only.
                 call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
             return {
