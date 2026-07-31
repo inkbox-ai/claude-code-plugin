@@ -1,12 +1,14 @@
 """Live voice-call suite — real phone calls, real model, transcript-verified.
 
-Two scenarios, each run against a bridge booted in the matching speech mode (the
+Three scenarios, each run against a bridge booted in the matching speech mode (the
 workflow sets that up and selects the scenario via VOICE_SCENARIO):
 
   * inbound_inkbox   — the driver calls the agent; the agent answers with Inkbox
                        STT/TTS and holds a turn.
   * outbound_realtime — the driver texts "call me"; the agent places a call back,
                        powered by the realtime API, and holds a turn.
+  * outbound_hosted — the driver texts "call me"; Inkbox Voice AI runs the call,
+                      then call.ended wakes Claude Code to perform one action.
 
 A companion driver process (voice_driver.py) bridges the driver's side of the call
 over an Inkbox tunnel and speaks one line. We then read the stored call transcript
@@ -46,6 +48,7 @@ AUT_KEY = os.environ.get("CLAUDE_CODE_INKBOX_API_KEY")
 BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 REAL = os.environ.get("LIVE_REAL_MODEL") == "1"
 SCENARIO = os.environ.get("VOICE_SCENARIO", "")
+HOSTED_POST_CALL_MARKER = os.environ.get("HOSTED_POST_CALL_MARKER", "")
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
 TIMEOUT_S = float(os.environ.get("LIVE_VOICE_TIMEOUT", "220"))
 POLL_EVERY_S = 6.0
@@ -238,3 +241,53 @@ def test_outbound_call_realtime():
             f"outbound call must be powered by the realtime API (Inkbox speech off), got tts={tts} stt={stt}"
     finally:
         _hangup_call(remote, call_id)
+
+
+@pytest.mark.skipif(SCENARIO != "outbound_hosted", reason="outbound Voice AI leg only")
+def test_outbound_call_hosted_and_post_call_wakeup():
+    """Voice AI runs the call; Claude executes its open action after call.ended."""
+    assert HOSTED_POST_CALL_MARKER, "HOSTED_POST_CALL_MARKER is required"
+    st = _driver_state()
+    remote, aut = _client(REMOTE_KEY), _client(AUT_KEY)
+    aut_phone = _aut_phone(aut)
+    tail = _digits(aut_phone)[-10:]
+
+    def _inbound_calls():
+        return [c for c in remote.calls.list(limit=30)
+                if (getattr(c, "direction", "") or "").lower() == "inbound"
+                and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == tail]
+
+    def _inbound_texts():
+        return [m for m in remote.texts.list(st["number_id"], limit=30)
+                if (getattr(m, "direction", "") or "").lower() == "inbound"
+                and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == tail]
+
+    before_calls = {c.id for c in _inbound_calls()}
+    before_texts = {m.id for m in _inbound_texts()}
+    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
+
+    call_id = None
+    try:
+        deadline = time.monotonic() + TIMEOUT_S
+        while time.monotonic() < deadline:
+            fresh = [c for c in _inbound_calls() if c.id not in before_calls]
+            if fresh:
+                call_id = fresh[0].id
+                break
+            time.sleep(POLL_EVERY_S)
+        assert call_id, f"agent never placed a hosted call within {TIMEOUT_S:.0f}s"
+        _wait_for_two_way_call(remote, st["number_id"], call_id)
+
+        call = remote.calls.get(call_id)
+        assert str(getattr(getattr(call, "mode", ""), "value", getattr(call, "mode", ""))) == "hosted_agent"
+        assert str(getattr(getattr(call, "voicemail_detection", ""), "value", getattr(call, "voicemail_detection", ""))) == "disabled"
+    finally:
+        _hangup_call(remote, call_id)
+
+    deadline = time.monotonic() + TIMEOUT_S
+    while time.monotonic() < deadline:
+        for message in _inbound_texts():
+            if message.id not in before_texts and HOSTED_POST_CALL_MARKER in (message.text or ""):
+                return
+        time.sleep(POLL_EVERY_S)
+    pytest.fail("hosted call ended but Claude Code did not execute its post-call SMS action")

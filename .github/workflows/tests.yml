@@ -55,7 +55,7 @@ jobs:
       - name: Install bridge + latest SDK
         run: |
           uv pip install --system \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@73f18a2b8c0e9dc6887c5663e6e904d54869927e#subdirectory=sdk/python" \
             -e . pytest
           uv pip install --system -U claude-agent-sdk
 

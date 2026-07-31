@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from inkbox_claude import tools as tools_mod
+from inkbox_claude.config import BridgeConfig, VoiceStack
 
 
 @pytest.fixture(autouse=True)
@@ -171,14 +172,20 @@ class _FakeClient:
         return self.identity
 
 
-def _tool_map(client):
-    server, tool_names = tools_mod.build_inkbox_mcp_server(client, "claude-agent")
+def _tool_map(client, cfg=None):
+    server, tool_names = tools_mod.build_inkbox_mcp_server(client, "claude-agent", cfg)
     return {tool._inkbox_tool_name: tool for tool in server["tools"]}, tool_names
 
 
 def _call(client, name, arguments):
     tools, _tool_names = _tool_map(client)
     result = asyncio.run(tools[name](arguments))
+    return json.loads(result["content"][0]["text"])
+
+
+def _call_with_config(client, cfg, name, arguments):
+    registered, _ = _tool_map(client, cfg)
+    result = asyncio.run(registered[name](arguments))
     return json.loads(result["content"][0]["text"])
 
 
@@ -191,6 +198,38 @@ def test_call_tools_are_registered():
     assert "mcp__inkbox__inkbox_place_call" in tool_names
     assert "mcp__inkbox__inkbox_list_calls" in tool_names
     assert "mcp__inkbox__inkbox_get_call_transcript" in tool_names
+
+
+def test_hosted_place_call_uses_reason_and_saved_authority_default():
+    client = _FakeClient()
+    result = _call_with_config(
+        client,
+        BridgeConfig(
+            voice_stack=VoiceStack.INKBOX_VOICE_AI,
+            voicemail_detection="disabled",
+        ),
+        "inkbox_place_call",
+        {
+            "to_number": "+15551112222",
+            "purpose": "Confirm the release window",
+            "opening_message": "Introduce yourself first",
+            "context": "The release is currently green",
+        },
+    )
+
+    assert result["mode"] == "hosted_agent"
+    assert client.identity.place_call_kwargs == {
+        "to_number": "+15551112222",
+        "origination": "dedicated_number",
+        "mode": "hosted_agent",
+        "reason": (
+            "Confirm the release window\n\n"
+            "Opening guidance: Introduce yourself first\n\n"
+            "Additional context: The release is currently green"
+        ),
+        "voicemail_detection": "disabled",
+    }
+    assert "hosted_agent_authority_mode" not in client.identity.place_call_kwargs
 
 
 def test_coding_agent_tool_tier_is_registered():

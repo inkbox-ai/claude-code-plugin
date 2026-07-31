@@ -7,9 +7,9 @@ import shutil
 from typing import List, Tuple
 
 try:
-    from .config import inkbox_client_kwargs, read_config
+    from .config import VoiceStack, inkbox_client_kwargs, read_config
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import inkbox_client_kwargs, read_config
+    from config import VoiceStack, inkbox_client_kwargs, read_config
 
 
 def run_doctor() -> List[Tuple[str, bool, str]]:
@@ -37,12 +37,28 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         bool(cfg.signing_key) or not cfg.require_signature,
         "set" if cfg.signing_key else "missing (required for signed inbound webhooks)",
     ))
+    checks.append((
+        "phone voice stack",
+        not bool(cfg.voice_stack_invalid_value),
+        cfg.voice_stack_invalid_value or cfg.voice_stack.value,
+    ))
+    checks.append((
+        "voicemail detection",
+        cfg.voicemail_detection in {"enabled", "disabled"},
+        cfg.voicemail_detection,
+    ))
+    if cfg.voice_stack is VoiceStack.OPENAI_REALTIME:
+        checks.append((
+            "OpenAI Realtime key",
+            bool(cfg.realtime.api_key),
+            "set" if cfg.realtime.api_key else "missing",
+        ))
 
     try:
         import inkbox  # noqa: F401
         checks.append(("inkbox SDK", True, "installed"))
     except ImportError:
-        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.5.6,<1.0.0'"))
+        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.5.9,<1.0.0'"))
 
     try:
         import claude_agent_sdk  # noqa: F401
@@ -83,6 +99,24 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
                 "imessage" if getattr(identity, "imessage_enabled", False) else None,
             ])) or "no channels provisioned"
             checks.append(("identity reachable", True, detail))
+            if cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI:
+                try:
+                    hosted = identity.get_hosted_agent_config()
+                    remote = str(
+                        getattr(
+                            getattr(hosted, "authority_mode", ""),
+                            "value",
+                            getattr(hosted, "authority_mode", ""),
+                        )
+                        or "contact_scoped"
+                    )
+                    checks.append((
+                        "Voice AI authority",
+                        remote == cfg.voice_ai_authority_mode,
+                        remote,
+                    ))
+                except Exception as exc:
+                    checks.append(("Voice AI authority", False, str(exc)))
         except Exception as exc:
             checks.append(("identity reachable", False, str(exc)))
 

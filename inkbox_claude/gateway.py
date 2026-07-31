@@ -29,6 +29,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,12 +62,13 @@ try:
         DEFAULT_WEBHOOK_PATH,
         INKBOX_WS_PATH,
         BridgeConfig,
+        VoiceStack,
         call_contexts_dir,
         inkbox_client_kwargs,
     )
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .media import download_media, inbound_media_note
-    from .prompts import contact_marker, frame_inbound, normalize_contact_memories, strip_markdown
+    from .prompts import contact_marker, contact_memories_block, frame_inbound, normalize_contact_memories, strip_markdown
     from .realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -76,10 +78,10 @@ try:
     from .tools import build_inkbox_mcp_server
     from .webhook_providers import match_provider
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, call_contexts_dir, inkbox_client_kwargs
+    from config import DEFAULT_WEBHOOK_PATH, INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir, inkbox_client_kwargs
     from a2a_delegations import find_by_task as find_a2a_delegation
     from media import download_media, inbound_media_note
-    from prompts import contact_marker, frame_inbound, normalize_contact_memories, strip_markdown
+    from prompts import contact_marker, contact_memories_block, frame_inbound, normalize_contact_memories, strip_markdown
     from realtime import (
         RealtimeBridgeConnectError,
         RealtimeCallMeta,
@@ -417,6 +419,7 @@ A2A_EVENTS = [
     "a2a.task.canceled",
     "a2a.sent_task.updated",
 ]
+CALL_EVENTS = ["call.ended"]
 A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 
 
@@ -519,6 +522,11 @@ class InkboxGateway:
             Path.home() / ".inkbox-claude" / "a2a_tasks.json"
         )
         self._a2a_jobs: Dict[str, set[asyncio.Task[Any]]] = {}
+        state_root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
+        state_root.mkdir(parents=True, exist_ok=True)
+        self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
+        self._hosted_call_registry_owner = uuid.uuid4().hex
+        self._hosted_call_jobs: Dict[str, asyncio.Task[Any]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -533,7 +541,13 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.5.6,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.5.9,<1.0.0'")
+        if self.cfg.voice_stack_invalid_value:
+            raise RuntimeError(
+                f"invalid INKBOX_VOICE_STACK={self.cfg.voice_stack_invalid_value!r}; rerun setup"
+            )
+        if self.cfg.voicemail_detection not in {"enabled", "disabled"}:
+            raise RuntimeError("INKBOX_VOICEMAIL_DETECTION must be enabled or disabled")
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
 
@@ -562,7 +576,7 @@ class InkboxGateway:
         await asyncio.to_thread(self._patch_identity_objects)
 
         # Sessions get the Inkbox tools so Claude can message proactively.
-        server, tool_names = build_inkbox_mcp_server(self._inkbox, self.cfg.identity)
+        server, tool_names = build_inkbox_mcp_server(self._inkbox, self.cfg.identity, self.cfg)
         self.sessions = SessionManager(
             cfg=self.cfg,
             send_fn=self.send_to_contact,
@@ -574,6 +588,7 @@ class InkboxGateway:
             health_fn=self.health_report,
         )
         await self._catch_up_a2a_tasks()
+        await self._recover_hosted_call_completions()
 
         logger.info(
             "[bridge] ready — %s / %s / %s → Claude Code in %s",
@@ -682,11 +697,18 @@ class InkboxGateway:
         )
         if can_receive_calls:
             if hasattr(identity, "set_incoming_call_action"):
-                identity.set_incoming_call_action(
-                    incoming_call_action="auto_accept",
-                    client_websocket_url=ws_url,
-                    incoming_call_webhook_url=webhook_url,
-                )
+                if self.cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI:
+                    identity.set_incoming_call_action(
+                        incoming_call_action="hosted_agent",
+                        client_websocket_url=None,
+                        incoming_call_webhook_url=None,
+                    )
+                else:
+                    identity.set_incoming_call_action(
+                        incoming_call_action="auto_accept",
+                        client_websocket_url=ws_url,
+                        incoming_call_webhook_url=webhook_url,
+                    )
             elif identity.phone_number is not None:
                 # Legacy SDKs (<0.4.15) only expose the number-scoped shim,
                 # which cannot configure a shared-iMessage-only identity.
@@ -712,11 +734,232 @@ class InkboxGateway:
                 "[bridge] Inkbox API does not support A2A webhook events yet; "
                 "continuing without A2A delivery until the backend is upgraded"
             )
+        _reconcile({"agent_identity_id": identity.id}, CALL_EVENTS)
         if getattr(identity, "imessage_enabled", False):
             _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
+    def _read_hosted_call_registry(self) -> Dict[str, Any]:
+        if not self._hosted_call_registry_path.exists():
+            return {}
+        try:
+            loaded = json.loads(self._hosted_call_registry_path.read_text())
+        except Exception:
+            logger.exception("[bridge] hosted-call completion registry is unreadable")
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def _write_hosted_call_registry(
+        self,
+        call_id: str,
+        *,
+        event_id: str,
+        state: str,
+        payload: Dict[str, Any],
+        outcome: str = "",
+    ) -> None:
+        """Atomically persist completion work before acknowledging a webhook."""
+        now = time.time()
+        current = {
+            key: value
+            for key, value in self._read_hosted_call_registry().items()
+            if isinstance(value, dict)
+            and now - float(value.get("updated_at") or 0) < 30 * 24 * 60 * 60
+        }
+        current[call_id] = {
+            "event_id": event_id,
+            "state": state,
+            "outcome": outcome,
+            "owner_id": self._hosted_call_registry_owner,
+            "payload": payload,
+            "updated_at": now,
+        }
+        if len(current) > 1_000:
+            current = dict(sorted(
+                current.items(),
+                key=lambda item: float(item[1].get("updated_at") or 0),
+                reverse=True,
+            )[:1_000])
+        tmp = self._hosted_call_registry_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+        tmp.chmod(0o600)
+        os.replace(tmp, self._hosted_call_registry_path)
+        self._hosted_call_registry_path.chmod(0o600)
+
+    def _schedule_hosted_call_completion(
+        self,
+        call_id: str,
+        event_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        task = asyncio.create_task(
+            self._run_hosted_call_completion(call_id, event_id, payload),
+            name=f"hosted-call-completion:{call_id}",
+        )
+        self._hosted_call_jobs[call_id] = task
+        task.add_done_callback(lambda _task, key=call_id: self._hosted_call_jobs.pop(key, None))
+
+    async def _recover_hosted_call_completions(self) -> None:
+        """Requeue work left queued/running/failed by a previous process."""
+        for call_id, entry in self._read_hosted_call_registry().items():
+            if not isinstance(entry, dict) or entry.get("state") == "completed":
+                continue
+            payload = entry.get("payload")
+            if not isinstance(payload, dict) or call_id in self._hosted_call_jobs:
+                continue
+            self._write_hosted_call_registry(
+                call_id,
+                event_id=str(entry.get("event_id") or ""),
+                state="queued",
+                payload=payload,
+                outcome=str(entry.get("outcome") or ""),
+            )
+            self._schedule_hosted_call_completion(
+                call_id, str(entry.get("event_id") or ""), payload
+            )
+
+    async def _on_hosted_call_ended(self, envelope: Dict[str, Any]) -> "web.Response":
+        data = envelope.get("data")
+        call = data.get("call") if isinstance(data, dict) else None
+        if not isinstance(call, dict) or str(call.get("mode") or "") != "hosted_agent":
+            return web.json_response({"ok": True, "ignored": "non-hosted-call"})
+        call_id = str(call.get("id") or "").strip()
+        if not call_id:
+            return web.json_response({"ok": True, "ignored": "missing-call-id"})
+        existing = self._read_hosted_call_registry().get(call_id)
+        state = str(existing.get("state") or "") if isinstance(existing, dict) else ""
+        current_inflight = (
+            isinstance(existing, dict)
+            and state in {"queued", "running"}
+            and existing.get("owner_id") == self._hosted_call_registry_owner
+        )
+        if state == "completed" or current_inflight:
+            return web.json_response({"ok": True, "deduped": True})
+        event_id = str(envelope.get("id") or "").strip()
+        self._write_hosted_call_registry(
+            call_id,
+            event_id=event_id,
+            state="queued",
+            payload=envelope,
+            outcome=str(data.get("outcome") or call.get("status") or ""),
+        )
+        self._schedule_hosted_call_completion(call_id, event_id, envelope)
+        logger.info("[bridge] enqueued hosted call completion call_id=%s", call_id)
+        return web.json_response({"ok": True})
+
+    async def _run_hosted_call_completion(
+        self,
+        call_id: str,
+        event_id: str,
+        envelope: Dict[str, Any],
+    ) -> None:
+        data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        call = data.get("call") if isinstance(data.get("call"), dict) else {}
+        outcome = str(data.get("outcome") or call.get("status") or "unknown")
+        self._write_hosted_call_registry(
+            call_id, event_id=event_id, state="running", payload=envelope, outcome=outcome
+        )
+        try:
+            transcript: List[Tuple[str, str]] = []
+            try:
+                identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+                list_transcripts = getattr(identity, "list_transcripts", None)
+                if callable(list_transcripts):
+                    rows = await asyncio.to_thread(list_transcripts, call_id)
+                    transcript = [
+                        (
+                            str(getattr(getattr(row, "party", ""), "value", getattr(row, "party", "")) or "unknown"),
+                            str(getattr(row, "text", "") or ""),
+                        )
+                        for row in (rows or [])
+                        if str(getattr(row, "text", "") or "").strip()
+                    ]
+            except Exception as exc:
+                logger.warning(
+                    "[bridge] full transcript unavailable for hosted call %s: %s; using webhook transcript",
+                    call_id,
+                    exc,
+                )
+            if not transcript:
+                inline = data.get("transcript")
+                entries = inline.get("entries") if isinstance(inline, dict) else []
+                transcript = [
+                    (str(row.get("party") or "unknown"), str(row.get("text") or ""))
+                    for row in (entries or [])
+                    if isinstance(row, dict)
+                    and "marker" not in row
+                    and str(row.get("text") or "").strip()
+                ]
+            contacts = data.get("contacts") if isinstance(data.get("contacts"), list) else []
+            contact = contacts[0] if contacts and isinstance(contacts[0], dict) else {}
+            remote = str(call.get("remote_phone_number") or "").strip()
+            chat_id = str(contact.get("id") or remote or f"call:{call_id}")
+            actions = [
+                item for item in (data.get("post_call_action_items") or [])
+                if isinstance(item, dict) and str(item.get("status") or "open") == "open"
+            ]
+            lines = [
+                f"[inkbox:voice_call call_id={call_id}]",
+            ]
+            memories = contact_memories_block(contact.get("memories") or [])
+            if memories:
+                lines.append(memories)
+            lines.extend([
+                "[call_ended] Inkbox Voice AI finished this phone call.",
+                f"Direction: {call.get('direction') or 'unknown'}",
+                f"Outcome: {outcome}",
+            ])
+            hangup = str(call.get("hangup_reason") or "").strip()
+            reason = str(call.get("reason") or "").strip()
+            if hangup:
+                lines.append(f"Hangup reason: {hangup}")
+            if remote:
+                lines.extend([
+                    f"Remote party phone number: {remote}",
+                    "For callbacks or phone follow-up, use that exact number. "
+                    "Contact memories are background only and must not override it.",
+                ])
+            if reason:
+                lines.append(f"Outbound task: {reason}")
+            lines.extend(["", "Call transcript:"])
+            lines.extend(f"  - {role}: {text}" for role, text in transcript)
+            if not transcript:
+                lines.append("  (no transcript captured)")
+            if actions:
+                lines.extend(["", "Open post-call actions:"])
+                lines.extend(
+                    f"  - {item.get('action') or item.get('description') or item}"
+                    for item in actions
+                )
+            lines.extend([
+                "",
+                "Review the outcome, transcript, and open actions once. Use tools "
+                "to execute every still-needed commitment; do not repeat completed, "
+                "canceled, superseded, or already-performed work.",
+                "If nothing remains, do nothing. Plain text from this turn is "
+                "suppressed because the call has ended; side effects require tools.",
+            ])
+            if self.sessions is None:
+                raise RuntimeError("session manager is not ready")
+            await self.sessions.get(chat_id).run_consult("\n".join(lines))
+            self._write_hosted_call_registry(
+                call_id, event_id=event_id, state="completed", payload=envelope, outcome=outcome
+            )
+            logger.info("[bridge] completed hosted call completion call_id=%s", call_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._write_hosted_call_registry(
+                call_id, event_id=event_id, state="failed", payload=envelope, outcome=outcome
+            )
+            logger.exception("[bridge] hosted call completion failed call_id=%s", call_id)
+
     async def _cleanup(self) -> None:
+        jobs = list(self._hosted_call_jobs.values())
+        for task in jobs:
+            task.cancel()
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
         if self.sessions is not None:
             await self.sessions.close_all()
         if self._runner is not None:
@@ -863,6 +1106,8 @@ class InkboxGateway:
                     response = await self._on_imessage_received(envelope)
                 elif event_type == "imessage.reaction_received":
                     response = await self._on_imessage_reaction_received(envelope)
+                elif event_type == "call.ended":
+                    response = await self._on_hosted_call_ended(envelope)
                 elif event_type.startswith("a2a."):
                     response = await self._on_a2a_event(envelope)
                 # Outbound delivery failures: tell the agent its message didn't
@@ -935,7 +1180,7 @@ class InkboxGateway:
             bool: True for a recognised Inkbox event shape.
         """
         if event_type and event_type.startswith(
-            ("message.", "text.", "imessage.", "a2a.")
+            ("message.", "text.", "imessage.", "a2a.", "call.")
         ):
             return True
         # ``id`` by itself is not a call discriminator: generic external

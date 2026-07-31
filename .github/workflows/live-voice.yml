@@ -4,6 +4,7 @@ name: Live voice e2e
 #   * inbound_inkbox    — driver calls the agent; Inkbox STT/TTS answers.
 #   * outbound_realtime — driver texts "call me"; the agent dials back powered
 #                         by the realtime voice API.
+#   * outbound_hosted   — Voice AI runs the call and call.ended wakes Claude.
 # A driver process (tests/live/voice_driver.py) is the peer on the other end
 # of the call, bridged over the driver identity's own Inkbox tunnel.
 
@@ -31,9 +32,10 @@ jobs:
       max-parallel: 1
       fail-fast: false
       matrix:
-        scenario: [inbound_inkbox, outbound_realtime]
+        scenario: [inbound_inkbox, outbound_realtime, outbound_hosted]
     env:
       INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_VOICEMAIL_DETECTION: "disabled"
       INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
       CLAUDE_PROJECT_DIR: ${{ github.workspace }}
       INKBOX_PERMISSION_TIMEOUT_S: "30"
@@ -58,7 +60,7 @@ jobs:
       - name: Install bridge + driver deps
         run: |
           pip install \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
+            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@73f18a2b8c0e9dc6887c5663e6e904d54869927e#subdirectory=sdk/python" \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI
@@ -79,10 +81,18 @@ jobs:
       - name: Configure speech mode (${{ matrix.scenario }})
         run: |
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
+            echo "INKBOX_VOICE_STACK=openai_realtime" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=true" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
+            marker="hosted-post-call-$(openssl rand -hex 6)"
+            echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
+            echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
+            echo "HOSTED_POST_CALL_MARKER=$marker" >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_LINE=After this call ends, send me an SMS containing exactly: $marker" >> "$GITHUB_ENV"
           else
+            echo "INKBOX_VOICE_STACK=inkbox_tts_stt" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
           fi
 

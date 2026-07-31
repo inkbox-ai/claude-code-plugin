@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.metadata
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
@@ -24,6 +25,14 @@ DISTRIBUTION_NAME = "claude-code-plugin"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
 DEFAULT_WEBHOOK_PATH = "/webhook"
+
+
+class VoiceStack(str, Enum):
+    """Supported phone-call voice stacks."""
+
+    INKBOX_VOICE_AI = "inkbox_voice_ai"
+    OPENAI_REALTIME = "openai_realtime"
+    INKBOX_TTS_STT = "inkbox_tts_stt"
 
 # Tools Claude Code may run without texting the human first. Everything
 # else (Bash, Write, Edit, ...) escalates over the active channel.
@@ -82,6 +91,10 @@ class BridgeConfig:
     claude_model: str = ""
     permission_timeout_s: float = 600.0
     auto_allowed_tools: List[str] = field(default_factory=lambda: list(DEFAULT_AUTO_ALLOWED_TOOLS))
+    voice_stack: VoiceStack = VoiceStack.INKBOX_TTS_STT
+    voice_stack_invalid_value: str = ""
+    voice_ai_authority_mode: str = "contact_scoped"
+    voicemail_detection: str = "enabled"
     # OpenAI Realtime voice (off unless the wizard validated a key)
     realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
 
@@ -130,8 +143,36 @@ def _read_realtime_config() -> RealtimeConfig:
     )
 
 
+def resolve_voice_stack(
+    value: Any,
+    *,
+    realtime_enabled: Any = None,
+    realtime_api_key: str = "",
+) -> tuple[VoiceStack, str]:
+    """Resolve the canonical stack while preserving pre-selector installs."""
+    normalized = str(value or "").strip().lower()
+    if normalized:
+        try:
+            return VoiceStack(normalized), ""
+        except ValueError:
+            return VoiceStack.INKBOX_TTS_STT, normalized
+    if realtime_enabled is not None:
+        enabled = str(realtime_enabled).strip().lower() in {"auto", "1", "true", "yes", "on"}
+        if not enabled:
+            return VoiceStack.INKBOX_TTS_STT, ""
+    if realtime_api_key:
+        return VoiceStack.OPENAI_REALTIME, ""
+    return VoiceStack.INKBOX_TTS_STT, ""
+
+
 def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
     extra = extra or {}
+    realtime = _read_realtime_config()
+    voice_stack, invalid_voice_stack = resolve_voice_stack(
+        extra.get("voice_stack") or os.getenv("INKBOX_VOICE_STACK"),
+        realtime_enabled=os.getenv("INKBOX_REALTIME_ENABLED"),
+        realtime_api_key=realtime.api_key,
+    )
     return BridgeConfig(
         api_key=str(extra.get("api_key") or os.getenv("INKBOX_API_KEY") or "").strip(),
         identity=str(extra.get("identity") or os.getenv("INKBOX_IDENTITY") or "").strip(),
@@ -151,5 +192,17 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         claude_model=str(os.getenv("CLAUDE_MODEL") or extra.get("claude_model") or "").strip(),
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         auto_allowed_tools=_csv_env("INKBOX_AUTO_ALLOWED_TOOLS") or list(DEFAULT_AUTO_ALLOWED_TOOLS),
-        realtime=_read_realtime_config(),
+        voice_stack=voice_stack,
+        voice_stack_invalid_value=invalid_voice_stack,
+        voice_ai_authority_mode=str(
+            extra.get("voice_ai_authority_mode")
+            or os.getenv("INKBOX_VOICE_AI_AUTHORITY_MODE")
+            or "contact_scoped"
+        ).strip().lower(),
+        voicemail_detection=str(
+            extra.get("voicemail_detection")
+            or os.getenv("INKBOX_VOICEMAIL_DETECTION")
+            or "enabled"
+        ).strip().lower(),
+        realtime=realtime,
     )
