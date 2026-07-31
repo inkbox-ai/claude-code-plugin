@@ -171,6 +171,32 @@ def test_failed_completion_is_recovered_after_restart(tmp_path):
     asyncio.run(scenario())
 
 
+def test_recovery_remains_retryable_when_authoritative_transcript_fails(tmp_path):
+    async def scenario():
+        first, _ = _gateway(tmp_path, error=RuntimeError("Claude unavailable"))
+        await first._on_hosted_call_ended(_payload())
+        await _drain(first)
+
+        unsettled, prompts = _gateway(tmp_path)
+        unsettled._inkbox = _TranscriptFailureInkbox()
+        await unsettled._recover_hosted_call_completions()
+        await _drain(unsettled)
+        entry = json.loads(
+            unsettled._hosted_call_registry_path.read_text()
+        )["call-1"]
+        assert entry["state"] == "failed"
+        assert prompts == []
+
+        settled, prompts = _gateway(tmp_path)
+        await settled._recover_hosted_call_completions()
+        await _drain(settled)
+        entry = json.loads(settled._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+        assert len(prompts) == 1
+
+    asyncio.run(scenario())
+
+
 def test_non_hosted_call_does_not_start_completion_turn(tmp_path):
     async def scenario():
         gateway, prompts = _gateway(tmp_path)

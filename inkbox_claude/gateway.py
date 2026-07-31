@@ -956,6 +956,7 @@ class InkboxGateway:
         )
         try:
             transcript: List[Tuple[str, str]] = []
+            transcript_fetch_failed = False
             try:
                 identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
                 list_transcripts = getattr(identity, "list_transcripts", None)
@@ -970,6 +971,7 @@ class InkboxGateway:
                         if str(getattr(row, "text", "") or "").strip()
                     ]
             except Exception as exc:
+                transcript_fetch_failed = True
                 logger.warning(
                     "[bridge] full transcript unavailable for hosted call %s: %s; using webhook transcript",
                     call_id,
@@ -985,6 +987,10 @@ class InkboxGateway:
                     and "marker" not in row
                     and str(row.get("text") or "").strip()
                 ]
+                if transcript_fetch_failed and not isinstance(inline, dict):
+                    raise RuntimeError(
+                        "authoritative transcript unavailable for recovered hosted call"
+                    )
             contacts = data.get("contacts") if isinstance(data.get("contacts"), list) else []
             contact = contacts[0] if contacts and isinstance(contacts[0], dict) else {}
             remote = str(call.get("remote_phone_number") or "").strip()
