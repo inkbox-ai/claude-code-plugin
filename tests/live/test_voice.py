@@ -261,18 +261,16 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     assert HOSTED_POST_CALL_MARKER, "HOSTED_POST_CALL_MARKER is required"
     st = _driver_state()
     remote, aut = _client(REMOTE_KEY), _client(AUT_KEY)
-    aut_phone = _aut_phone(aut)
+    aut_numbers = aut.phone_numbers.list()
+    assert aut_numbers, "AUT identity has no phone number"
+    aut_phone = aut_numbers[0].number
+    aut_number_id = str(aut_numbers[0].id)
     tail = _digits(aut_phone)[-10:]
 
     def _inbound_calls():
         return [c for c in remote.calls.list(limit=30)
                 if (getattr(c, "direction", "") or "").lower() == "inbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == tail]
-
-    def _inbound_texts():
-        return [m for m in remote.texts.list(st["number_id"], limit=30)
-                if (getattr(m, "direction", "") or "").lower() == "inbound"
-                and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == tail]
 
     driver_tail = _digits(st["number"])[-10:]
 
@@ -281,9 +279,14 @@ def test_outbound_call_hosted_and_post_call_wakeup():
                 if (getattr(c, "direction", "") or "").lower() == "outbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == driver_tail]
 
+    def _aut_outbound_texts():
+        return [m for m in aut.texts.list(aut_number_id, limit=30)
+                if (getattr(m, "direction", "") or "").lower() == "outbound"
+                and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == driver_tail]
+
     before_calls = {c.id for c in _inbound_calls()}
     before_outbound = {c.id for c in _outbound_calls()}
-    before_texts = {m.id for m in _inbound_texts()}
+    before_texts = {m.id for m in _aut_outbound_texts()}
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     call_id = None
@@ -315,9 +318,29 @@ def test_outbound_call_hosted_and_post_call_wakeup():
         _hangup_call(remote, call_id)
 
     deadline = time.monotonic() + TIMEOUT_S
+    delivered = []
     while time.monotonic() < deadline:
-        for message in _inbound_texts():
-            if message.id not in before_texts and HOSTED_POST_CALL_MARKER in (message.text or ""):
-                return
+        delivered = [
+            message for message in _aut_outbound_texts()
+            if message.id not in before_texts
+            and HOSTED_POST_CALL_MARKER in (message.text or "")
+        ]
+        if delivered:
+            break
         time.sleep(POLL_EVERY_S)
-    pytest.fail("hosted call ended but Claude Code did not execute its post-call SMS action")
+    assert delivered, (
+        "hosted call ended but Claude Code did not execute its post-call SMS action"
+    )
+
+    # Prove the explicit tool side effect is the only post-call SMS; a plain
+    # captured model reply must not leak onto the requesting channel.
+    time.sleep(2 * POLL_EVERY_S)
+    new_texts = [
+        message for message in _aut_outbound_texts()
+        if message.id not in before_texts
+    ]
+    assert len(new_texts) == 1, (
+        "hosted post-call processing leaked model text or duplicated the "
+        f"commitment: {[getattr(message, 'text', '') for message in new_texts]}"
+    )
+    assert HOSTED_POST_CALL_MARKER in (new_texts[0].text or "")
