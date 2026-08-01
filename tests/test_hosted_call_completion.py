@@ -318,6 +318,75 @@ def test_hosted_sms_correction_requires_one_clean_success(tmp_path):
     asyncio.run(scenario())
 
 
+def test_hosted_transcript_sms_commitment_requires_settlement(tmp_path):
+    async def scenario():
+        missing = CapturedTurnResult(text="", tool_deliveries=())
+        gateway, prompts = _gateway(tmp_path, results=[missing, _sms_result()])
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = []
+        payload["data"]["transcript"]["entries"] = [{
+            "party": "remote",
+            "text": "After we hang up, send me one SMS with the release status.",
+        }]
+
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        assert len(prompts) == 2
+        assert "tool was not called" in prompts[1]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_transcript_generic_text_references_do_not_require_sms(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path)
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = []
+        payload["data"]["transcript"]["entries"] = [
+            {"party": "remote", "text": "I got your text yesterday."},
+            {"party": "remote", "text": "Can you see my earlier SMS messages?"},
+            {"party": "local", "text": "We discussed texting during the call."},
+        ]
+
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        assert gateway.sessions.session.detailed_calls == 0
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_transcript_sms_commitment_classifier_is_narrow():
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "After we hang up, text Alex with the release status.")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "Could you text her the confirmation?")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "Please text Alex the confirmation.")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("local", "I'll text you the final result.")]
+    )
+    assert not gateway_module._hosted_requires_sms(
+        [],
+        [
+            ("remote", "I got your text yesterday."),
+            ("remote", "Can you see my earlier SMS messages?"),
+            ("local", "We discussed texting during the call."),
+            ("local", "I will send her the confirmation."),
+            ("remote", "After we hang up, send me the summary."),
+        ],
+    )
+
+
 def test_hosted_non_sms_action_preserves_plain_capture_behavior(tmp_path):
     async def scenario():
         gateway, prompts = _gateway(tmp_path)

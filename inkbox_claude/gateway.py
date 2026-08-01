@@ -123,15 +123,70 @@ class _HostedToolSettlementError(RuntimeError):
     """A required hosted-call side effect reached a bounded terminal state."""
 
 
-def _hosted_requires_sms(actions: List[Dict[str, Any]]) -> bool:
-    """Return true when an open server-recorded action explicitly requires SMS."""
+_TRANSCRIPT_SMS_COMMITMENT_PATTERNS = (
+    # Direct text requests: "text me" / "could you text her".  Bare "send
+    # me" is channel-ambiguous and must not force an SMS side effect.
+    re.compile(r"\btext\s+(?:me|us|them|him|her)\b", re.IGNORECASE),
+    # A clear imperative/request may use a named recipient rather than a
+    # pronoun: "Text Alex" / "please text Dima" / "could you text Pat".
+    re.compile(
+        r"(?:^|[.!?]\s+|\b(?:please|can\s+you|could\s+you|would\s+you|will\s+you)\s+)"
+        r"text\s+(?!messages?\b|history\b|thread\b)[\w@][\w@.'’+-]*\b",
+        re.IGNORECASE,
+    ),
+    # Explicit channel requests that name the medium even when the recipient
+    # is a proper noun: "send Alex an SMS" / "send a text message".
+    re.compile(
+        r"\bsend\b.{0,80}\b(?:an?\s+)?(?:sms|text\s+message)\b",
+        re.IGNORECASE,
+    ),
+    # A bounded after-call promise/request.  Bare "send" is not enough: it
+    # must identify the SMS/text-message medium inside the same turn.
+    re.compile(
+        r"\b(?:after|once|when)\s+(?:we\s+|you\s+)?"
+        r"(?:hang\s*up|the\s+call\s+(?:ends?|is\s+over))\b.{0,160}"
+        r"(?:\btext\b|\bsend\b.{0,80}\b(?:sms|text\s+message))",
+        re.IGNORECASE,
+    ),
+    # The hosted agent's own unambiguous future commitment.
+    re.compile(
+        r"\b(?:i|we)\s*(?:will|'ll|’ll|am\s+going\s+to|are\s+going\s+to)\s+"
+        r"(?:text\s+(?:you|me|us|them|him|her)\b|"
+        r"send\b.{0,80}\b(?:sms|text\s+message)\b)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _transcript_requires_sms_commitment(transcript: Any) -> bool:
+    """Detect a clear future SMS commitment without matching past references."""
+    turns = []
+    for row in transcript or []:
+        if isinstance(row, dict):
+            value = row.get("text")
+        elif isinstance(row, (tuple, list)) and len(row) > 1:
+            value = row[1]
+        else:
+            value = getattr(row, "text", "")
+        text = str(value or "").strip()
+        if text:
+            turns.append(text)
+    return any(pattern.search(turn) for turn in turns for pattern in _TRANSCRIPT_SMS_COMMITMENT_PATTERNS)
+
+
+def _hosted_requires_sms(
+    actions: List[Dict[str, Any]], transcript: Any = None,
+) -> bool:
+    """Return true for an open SMS action or explicit transcript commitment."""
     text = " ".join(
         str(action.get(field) or "")
         for action in actions
         if str(action.get("status") or "open").strip().lower() == "open"
         for field in ("action", "description", "details")
     ).lower()
-    return bool(re.search(r"\b(?:sms|text|texted|texting)\b", text))
+    return bool(re.search(r"\b(?:sms|text|texted|texting)\b", text)) or (
+        _transcript_requires_sms_commitment(transcript)
+    )
 
 
 def _hosted_sms_settlement(
@@ -1189,7 +1244,7 @@ class InkboxGateway:
                 raise RuntimeError("session manager is not ready")
             session = self.sessions.get(chat_id)
             prompt = "\n".join(lines)
-            if remote and _hosted_requires_sms(actions):
+            if remote and _hosted_requires_sms(actions, transcript):
                 result = await session.run_consult_detailed(prompt)
                 settlement = _hosted_sms_settlement(result, remote)
                 if settlement in {"missing", "recoverable"}:
