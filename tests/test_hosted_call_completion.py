@@ -231,11 +231,16 @@ def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
     async def scenario():
         monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
         gateway, prompts = _gateway(tmp_path)
+        payload = _payload()
+        payload["data"]["post_call_action_items"].append({
+            "action": "Update the release checklist",
+            "status": "open",
+        })
         gateway._write_hosted_call_registry(
             "call-1",
             event_id="event-call-1",
             state="running",
-            payload=_payload(),
+            payload=payload,
             outcome="completed",
         )
         assert reserve_hosted_sms_attempt(
@@ -249,6 +254,8 @@ def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
         assert len(prompts) == 1
         assert "[hosted_post_call_sms_correction]" in prompts[0]
         assert "Review the outcome, transcript" not in prompts[0]
+        assert "Send the summary" in prompts[0]
+        assert "Update the release checklist" not in prompts[0]
         assert gateway.sessions.session.hosted_contexts == [{
             "call_id": "call-1",
             "attempt": 2,

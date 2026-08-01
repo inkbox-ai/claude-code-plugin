@@ -233,22 +233,67 @@ def _hosted_sms_settlement(
     return "terminal"
 
 
-def _hosted_sms_correction_prompt(remote_phone: str, *, missing: bool) -> str:
+def _hosted_sms_recovery_evidence(transcript: Any, actions: Any) -> str:
+    """Render only trusted SMS commitments needed by a fresh recovery session."""
+    lines: List[str] = []
+    for row in transcript or []:
+        if isinstance(row, dict):
+            role, text = row.get("party"), row.get("text")
+        elif isinstance(row, (tuple, list)) and len(row) > 1:
+            role, text = row[0], row[1]
+        else:
+            role, text = getattr(row, "party", "unknown"), getattr(row, "text", "")
+        text = str(text or "").strip()
+        if text and _clause_requires_sms(text, _TRANSCRIPT_SMS_COMMITMENT_PATTERNS):
+            lines.append(f"Transcript SMS commitment ({role or 'unknown'}): {text}")
+    for action in actions or []:
+        if not isinstance(action, dict):
+            continue
+        if str(action.get("status") or "open").strip().lower() != "open":
+            continue
+        text = " ".join(
+            str(action.get(field) or "")
+            for field in ("action", "description", "details")
+        ).strip()
+        if text and _clause_requires_sms(text, _OPEN_ACTION_SMS_COMMITMENT_PATTERNS):
+            lines.append(f"Open SMS action: {text}")
+    return "\n".join(lines)
+
+
+def _hosted_sms_correction_prompt(
+    remote_phone: str,
+    *,
+    missing: bool,
+    evidence: str = "",
+) -> str:
     reason = (
         "The required SMS tool was not called"
         if missing
         else "The required SMS tool had a recoverable argument or format error"
     )
-    return "\n".join([
+    lines = [
         "[hosted_post_call_sms_correction]",
         f"{reason}. This is the only correction attempt.",
+    ]
+    if evidence:
+        lines.extend([
+            "Trusted SMS-only recovery context:",
+            evidence,
+        ])
+    message_source = (
+        "the trusted SMS context above"
+        if evidence
+        else "the prior hosted-call reconciliation"
+    )
+    lines.extend([
         "Call inkbox_send_sms exactly once now with `to` set to the exact "
         f"authoritative remote number {remote_phone} and `text` set to the "
-        "still-needed message from the prior hosted-call reconciliation.",
+        f"still-needed message in {message_source}.",
         "Do not use another recipient, do not repeat any completed action, and "
         "do not answer with prose. Do not return [SILENT], skip, or defer. "
         "Stop after the tool result.",
     ])
+    return "\n".join(lines)
 
 
 def _webhook_mail_body(message: Dict[str, Any]) -> str:
@@ -1141,9 +1186,38 @@ class InkboxGateway:
             contact = contacts[0] if contacts and isinstance(contacts[0], dict) else {}
             if not remote or self.sessions is None:
                 raise _HostedToolSettlementError("hosted SMS correction context is unavailable")
+            transcript: List[Tuple[str, str]] = []
+            try:
+                identity = await asyncio.to_thread(
+                    self._inkbox.get_identity, self.cfg.identity
+                )
+                rows = await asyncio.to_thread(identity.list_transcripts, call_id)
+                transcript = [
+                    (
+                        str(getattr(row, "party", "unknown") or "unknown"),
+                        str(getattr(row, "text", "") or ""),
+                    )
+                    for row in (rows or [])
+                ]
+            except Exception:
+                logger.warning(
+                    "[bridge] hosted SMS recovery transcript unavailable: %s",
+                    call_id,
+                    exc_info=True,
+                )
+            actions = data.get("post_call_action_items") or []
+            evidence = _hosted_sms_recovery_evidence(transcript, actions)
+            if not evidence:
+                raise _HostedToolSettlementError(
+                    "hosted SMS correction lacks authoritative SMS context"
+                )
             session = self.sessions.get(str(contact.get("id") or remote))
             corrected = await session.run_consult_detailed(
-                _hosted_sms_correction_prompt(remote, missing=False),
+                _hosted_sms_correction_prompt(
+                    remote,
+                    missing=False,
+                    evidence=evidence,
+                ),
                 hosted_sms_context={
                     "call_id": call_id,
                     "attempt": 2,
