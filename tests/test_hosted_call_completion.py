@@ -59,15 +59,31 @@ def _payload(call_id="call-1"):
     }
 
 
+def _non_sms_payload(call_id="call-1"):
+    payload = _payload(call_id)
+    payload["data"]["post_call_action_items"] = [{
+        "action": "Update the release checklist",
+        "status": "open",
+    }]
+    payload["data"]["transcript"]["entries"] = [{
+        "party": "remote",
+        "text": "Please update the release checklist.",
+    }]
+    return payload
+
+
 class _Session:
-    def __init__(self, prompts, error=None, results=None):
+    def __init__(self, prompts, error=None, results=None, gate=None):
         self.prompts = prompts
         self.error = error
         self.results = list(results or [_sms_result()])
+        self.gate = gate
         self.detailed_calls = 0
 
     async def run_consult(self, prompt):
         self.prompts.append(prompt)
+        if self.gate is not None:
+            await self.gate.wait()
         if self.error:
             raise self.error
         return "This plain text must not be delivered"
@@ -75,17 +91,19 @@ class _Session:
     async def run_consult_detailed(self, prompt):
         self.detailed_calls += 1
         self.prompts.append(prompt)
+        if self.gate is not None:
+            await self.gate.wait()
         if self.error:
             raise self.error
         return self.results.pop(0)
 
 
 class _Sessions:
-    def __init__(self, prompts, error=None, results=None):
+    def __init__(self, prompts, error=None, results=None, gate=None):
         self.prompts = prompts
         self.error = error
         self.chat_ids = []
-        self.session = _Session(self.prompts, self.error, results)
+        self.session = _Session(self.prompts, self.error, results, gate)
 
     def get(self, chat_id):
         self.chat_ids.append(chat_id)
@@ -105,14 +123,14 @@ class _TranscriptFailureInkbox:
         return types.SimpleNamespace(list_transcripts=fail)
 
 
-def _gateway(tmp_path, *, error=None, results=None):
+def _gateway(tmp_path, *, error=None, results=None, gate=None):
     gateway_module.web = types.SimpleNamespace(json_response=lambda value: value)
     cfg = BridgeConfig(identity="claude", voice_stack=VoiceStack.INKBOX_VOICE_AI)
     gateway = InkboxGateway(cfg)
     gateway._hosted_call_registry_path = tmp_path / "hosted.json"
     gateway._inkbox = _Inkbox()
     prompts = []
-    gateway.sessions = _Sessions(prompts, error, results)
+    gateway.sessions = _Sessions(prompts, error, results, gate)
     return gateway, prompts
 
 
@@ -177,6 +195,50 @@ def test_hosted_sms_failed_correction_is_terminal_and_not_replayed(tmp_path):
         await _drain(gateway)
 
         assert len(prompts) == 2
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted, restarted_prompts = _gateway(tmp_path)
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_turn_exception_is_terminal_and_not_replayed(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(
+            tmp_path, error=RuntimeError("capture transport failed")
+        )
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted, restarted_prompts = _gateway(tmp_path)
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_turn_cancellation_is_terminal_and_not_replayed(tmp_path):
+    async def scenario():
+        gate = asyncio.Event()
+        gateway, prompts = _gateway(tmp_path, gate=gate)
+        await gateway._on_hosted_call_ended(_payload())
+        while not prompts:
+            await asyncio.sleep(0)
+        task = next(iter(gateway._hosted_call_jobs.values()))
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "failed"
         assert entry["retryable"] is False
@@ -390,7 +452,20 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
             ("local", "I'll text you the final result."),
             ("remote", "After we hang up, review the text conversation."),
             ("remote", "Review the text exchange after we hang up."),
+            ("remote", "After we hang up, do not send me an SMS."),
+            ("remote", "After the call ends, don't text me."),
+            ("remote", "Never text me after the call is over."),
         ],
+    )
+    assert not gateway_module._hosted_requires_sms(
+        [{"status": "open", "action": "Do not send me an SMS."}], []
+    )
+    assert gateway_module._hosted_requires_sms(
+        [
+            {"status": "open", "action": "Do not send me an SMS."},
+            {"status": "open", "action": "Text the operator by SMS."},
+        ],
+        [],
     )
 
 
@@ -463,7 +538,7 @@ def test_full_transcript_failure_uses_inline_webhook_transcript(tmp_path):
 def test_failed_completion_is_recovered_after_restart(tmp_path):
     async def scenario():
         first, _ = _gateway(tmp_path, error=RuntimeError("Claude unavailable"))
-        await first._on_hosted_call_ended(_payload())
+        await first._on_hosted_call_ended(_non_sms_payload())
         await _drain(first)
         assert json.loads(first._hosted_call_registry_path.read_text())["call-1"]["state"] == "failed"
 
@@ -479,7 +554,7 @@ def test_failed_completion_is_recovered_after_restart(tmp_path):
 def test_recovery_remains_retryable_when_authoritative_transcript_fails(tmp_path):
     async def scenario():
         first, _ = _gateway(tmp_path, error=RuntimeError("Claude unavailable"))
-        await first._on_hosted_call_ended(_payload())
+        await first._on_hosted_call_ended(_non_sms_payload())
         await _drain(first)
 
         unsettled, prompts = _gateway(tmp_path)
