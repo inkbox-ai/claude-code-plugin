@@ -123,36 +123,22 @@ class _HostedToolSettlementError(RuntimeError):
     """A required hosted-call side effect reached a bounded terminal state."""
 
 
+_TRANSCRIPT_POST_CALL_TIMING = (
+    r"(?:after|when|once)\s+(?:(?:we|you)\s+hang\s*up|"
+    r"(?:this|the)\s+call\s+(?:ends?|is\s+over))"
+)
+_TRANSCRIPT_SMS_ACTION = (
+    r"(?:text\s+(?!messages?\b|history\b|thread\b|yesterday\b|earlier\b|from\b)"
+    r"[\w@][\w@.'’+-]*\b|"
+    r"send\b.{0,80}\b(?:an?\s+)?(?:sms|text\s+message)\b)"
+)
 _TRANSCRIPT_SMS_COMMITMENT_PATTERNS = (
-    # Direct text requests: "text me" / "could you text her".  Bare "send
-    # me" is channel-ambiguous and must not force an SMS side effect.
-    re.compile(r"\btext\s+(?:me|us|them|him|her)\b", re.IGNORECASE),
-    # A clear imperative/request may use a named recipient rather than a
-    # pronoun: "Text Alex" / "please text Dima" / "could you text Pat".
     re.compile(
-        r"(?:^|[.!?]\s+|\b(?:please|can\s+you|could\s+you|would\s+you|will\s+you)\s+)"
-        r"text\s+(?!messages?\b|history\b|thread\b)[\w@][\w@.'’+-]*\b",
+        rf"\b{_TRANSCRIPT_POST_CALL_TIMING}\b.{{0,160}}{_TRANSCRIPT_SMS_ACTION}",
         re.IGNORECASE,
     ),
-    # Explicit channel requests that name the medium even when the recipient
-    # is a proper noun: "send Alex an SMS" / "send a text message".
     re.compile(
-        r"\bsend\b.{0,80}\b(?:an?\s+)?(?:sms|text\s+message)\b",
-        re.IGNORECASE,
-    ),
-    # A bounded after-call promise/request.  Bare "send" is not enough: it
-    # must identify the SMS/text-message medium inside the same turn.
-    re.compile(
-        r"\b(?:after|once|when)\s+(?:we\s+|you\s+)?"
-        r"(?:hang\s*up|the\s+call\s+(?:ends?|is\s+over))\b.{0,160}"
-        r"(?:\btext\b|\bsend\b.{0,80}\b(?:sms|text\s+message))",
-        re.IGNORECASE,
-    ),
-    # The hosted agent's own unambiguous future commitment.
-    re.compile(
-        r"\b(?:i|we)\s*(?:will|'ll|’ll|am\s+going\s+to|are\s+going\s+to)\s+"
-        r"(?:text\s+(?:you|me|us|them|him|her)\b|"
-        r"send\b.{0,80}\b(?:sms|text\s+message)\b)",
+        rf"\b{_TRANSCRIPT_SMS_ACTION}.{{0,160}}\b{_TRANSCRIPT_POST_CALL_TIMING}\b",
         re.IGNORECASE,
     ),
 )
@@ -171,7 +157,11 @@ def _transcript_requires_sms_commitment(transcript: Any) -> bool:
         text = str(value or "").strip()
         if text:
             turns.append(text)
-    return any(pattern.search(turn) for turn in turns for pattern in _TRANSCRIPT_SMS_COMMITMENT_PATTERNS)
+    return any(
+        pattern.search(turn)
+        for turn in turns
+        for pattern in _TRANSCRIPT_SMS_COMMITMENT_PATTERNS
+    )
 
 
 def _hosted_requires_sms(
