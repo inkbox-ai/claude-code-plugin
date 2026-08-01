@@ -375,6 +375,9 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
     assert gateway_module._hosted_requires_sms(
         [], [("local", "I'll send you a text message after we hang up.")]
     )
+    assert gateway_module._hosted_requires_sms(
+        [], [("local", "After I hang up, text the release status to Dima.")]
+    )
     assert not gateway_module._hosted_requires_sms(
         [],
         [
@@ -385,6 +388,7 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
             ("remote", "After we hang up, send me the summary."),
             ("remote", "Please text me the status."),
             ("local", "I'll text you the final result."),
+            ("remote", "After we hang up, review the text conversation."),
         ],
     )
 

@@ -124,21 +124,35 @@ class _HostedToolSettlementError(RuntimeError):
 
 
 _TRANSCRIPT_POST_CALL_TIMING = (
-    r"(?:after|when|once)\s+(?:(?:we|you)\s+hang\s*up|"
+    r"(?:after|when|once)\s+(?:(?:i|we|you)\s+hang\s*up|"
     r"(?:this|the)\s+call\s+(?:ends?|is\s+over))"
 )
-_TRANSCRIPT_SMS_ACTION = (
-    r"(?:text\s+(?!messages?\b|history\b|thread\b|yesterday\b|earlier\b|from\b)"
-    r"[\w@][\w@.'’+-]*\b|"
-    r"send\b.{0,80}\b(?:an?\s+)?(?:sms|text\s+message)\b)"
+_TRANSCRIPT_TEXT_VERB = (
+    r"text\s+(?!conversation\b|messages?\b|history\b|thread\b|"
+    r"yesterday\b|earlier\b|from\b)[\w@][\w@.'’+-]*\b"
 )
+_TRANSCRIPT_TEXT_CLAUSE_PREFIX = (
+    r"(?:please\s+|then\s+|(?:(?:can|could|would|will)\s+you|"
+    r"(?:i|we)\s*(?:will|'ll|’ll|am\s+going\s+to|are\s+going\s+to))\s+)?"
+)
+_TRANSCRIPT_SEND_SMS = r"send\b.{0,80}\b(?:an?\s+)?(?:sms|text\s+message)\b"
 _TRANSCRIPT_SMS_COMMITMENT_PATTERNS = (
     re.compile(
-        rf"\b{_TRANSCRIPT_POST_CALL_TIMING}\b.{{0,160}}{_TRANSCRIPT_SMS_ACTION}",
+        rf"\b{_TRANSCRIPT_POST_CALL_TIMING}\b[\s,;:!—-]*"
+        rf"{_TRANSCRIPT_TEXT_CLAUSE_PREFIX}{_TRANSCRIPT_TEXT_VERB}",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"\b{_TRANSCRIPT_SMS_ACTION}.{{0,160}}\b{_TRANSCRIPT_POST_CALL_TIMING}\b",
+        rf"(?:^|[.!?]\s+|\b{_TRANSCRIPT_TEXT_CLAUSE_PREFIX})"
+        rf"{_TRANSCRIPT_TEXT_VERB}.{{0,160}}\b{_TRANSCRIPT_POST_CALL_TIMING}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{_TRANSCRIPT_POST_CALL_TIMING}\b.{{0,160}}{_TRANSCRIPT_SEND_SMS}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{_TRANSCRIPT_SEND_SMS}.{{0,160}}\b{_TRANSCRIPT_POST_CALL_TIMING}\b",
         re.IGNORECASE,
     ),
 )
