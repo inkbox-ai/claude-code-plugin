@@ -794,8 +794,22 @@ class InkboxGateway:
             raise RuntimeError(
                 f"invalid INKBOX_VOICE_STACK={self.cfg.voice_stack_invalid_value!r}; rerun setup"
             )
+        if (
+            self.cfg.voice_stack is VoiceStack.OPENAI_REALTIME
+            and not self.cfg.realtime.enabled
+        ):
+            raise RuntimeError(
+                "INKBOX_VOICE_STACK=openai_realtime requires INKBOX_REALTIME_API_KEY"
+            )
         if self.cfg.voicemail_detection not in {"enabled", "disabled"}:
             raise RuntimeError("INKBOX_VOICEMAIL_DETECTION must be enabled or disabled")
+        if (
+            self.cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI
+            and self.cfg.voice_ai_authority_mode not in {"contact_scoped", "yolo"}
+        ):
+            raise RuntimeError(
+                "INKBOX_VOICE_AI_AUTHORITY_MODE must be contact_scoped or yolo"
+            )
         if not self.cfg.api_key or not self.cfg.identity:
             raise RuntimeError("INKBOX_API_KEY and INKBOX_IDENTITY must be set (see README)")
 

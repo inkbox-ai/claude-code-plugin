@@ -49,6 +49,16 @@ def test_record_timestamp_accepts_datetime_and_iso_z():
     ) == stamp
 
 
+def test_voicemail_detection_value_accepts_sdk_enum_or_wire_string():
+    enum_like = SimpleNamespace(value="disabled")
+    assert voice._voicemail_detection_value(
+        SimpleNamespace(voicemail_detection=enum_like)
+    ) == "disabled"
+    assert voice._voicemail_detection_value(
+        SimpleNamespace(voicemail_detection="disabled")
+    ) == "disabled"
+
+
 def test_matching_post_call_action_requires_open_current_marker_sms():
     marker = "victor echo juliet"
     matching = {

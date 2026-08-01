@@ -99,6 +99,28 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
                 "imessage" if getattr(identity, "imessage_enabled", False) else None,
             ])) or "no channels provisioned"
             checks.append(("identity reachable", True, detail))
+            expected_action = (
+                "hosted_agent"
+                if cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI
+                else "auto_accept"
+            )
+            try:
+                incoming = identity.get_incoming_call_action()
+                actual_action = str(
+                    getattr(
+                        getattr(incoming, "incoming_call_action", ""),
+                        "value",
+                        getattr(incoming, "incoming_call_action", ""),
+                    )
+                )
+            except Exception as exc:
+                checks.append(("incoming call action", False, str(exc)))
+            else:
+                checks.append((
+                    "incoming call action",
+                    actual_action == expected_action,
+                    f"{actual_action or 'unset'} (expected {expected_action})",
+                ))
             if cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI:
                 try:
                     hosted = identity.get_hosted_agent_config()

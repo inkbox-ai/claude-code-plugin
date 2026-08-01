@@ -657,14 +657,123 @@ def _voice_setup_kwargs():
 
 def test_phone_voice_stack_configures_tts_stt(tmp_path, monkeypatch):
     monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / ".env"))
+    questions = []
+    monkeypatch.setattr(
+        setup_wizard,
+        "prompt",
+        lambda question, *a, **k: questions.append(question) or "",
+    )
     monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: 2)
     identity = _VoiceIdentity()
 
     setup_wizard._configure_phone_call_voice_stack(identity, **_voice_setup_kwargs())
 
     assert setup_wizard._env("INKBOX_VOICE_STACK") == "inkbox_tts_stt"
+    assert questions == ["  Press Enter to continue and set up phone call handling"]
     assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "false"
     assert identity.incoming_updates[-1]["incoming_call_action"] == "auto_accept"
+
+
+def test_local_voice_stack_rebuilds_canonical_tunnel_url_after_hosted_mode(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: 2)
+    identity = _VoiceIdentity()
+    identity.phone_number.client_websocket_url = None
+
+    setup_wizard._configure_phone_call_voice_stack(
+        identity,
+        **_voice_setup_kwargs(),
+    )
+
+    assert identity.incoming_updates[-1] == {
+        "incoming_call_action": "auto_accept",
+        "client_websocket_url": "wss://agent.inkboxwire.com/phone/media/ws",
+        "incoming_call_webhook_url": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("saved_stack", "expected_index"),
+    [
+        ("inkbox_voice_ai", 0),
+        ("openai_realtime", 1),
+        ("inkbox_tts_stt", 2),
+    ],
+)
+def test_voice_stack_rerun_defaults_to_saved_selection(
+    saved_stack, expected_index, monkeypatch,
+):
+    monkeypatch.setattr(
+        setup_wizard,
+        "_env",
+        lambda name: saved_stack if name == "INKBOX_VOICE_STACK" else "",
+    )
+    assert setup_wizard._voice_stack_default_index("") == expected_index
+
+
+def test_prompt_choice_reprompts_invalid_input_and_honors_default(monkeypatch):
+    answers = iter(["not-a-number", "9", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    assert setup_wizard.prompt_choice("choose", ["one", "two", "three"], 1) == 1
+
+
+def test_prompt_choice_cancellation_exits(monkeypatch):
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    with pytest.raises(SystemExit):
+        setup_wizard.prompt_choice("choose", ["one", "two"], 0)
+
+
+def test_phone_voice_stack_configures_valid_realtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("INKBOX_REALTIME_API_KEY", "sk-valid")
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        setup_wizard,
+        "_test_openai_realtime_api_key",
+        lambda *a, **k: (True, "ok"),
+    )
+    identity = _VoiceIdentity()
+
+    setup_wizard._configure_phone_call_voice_stack(
+        identity,
+        **_voice_setup_kwargs(),
+    )
+
+    assert setup_wizard._env("INKBOX_VOICE_STACK") == "openai_realtime"
+    assert setup_wizard._env("INKBOX_REALTIME_API_KEY") == "sk-valid"
+    assert identity.incoming_updates[-1]["incoming_call_action"] == "auto_accept"
+
+
+def test_voice_ai_contact_scope_does_not_prompt_for_admin(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / ".env"))
+    choices = iter([0, 0])
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: next(choices))
+    monkeypatch.setattr(
+        setup_wizard,
+        "prompt",
+        lambda question, *a, **k: (
+            ""
+            if "Press Enter" in question
+            else (_ for _ in ()).throw(AssertionError("admin prompted"))
+        ),
+    )
+    identity = _VoiceIdentity(authority="contact_scoped")
+
+    setup_wizard._configure_phone_call_voice_stack(
+        identity,
+        **_voice_setup_kwargs(),
+    )
+
+    assert identity.authority_updates == []
+    assert setup_wizard._env("INKBOX_VOICE_AI_AUTHORITY_MODE") == "contact_scoped"
+    assert setup_wizard._env("INKBOX_VOICE_STACK") == "inkbox_voice_ai"
 
 
 def test_realtime_validation_failure_loops_back_to_all_choices(tmp_path, monkeypatch):
@@ -693,7 +802,11 @@ def test_voice_ai_reuses_admin_identity_without_persisting_admin_key(tmp_path, m
     monkeypatch.setattr(
         setup_wizard,
         "prompt",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("admin key must be reused")),
+        lambda question, *a, **k: (
+            ""
+            if "Press Enter" in question
+            else (_ for _ in ()).throw(AssertionError("admin key must be reused"))
+        ),
     )
     identity = _VoiceIdentity(authority="contact_scoped")
     admin_identity = _VoiceIdentity(authority="contact_scoped")
@@ -720,6 +833,7 @@ def test_voice_ai_failure_restores_all_prior_config(tmp_path, monkeypatch):
     monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / ".env"))
     choices = iter([0, 1, 2])
     monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: next(choices))
+    monkeypatch.setattr(setup_wizard, "prompt", lambda *a, **k: "")
     identity = _VoiceIdentity(authority="contact_scoped")
     identity.get_hosted_agent_config = lambda: types.SimpleNamespace(
         authority_mode="contact_scoped",
@@ -747,7 +861,7 @@ def test_voice_ai_failure_restores_all_prior_config(tmp_path, monkeypatch):
 
     assert admin_identity.authority_updates == ["yolo", "contact_scoped"]
     assert identity.hosted_updates == [
-        {"voice": None, "model": None, "instructions": None},
+        {"voice": "old-voice", "model": "old-model", "instructions": "old instructions"},
         {"voice": "old-voice", "model": "old-model", "instructions": "old instructions"},
     ]
     assert identity.incoming_updates[1] == {

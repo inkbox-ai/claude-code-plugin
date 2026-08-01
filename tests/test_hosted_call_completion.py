@@ -614,6 +614,30 @@ def test_hosted_non_sms_action_preserves_plain_capture_behavior(tmp_path):
     asyncio.run(scenario())
 
 
+def test_hosted_callback_prompt_anchors_authoritative_caller_over_contact_memory(
+    tmp_path,
+):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path)
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = [{
+            "action": "Call the current caller back after this call",
+            "status": "open",
+        }]
+        payload["data"]["contacts"][0].update({
+            "phone_numbers": ["+19999999999"],
+            "memories": ["A similarly named contact prefers +19999999999."],
+        })
+
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        assert "Remote party phone number: +15551112222" in prompts[0]
+        assert "must not override it" in prompts[0]
+
+    asyncio.run(scenario())
+
+
 def test_hosted_completion_registry_is_private_bounded_and_drops_completed_payload(tmp_path):
     async def scenario():
         gateway, _ = _gateway(tmp_path)

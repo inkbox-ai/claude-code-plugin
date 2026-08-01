@@ -952,7 +952,13 @@ def _local_call_ws_url(identity: Any) -> str:
     if public_url:
         scheme, _, host = public_url.partition("://")
         return f"{'wss' if scheme == 'https' else 'ws'}://{host}{INKBOX_WS_PATH}"
-    return ""
+    handle = str(getattr(identity, "agent_handle", "") or "").strip()
+    tunnel_name = _env("INKBOX_TUNNEL_NAME").strip() or handle
+    return (
+        f"wss://{tunnel_name}.inkboxwire.com{INKBOX_WS_PATH}"
+        if tunnel_name
+        else ""
+    )
 
 
 def _set_local_incoming_call_action(identity: Any) -> None:
@@ -1105,9 +1111,15 @@ def _configure_voice_ai(
     authority_changed = False
     incoming_changed = False
     try:
-        # Hosted instructions intentionally remain server-owned for now.
+        # Hosted prompt/model configuration remains server-owned. Re-submit
+        # the authoritative values so setup never clears an existing server
+        # configuration while changing only routing/authority.
         hosted_changed = True
-        identity.set_hosted_agent_config(voice=None, model=None, instructions=None)
+        identity.set_hosted_agent_config(
+            voice=getattr(current, "voice", None),
+            model=getattr(current, "model", None),
+            instructions=getattr(current, "instructions", None),
+        )
         if authority != before:
             setter = getattr(authority_writer, "set_hosted_agent_authority_mode", None)
             if not callable(setter):
@@ -1167,6 +1179,7 @@ def _configure_phone_call_voice_stack(
     if getattr(identity, "phone_number", None) is None and not imessage_enabled:
         return
     print()
+    prompt("  Press Enter to continue and set up phone call handling")
     print(color("  --- Phone call voice stack ---", Colors.CYAN))
     detected = _detect_openai_realtime_key()
     detected_key = detected[1] if detected else ""
