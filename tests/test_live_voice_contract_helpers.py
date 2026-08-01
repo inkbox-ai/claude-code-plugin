@@ -22,6 +22,7 @@ voice = _load_voice_module()
 
 def test_spoken_marker_normalizes_punctuation_and_case():
     assert voice._spoken_key("Victor-Echo, JULIET!") == "victorechojuliet"
+    assert voice._spoken_key("cloudpapa") == voice._spoken_key("Claude Papa")
 
 
 def test_after_call_sms_intent_requires_after_call_language():

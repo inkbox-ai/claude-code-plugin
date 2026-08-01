@@ -96,10 +96,10 @@ jobs:
               uniform victor whiskey xray yankee zulu
             )
             marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
-            marker="claude"
+            marker=""
             for _ in 1 2 3 4 5; do
               marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
-              marker="$marker ${RADIO_WORDS[$marker_index]}"
+              marker="${marker:+$marker }${RADIO_WORDS[$marker_index]}"
               marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
             done
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
