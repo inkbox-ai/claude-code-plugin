@@ -234,6 +234,7 @@ def test_hosted_sms_recoverable_failure_gets_one_correction(tmp_path):
 
         assert len(prompts) == 2
         assert "only correction attempt" in prompts[1]
+        assert "Do not return [SILENT], skip, or defer" in prompts[1]
         assert "+15551112222" in prompts[1]
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "completed"
@@ -496,6 +497,10 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
     assert gateway_module._hosted_requires_sms(
         [], [("local", "After I hang up, text the release status to Dima.")]
     )
+    assert gateway_module._hosted_requires_sms(
+        [],
+        [("remote", "Don't text me now; after this call ends, text me the code.")],
+    )
     assert not gateway_module._hosted_requires_sms(
         [],
         [
@@ -527,6 +532,13 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
             {"status": "open", "action": "Do not send me an SMS."},
             {"status": "open", "action": "Text the operator by SMS."},
         ],
+        [],
+    )
+    assert gateway_module._hosted_requires_sms(
+        [{
+            "status": "open",
+            "action": "Do not text now; text the operator after the call.",
+        }],
         [],
     )
 

@@ -167,6 +167,20 @@ _OPEN_ACTION_SMS_COMMITMENT_PATTERNS = (
     re.compile(rf"\b{_TRANSCRIPT_TEXT_VERB}", re.IGNORECASE),
     re.compile(rf"\b{_TRANSCRIPT_SEND_SMS}", re.IGNORECASE),
 )
+_SMS_CLAUSE_SPLIT = re.compile(
+    r"(?:[.!?;]+|\s+—\s+|\b(?:but|however)\b)",
+    re.IGNORECASE,
+)
+
+
+def _clause_requires_sms(text: str, patterns: Any) -> bool:
+    """Match one positive SMS clause without letting another clause negate it."""
+    clauses = [part.strip() for part in _SMS_CLAUSE_SPLIT.split(text) if part.strip()]
+    return any(
+        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(clause)
+        and any(pattern.search(clause) for pattern in patterns)
+        for clause in clauses
+    )
 
 
 def _transcript_requires_sms_commitment(transcript: Any) -> bool:
@@ -183,10 +197,8 @@ def _transcript_requires_sms_commitment(transcript: Any) -> bool:
         if text:
             turns.append(text)
     return any(
-        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(turn)
-        and pattern.search(turn)
+        _clause_requires_sms(turn, _TRANSCRIPT_SMS_COMMITMENT_PATTERNS)
         for turn in turns
-        for pattern in _TRANSCRIPT_SMS_COMMITMENT_PATTERNS
     )
 
 
@@ -203,11 +215,7 @@ def _hosted_requires_sms(
         if str(action.get("status") or "open").strip().lower() == "open"
     )
     action_requires_sms = any(
-        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(text)
-        and any(
-            pattern.search(text)
-            for pattern in _OPEN_ACTION_SMS_COMMITMENT_PATTERNS
-        )
+        _clause_requires_sms(text, _OPEN_ACTION_SMS_COMMITMENT_PATTERNS)
         for text in open_action_texts
     )
     return action_requires_sms or _transcript_requires_sms_commitment(transcript)
@@ -248,7 +256,8 @@ def _hosted_sms_correction_prompt(remote_phone: str, *, missing: bool) -> str:
         f"authoritative remote number {remote_phone} and `text` set to the "
         "still-needed message from the prior hosted-call reconciliation.",
         "Do not use another recipient, do not repeat any completed action, and "
-        "do not answer with prose. Stop after the tool result.",
+        "do not answer with prose. Do not return [SILENT], skip, or defer. "
+        "Stop after the tool result.",
     ])
 
 
