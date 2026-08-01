@@ -91,7 +91,7 @@ jobs:
         run: |
           nohup python3 tests/live/mock_anthropic.py 8089 > /tmp/mock_anthropic.log 2>&1 &
           for i in $(seq 1 10); do
-            curl -fsS http://127.0.0.1:8089/ > /dev/null 2>&1 && exit 0
+            curl -fsS --connect-timeout 1 --max-time 3 http://127.0.0.1:8089/ > /dev/null 2>&1 && exit 0
             sleep 1
           done
           echo "mock model server never came up"; exit 1
