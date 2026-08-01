@@ -100,6 +100,59 @@ def test_stop_command_aborts_queued_detailed_capture():
     asyncio.run(scenario())
 
 
+def test_clear_command_aborts_queued_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        parked_worker = asyncio.create_task(asyncio.sleep(30))
+        session._worker = parked_worker
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.sleep(0)
+
+        await session.handle_inbound("/clear", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1].startswith("Started a fresh conversation")
+        parked_worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_aborts_running_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class FakeClient:
+            async def query(self, _text):
+                started.set()
+
+            async def receive_response(self):
+                await interrupted.wait()
+                raise RuntimeError("Claude turn interrupted")
+                yield  # pragma: no cover
+
+            async def interrupt(self):
+                interrupted.set()
+
+        session._client = FakeClient()
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await session.handle_inbound("/stop", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1] == "Stopped."
+
+    asyncio.run(scenario())
+
+
 def test_clear_command_aborts_running_detailed_capture():
     async def scenario():
         sent = []
@@ -316,10 +369,12 @@ def test_tool_failure_capture_keeps_only_sanitized_classification():
         (422, {"error": "message_blocked_spam_filter", "rule": "emoji_overload"}, "recoverable"),
         (422, {"error": "message_blocked_spam_filter", "rule": "profanity"}, "recoverable"),
         (422, {"error": "content_rejected_by_carrier"}, "recoverable"),
-        (502, {"error": "carrier_unavailable"}, "recoverable"),
-        (429, {"error": "carrier_rate_limit"}, "recoverable"),
-        (None, {"error": "carrier_rate_limit"}, "recoverable"),
-        (None, {"error": "inkbox_duplicate_body"}, "recoverable"),
+        (502, {"error": "carrier_unavailable"}, "terminal"),
+        (429, {"error": "carrier_rate_limit"}, "terminal"),
+        (None, {"error": "carrier_rate_limit"}, "terminal"),
+        (None, {"error": "inkbox_duplicate_body"}, "terminal"),
+        (408, {"error": "request_timeout"}, "terminal"),
+        (503, {"error": "upstream_failure"}, "terminal"),
         (None, {"error": "forbidden"}, "terminal"),
         (403, {"error": "recipient_opted_out"}, "terminal"),
         (422, {"error": "invalid_phone_number"}, "terminal"),
@@ -345,6 +400,7 @@ def test_tool_failure_capture_uses_structured_sms_policy(status, detail, expecte
 
 
 def test_hosted_tool_status_rules_do_not_broaden_normal_delivery_policy():
+    assert sms_delivery_failure_policy("carrier_unavailable", "") == "retry"
     assert sms_delivery_failure_policy("carrier_rate_limit", "") == "conditional"
     assert sms_delivery_failure_policy("inkbox_duplicate_body", "") == "conditional"
     assert sms_delivery_failure_policy("forbidden", "") == "conditional"

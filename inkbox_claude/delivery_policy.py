@@ -45,17 +45,53 @@ _RETRY_MARKERS = (
     "temporar",
     "carrier_unavailable",
 )
-_TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _HOSTED_TERMINAL_CODES = frozenset({
+    *_TERMINAL_CODES,
     "unauthorized",
     "forbidden",
     "insufficient_authority",
-})
-_HOSTED_RECOVERABLE_CODES = frozenset({
     "carrier_rate_limit",
+    "carrier_unavailable",
+    "carrier_temporarily_unavailable",
     "inkbox_duplicate_body",
     "inkbox_carrier_backoff",
 })
+_HOSTED_RECOVERABLE_CODES = frozenset({
+    "sms_too_long",
+    "message_too_long",
+    "message_blocked_spam_filter",
+    "content_flagged_as_spam",
+    "content_rejected_by_carrier",
+    "content_blocked_by_policy",
+})
+_HOSTED_TERMINAL_MARKERS = (
+    *_TERMINAL_MARKERS,
+    "duplicate_body",
+    "carrier_backoff",
+    "carrier_unavailable",
+    "carrier temporarily unavailable",
+    "rate limit",
+    "timed out",
+    "timeout",
+)
+_HOSTED_RECOVERABLE_MARKERS = (
+    "invalid argument",
+    "invalid params",
+    "required property",
+    "missing required",
+    "schema",
+    "format",
+    "e.164",
+    "maximum is",
+    "too long",
+    "must be",
+    "specify exactly one",
+    "message_blocked_spam_filter",
+    "content_flagged_as_spam",
+    "content_rejected_by_carrier",
+    "content_blocked_by_policy",
+)
+_COMMIT_AMBIGUOUS_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def sms_delivery_failure_policy(
@@ -99,18 +135,20 @@ def sms_tool_failure_kind(error: Any) -> str:
     elif detail is not None:
         message = str(detail)
 
-    stable_code = f"{code} rule={rule}" if code and rule else (code or rule)
     fallback = str(error or "")
     normalized_code = code.lower()
-    if normalized_code in _HOSTED_TERMINAL_CODES:
-        return "terminal"
-    policy = sms_delivery_failure_policy(stable_code, message or fallback)
-    if policy == "stop":
+    combined = " ".join(
+        value.lower() for value in (code, rule, message, fallback) if value
+    )
+    if (
+        normalized_code in _HOSTED_TERMINAL_CODES
+        or status in _COMMIT_AMBIGUOUS_STATUSES
+        or any(marker in combined for marker in _HOSTED_TERMINAL_MARKERS)
+    ):
         return "terminal"
     if (
-        policy == "retry"
-        or normalized_code in _HOSTED_RECOVERABLE_CODES
-        or status in _TRANSIENT_STATUSES
+        normalized_code in _HOSTED_RECOVERABLE_CODES
+        or any(marker in combined for marker in _HOSTED_RECOVERABLE_MARKERS)
     ):
         return "recoverable"
     if status in {401, 403}:
