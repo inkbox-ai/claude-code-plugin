@@ -139,13 +139,13 @@ jobs:
 
       # Logs can carry live message content — surface them only when needed.
       - name: Dump logs on failure
-        if: failure()
+        if: failure() || cancelled()
         run: |
           echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
           echo "=== mock_anthropic.log ==="; tail -n 100 /tmp/mock_anthropic.log 2>/dev/null || true
 
       - name: Upload logs on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: live-channels-${{ matrix.leg }}-logs

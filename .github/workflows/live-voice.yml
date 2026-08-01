@@ -155,13 +155,13 @@ jobs:
 
       # Logs can carry live call transcripts — surface them only when needed.
       - name: Dump logs on failure
-        if: failure()
+        if: failure() || cancelled()
         run: |
           echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
           echo "=== voice_driver.log ==="; tail -n 150 /tmp/voice_driver.log 2>/dev/null || true
 
       - name: Upload logs on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: live-voice-${{ matrix.scenario }}-logs
