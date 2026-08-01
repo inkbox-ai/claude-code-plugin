@@ -22,6 +22,17 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
+def test_workflow_requires_action_first_exact_body_and_readback():
+    workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
+
+    assert (
+        "After we hang up, send me one SMS. Create the post-call action now with "
+        "this exact SMS body: $marker. Read those five words back to me after the "
+        "action is saved. Do not send it during the call."
+        in workflow
+    )
+
+
 def test_spoken_marker_normalizes_punctuation_and_case():
     assert voice._spoken_key("Victor-Echo, JULIET!") == "victorechojuliet"
     assert voice._spoken_key("cloudpapa") == voice._spoken_key("Claude Papa")
