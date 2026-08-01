@@ -86,11 +86,27 @@ jobs:
             echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"
           elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
-            marker="hosted-post-call-$(openssl rand -hex 6)"
+            # The marker crosses TTS -> PSTN -> STT. Use ordinary phonetic
+            # words instead of punctuation and long digit strings so the live
+            # assertion proves the current request without depending on exact
+            # ASR formatting.
+            RADIO_WORDS=(
+              alpha bravo charlie delta echo foxtrot golf hotel india juliet
+              kilo lima mike november oscar papa quebec romeo sierra tango
+              uniform victor whiskey xray yankee zulu
+            )
+            marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
+            marker="claude"
+            for _ in 1 2 3 4 5; do
+              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
+              marker="$marker ${RADIO_WORDS[$marker_index]}"
+              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
+            done
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER=$marker" >> "$GITHUB_ENV"
-            echo "VOICE_DRIVER_LINE=After this call ends, send me an SMS containing exactly: $marker" >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_LINE=After this call ends, send me one SMS containing exactly these words: $marker. Do not send it during the call." >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_LISTEN=45" >> "$GITHUB_ENV"
           else
             echo "INKBOX_VOICE_STACK=inkbox_tts_stt" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"

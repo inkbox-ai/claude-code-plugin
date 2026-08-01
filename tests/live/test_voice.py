@@ -22,6 +22,7 @@ import os
 import re
 import time
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
@@ -70,6 +71,51 @@ def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 
+def _spoken_tokens(value: str | None) -> list[str]:
+    """Normalize speech-carried text without depending on punctuation/case."""
+    return re.findall(r"[a-z0-9]+", (value or "").casefold())
+
+
+def _spoken_key(value: str | None) -> str:
+    return "".join(_spoken_tokens(value))
+
+
+def _message_created_at(message):
+    """Return an aware server timestamp from an SDK SMS row."""
+    value = getattr(message, "created_at", None)
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _sms_target_numbers(message) -> set[str]:
+    """All authoritative targets represented by an outbound SMS row."""
+    values = [getattr(message, "remote_phone_number", "") or ""]
+    values.extend(
+        getattr(recipient, "recipient_phone_number", "") or ""
+        for recipient in (getattr(message, "recipients", None) or [])
+    )
+    return {digits for value in values if (digits := _digits(value))}
+
+
+def _has_after_call_sms_intent(value: str | None) -> bool:
+    tokens = _spoken_tokens(value)
+    token_set = set(tokens)
+    joined = " ".join(tokens)
+    after_call = "after" in token_set and bool(
+        token_set & {"call", "hangup", "hang", "hung"}
+    )
+    send = bool(token_set & {"send", "text"})
+    sms = bool(token_set & {"sms", "text", "message"}) or "s m s" in joined
+    return after_call and send and sms
+
+
 def _client(key):
     from inkbox import Inkbox
 
@@ -103,6 +149,28 @@ def _segments(remote, number_id, call_id):
     rem = [s for s in segs if (getattr(s, "party", "") or "").lower() == "remote" and (s.text or "").strip()]
     loc = [s for s in segs if (getattr(s, "party", "") or "").lower() == "local" and (s.text or "").strip()]
     return segs, rem, loc
+
+
+def _wait_for_persisted_hosted_request(remote, number_id, call_id, marker):
+    """Wait for the current after-call SMS request in the caller transcript."""
+    marker_key = _spoken_key(marker)
+    assert marker_key
+    deadline = time.monotonic() + min(TIMEOUT_S, 90)
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            _all, _rem, local = _segments(remote, number_id, call_id)
+            text = " ".join(segment.text.strip() for segment in local)
+            if marker_key in _spoken_key(text) and _has_after_call_sms_intent(text):
+                return
+            last = f"local transcript so far: {text!r}"
+        except Exception as exc:  # transcripts may trail call teardown briefly
+            last = f"transcripts not ready: {exc!r}"
+        time.sleep(POLL_EVERY_S)
+    pytest.fail(
+        "call ended before the current after-call SMS request was persisted "
+        f"({last})"
+    )
 
 
 def _call_state(remote, call_id) -> tuple[str, str]:
@@ -273,22 +341,43 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     aut_numbers = aut.phone_numbers.list()
     assert aut_numbers, "AUT identity has no phone number"
     aut_phone = aut_numbers[0].number
+    aut_number_id = aut_numbers[0].id
     tail = _digits(aut_phone)[-10:]
+    driver_number = _digits(st["number"])
 
     def _inbound_calls():
         return [c for c in remote.calls.list(limit=30)
                 if (getattr(c, "direction", "") or "").lower() == "inbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == tail]
 
-    driver_tail = _digits(st["number"])[-10:]
+    driver_tail = driver_number[-10:]
 
     def _outbound_calls():
         return [c for c in aut.calls.list(limit=30)
                 if (getattr(c, "direction", "") or "").lower() == "outbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == driver_tail]
 
+    def _outbound_sms_to_driver():
+        return [
+            message
+            for message in aut.texts.list(aut_number_id, limit=200)
+            if (getattr(message, "direction", "") or "").lower() == "outbound"
+            and driver_number in _sms_target_numbers(message)
+        ]
+
     before_calls = {c.id for c in _inbound_calls()}
     before_outbound = {c.id for c in _outbound_calls()}
+    baseline_sms = _outbound_sms_to_driver()
+    before_sms = {message.id for message in baseline_sms}
+    baseline_times = [
+        created_at
+        for message in baseline_sms
+        if (created_at := _message_created_at(message)) is not None
+    ]
+    sms_watermark = max(
+        baseline_times,
+        default=datetime.min.replace(tzinfo=UTC),
+    )
     assert GATEWAY_LOG and os.path.exists(GATEWAY_LOG), (
         "GATEWAY_LOG must expose the bridge's host-native tool settlement"
     )
@@ -320,13 +409,12 @@ def test_outbound_call_hosted_and_post_call_wakeup():
         # ends the call itself. Let that complete so Voice AI can acknowledge
         # and persist the instruction before call.ended wakes Claude Code.
         _wait_for_call_end(remote, call_id)
-        segments, _remote_segments, _local_segments = _segments(
-            remote, st["number_id"], call_id,
+        _wait_for_persisted_hosted_request(
+            remote,
+            st["number_id"],
+            call_id,
+            HOSTED_POST_CALL_MARKER,
         )
-        assert any(
-            HOSTED_POST_CALL_MARKER in (segment.text or "")
-            for segment in segments
-        ), "the driver's post-call instruction was not persisted in the transcript"
     finally:
         _hangup_call(remote, call_id)
 
@@ -338,9 +426,19 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     completed_marker = f"completed hosted call completion call_id={placed_call_id}"
     deadline = time.monotonic() + TIMEOUT_S
     log = ""
+    marker_sms = []
     while time.monotonic() < deadline:
         log = _gateway_log_since(log_offset)
-        if tool_marker in log and completed_marker in log:
+        marker_sms = [
+            message
+            for message in _outbound_sms_to_driver()
+            if message.id not in before_sms
+            and (created_at := _message_created_at(message)) is not None
+            and created_at >= sms_watermark
+            and _spoken_key(HOSTED_POST_CALL_MARKER)
+            in _spoken_key(getattr(message, "text", None))
+        ]
+        if tool_marker in log and completed_marker in log and marker_sms:
             break
         time.sleep(POLL_EVERY_S)
     assert tool_marker in log, (
@@ -349,6 +447,29 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     )
     assert completed_marker in log, (
         "hosted SMS was sent but its post-call receipt did not complete"
+    )
+    assert marker_sms, (
+        "hosted completion did not create a current exact-recipient sender-side "
+        "SMS row with the spoken marker"
+    )
+
+    # Give any accidental second attempt time to become visible, then prove the
+    # API-accepted side effect occurred exactly once. Carrier delivery is
+    # asynchronous and belongs to the SMS delivery lane, not reconciliation.
+    time.sleep(2 * POLL_EVERY_S)
+    marker_sms = [
+        message
+        for message in _outbound_sms_to_driver()
+        if message.id not in before_sms
+        and (created_at := _message_created_at(message)) is not None
+        and created_at >= sms_watermark
+        and _spoken_key(HOSTED_POST_CALL_MARKER)
+        in _spoken_key(getattr(message, "text", None))
+    ]
+    assert len(marker_sms) == 1, (
+        "hosted post-call processing did not produce exactly one current-marker "
+        "SMS to the authoritative caller: "
+        f"{[getattr(message, 'text', '') for message in marker_sms]}"
     )
     assert log.count(tool_marker) == 1, (
         "hosted post-call processing recorded duplicate successful SMS side effects"
