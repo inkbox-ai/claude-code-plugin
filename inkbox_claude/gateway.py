@@ -1145,9 +1145,11 @@ class InkboxGateway:
                 "Review the outcome, transcript, and open actions once. Use tools "
                 "to execute every still-needed commitment; do not repeat completed, "
                 "canceled, superseded, or already-performed work.",
-                "Do not finish until each required tool reports success. If a tool "
-                "rejects a recoverable argument or format mistake, correct it and "
-                "try once more.",
+                "Every safe, still-needed commitment must be attempted. Mark it "
+                "complete only after the required tool reports success. If the "
+                "first tool call rejects a recoverable argument or format mistake, "
+                "correct it and try once more. After a terminal error or a failed "
+                "second attempt, stop without claiming success or duplicating the send.",
                 "If nothing remains, do nothing. Plain text from this turn is "
                 "suppressed because the call has ended; side effects require tools.",
             ])
