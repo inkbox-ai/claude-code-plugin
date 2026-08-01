@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -82,14 +83,34 @@ def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unava
     assert "status='failed'" in str(exc.value)
 
 
-def test_wait_for_call_end_returns_after_scripted_driver_completes():
+def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
     voice = _load_live_voice_module()
-    client = SimpleNamespace(calls=_Calls(
+    marker = "victor echo juliet"
+    remote = SimpleNamespace(calls=_Calls(
         call=SimpleNamespace(
-            status="completed", reason="test", hangup_reason="remote",
-            started_at="before", ended_at="now", is_blocked=False,
+            status="answered", reason="test", hangup_reason=None,
+            started_at="before", ended_at=None, is_blocked=False,
         ),
+        transcripts=[SimpleNamespace(
+            party="local",
+            text=f"After this call ends, send one SMS containing {marker}.",
+        )],
+    ))
+    aut = SimpleNamespace(calls=_Calls(
+        call=SimpleNamespace(post_call_action_items=[{
+            "status": "open",
+            "action": "send_sms",
+            "details": f"Send {marker} to the caller.",
+        }]),
         transcripts=[],
     ))
 
-    assert voice._wait_for_call_end(client, "call-id") is None
+    assert voice._wait_for_persisted_hosted_request(
+        remote,
+        "unused-number-id",
+        "driver-call-id",
+        aut,
+        "aut-call-id",
+        marker,
+        deadline=time.monotonic() + 1,
+    ) is None

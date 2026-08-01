@@ -106,7 +106,9 @@ jobs:
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER=$marker" >> "$GITHUB_ENV"
             echo "VOICE_DRIVER_LINE=After this call ends, send me one SMS containing exactly these words: $marker. Do not send it during the call." >> "$GITHUB_ENV"
-            echo "VOICE_DRIVER_LISTEN=45" >> "$GITHUB_ENV"
+            # Keep the media peer alive while the test waits for Voice AI to
+            # persist the open post-call action, then let the test hang up.
+            echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"
           else
             echo "INKBOX_VOICE_STACK=inkbox_tts_stt" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
