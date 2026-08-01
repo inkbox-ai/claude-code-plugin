@@ -213,6 +213,43 @@ def _matching_post_call_action(call, marker):
     return None
 
 
+def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
+    """Bounded, content-redacted predicates for the hosted action gate."""
+    items = getattr(call, "post_call_action_items", None) or []
+    open_count = 0
+    marker_count = 0
+    sms_count = 0
+    matching_action = False
+    marker_key = _spoken_key(marker)
+    for item in items[:10]:
+        if isinstance(item, dict):
+            status = item.get("status", "")
+            action = item.get("action", "")
+            details = item.get("details", "")
+        else:
+            status = getattr(item, "status", "")
+            action = getattr(item, "action", "")
+            details = getattr(item, "details", "")
+        value = f"{action} {details}"
+        is_open = str(status).casefold() == "open"
+        has_marker = bool(marker_key) and marker_key in _spoken_key(value)
+        has_sms_intent = _has_sms_action_intent(value)
+        open_count += int(is_open)
+        marker_count += int(has_marker)
+        sms_count += int(has_sms_intent)
+        matching_action = matching_action or (
+            is_open and has_marker and has_sms_intent
+        )
+    return {
+        "item_count": len(items),
+        "inspected_count": min(len(items), 10),
+        "open_count": open_count,
+        "marker_count": marker_count,
+        "sms_count": sms_count,
+        "matching_action": matching_action,
+    }
+
+
 def _client(key):
     from inkbox import Inkbox
 
@@ -263,8 +300,8 @@ def _wait_for_persisted_hosted_request(
     assert marker_key
     transcript_ready = False
     action_ready = False
-    last_transcript = ""
-    last_actions = ""
+    transcript_diagnostic: dict[str, int | bool | str] = {}
+    action_diagnostic: dict[str, int | bool | str] = {}
     while time.monotonic() < deadline:
         try:
             _all, _rem, local = _segments(remote, number_id, call_id)
@@ -273,15 +310,19 @@ def _wait_for_persisted_hosted_request(
                 marker_key in _spoken_key(text)
                 and _has_after_call_sms_intent(text)
             )
-            last_transcript = repr(text)
+            transcript_diagnostic = {
+                "segment_count": len(local),
+                "marker_present": marker_key in _spoken_key(text),
+                "after_call_sms_intent": _has_after_call_sms_intent(text),
+            }
         except Exception as exc:  # transcripts may trail call teardown briefly
-            last_transcript = f"not ready: {exc!r}"
+            transcript_diagnostic = {"error_type": type(exc).__name__}
         try:
             aut_call = aut.calls.get(aut_call_id)
             action_ready = _matching_post_call_action(aut_call, marker) is not None
-            last_actions = repr(getattr(aut_call, "post_call_action_items", None))
+            action_diagnostic = _post_call_action_diagnostic(aut_call, marker)
         except Exception as exc:
-            last_actions = f"not ready: {exc!r}"
+            action_diagnostic = {"error_type": type(exc).__name__}
         if transcript_ready and action_ready:
             return
         time.sleep(POLL_EVERY_S)
@@ -289,7 +330,7 @@ def _wait_for_persisted_hosted_request(
         "hosted call did not persist both current caller intent and its open "
         "post-call SMS action before the shared deadline "
         f"(transcript_ready={transcript_ready}, action_ready={action_ready}, "
-        f"local_transcript={last_transcript}, action_items={last_actions})"
+        f"transcript_gate={transcript_diagnostic}, action_gate={action_diagnostic})"
     )
 
 

@@ -829,6 +829,50 @@ def test_voice_ai_reuses_admin_identity_without_persisting_admin_key(tmp_path, m
     assert "admin" not in env_file.read_text().lower()
 
 
+def test_voice_ai_rejects_non_admin_key_and_returns_to_stack_choices(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
+    choices = iter([0, 1, 2])
+    monkeypatch.setattr(setup_wizard, "prompt_choice", lambda *a, **k: next(choices))
+    monkeypatch.setattr(
+        setup_wizard,
+        "prompt",
+        lambda question, *a, **k: (
+            "" if "Press Enter" in question else "ApiKey_not_admin"
+        ),
+    )
+
+    class Whoami:
+        auth_subtype = "agent_scoped"
+
+    class FakeInkbox:
+        def __init__(self, **_kwargs):
+            pass
+
+        def whoami(self):
+            return Whoami()
+
+        def get_identity(self, _handle):
+            raise AssertionError("non-admin credential must not configure authority")
+
+    kwargs = _voice_setup_kwargs()
+    kwargs.update({"Inkbox": FakeInkbox, "WhoamiApiKeyResponse": Whoami})
+    identity = _VoiceIdentity(authority="contact_scoped")
+
+    setup_wizard._configure_phone_call_voice_stack(identity, **kwargs)
+
+    assert identity.authority_updates == []
+    assert identity.hosted_updates == []
+    assert setup_wizard._env("INKBOX_VOICE_STACK") == "inkbox_tts_stt"
+    assert setup_wizard._env("INKBOX_REALTIME_ENABLED") == "false"
+    assert "ApiKey_not_admin" not in env_file.read_text()
+    assert "requires an admin-scoped API key" in capsys.readouterr().out
+
+
 def test_voice_ai_failure_restores_all_prior_config(tmp_path, monkeypatch):
     monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(tmp_path / ".env"))
     choices = iter([0, 1, 2])

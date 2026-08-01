@@ -101,6 +101,8 @@ def test_call_pair_duplicate_diagnostic_names_owner_and_ids():
             driver_watermark=stamp,
             aut_watermark=stamp,
         )
+
+
 def test_matching_post_call_action_requires_open_current_marker_sms():
     marker = "victor echo juliet"
     matching = {
@@ -120,3 +122,35 @@ def test_matching_post_call_action_requires_open_current_marker_sms():
         assert voice._matching_post_call_action(
             SimpleNamespace(post_call_action_items=[item]), marker
         ) is None
+
+
+def test_action_gate_diagnostic_is_bounded_and_content_redacted():
+    secret = "customer-secret-" * 10_000
+    call = SimpleNamespace(
+        post_call_action_items=[
+            {
+                "status": "open",
+                "action": "send_sms",
+                "details": f"Send Victor Echo Juliet {secret}",
+            },
+            *[
+                {"status": "closed", "action": secret, "details": secret}
+                for _ in range(15)
+            ],
+        ]
+    )
+
+    diagnostic = voice._post_call_action_diagnostic(
+        call,
+        "Victor Echo Juliet",
+    )
+
+    assert diagnostic == {
+        "item_count": 16,
+        "inspected_count": 10,
+        "open_count": 1,
+        "marker_count": 1,
+        "sms_count": 1,
+        "matching_action": True,
+    }
+    assert "customer-secret" not in repr(diagnostic)
