@@ -44,7 +44,7 @@ def _payload(call_id="call-1"):
                 "reason": "Check the release",
                 "status": "completed",
             },
-            "contacts": [{"id": "contact-1", "preferred_name": "Dima"}],
+            "contacts": [{"id": "contact-1", "preferred_name": "Ada"}],
             "outcome": "completed",
             "post_call_action_items": [
                 {
@@ -541,7 +541,7 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
         [], [("local", "I'll send you a text message after we hang up.")]
     )
     assert gateway_module._hosted_requires_sms(
-        [], [("local", "After I hang up, text the release status to Dima.")]
+        [], [("local", "After I hang up, text the release status to Ada.")]
     )
     assert gateway_module._hosted_requires_sms(
         [],
