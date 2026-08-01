@@ -133,13 +133,13 @@ _TRANSCRIPT_TEXT_VERB = (
 )
 _TRANSCRIPT_TEXT_CLAUSE_PREFIX = (
     r"(?:please\s+|then\s+|(?:(?:can|could|would|will)\s+you|"
-    r"(?:i|we)\s*(?:will|'ll|’ll|am\s+going\s+to|are\s+going\s+to))\s+)?"
+    r"(?:i|we)\s*(?:will|'ll|’ll|am\s+going\s+to|are\s+going\s+to))\s+)"
 )
 _TRANSCRIPT_SEND_SMS = r"send\b.{0,80}\b(?:an?\s+)?(?:sms|text\s+message)\b"
 _TRANSCRIPT_SMS_COMMITMENT_PATTERNS = (
     re.compile(
         rf"\b{_TRANSCRIPT_POST_CALL_TIMING}\b[\s,;:!—-]*"
-        rf"{_TRANSCRIPT_TEXT_CLAUSE_PREFIX}{_TRANSCRIPT_TEXT_VERB}",
+        rf"(?:{_TRANSCRIPT_TEXT_CLAUSE_PREFIX})?{_TRANSCRIPT_TEXT_VERB}",
         re.IGNORECASE,
     ),
     re.compile(

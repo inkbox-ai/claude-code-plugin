@@ -389,6 +389,7 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
             ("remote", "Please text me the status."),
             ("local", "I'll text you the final result."),
             ("remote", "After we hang up, review the text conversation."),
+            ("remote", "Review the text exchange after we hang up."),
         ],
     )
 
