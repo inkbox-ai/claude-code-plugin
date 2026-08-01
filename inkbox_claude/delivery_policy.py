@@ -16,9 +16,6 @@ _TERMINAL_CODES = frozenset({
     "sender_registration_required",
     "messaging_profile_disabled",
     "toll_free_sms_unsupported",
-    "unauthorized",
-    "forbidden",
-    "insufficient_authority",
 })
 _TERMINAL_MARKERS = (
     "opted out",
@@ -29,9 +26,6 @@ _TERMINAL_MARKERS = (
     "unreachable",
     "unknown subscriber",
     "cannot receive",
-    "not authorized",
-    "unauthorized",
-    "forbidden",
     "unsafe",
     "harmful",
     "abusive",
@@ -49,13 +43,19 @@ _RETRY_MARKERS = (
     "emoji",
     "profanity",
     "temporar",
-    "rate_limit",
-    "rate limit",
-    "duplicate_body",
-    "carrier_backoff",
     "carrier_unavailable",
 )
 _TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_HOSTED_TERMINAL_CODES = frozenset({
+    "unauthorized",
+    "forbidden",
+    "insufficient_authority",
+})
+_HOSTED_RECOVERABLE_CODES = frozenset({
+    "carrier_rate_limit",
+    "inkbox_duplicate_body",
+    "inkbox_carrier_backoff",
+})
 
 
 def sms_delivery_failure_policy(
@@ -101,10 +101,17 @@ def sms_tool_failure_kind(error: Any) -> str:
 
     stable_code = f"{code} rule={rule}" if code and rule else (code or rule)
     fallback = str(error or "")
+    normalized_code = code.lower()
+    if normalized_code in _HOSTED_TERMINAL_CODES:
+        return "terminal"
     policy = sms_delivery_failure_policy(stable_code, message or fallback)
     if policy == "stop":
         return "terminal"
-    if policy == "retry" or status in _TRANSIENT_STATUSES:
+    if (
+        policy == "retry"
+        or normalized_code in _HOSTED_RECOVERABLE_CODES
+        or status in _TRANSIENT_STATUSES
+    ):
         return "recoverable"
     if status in {401, 403}:
         return "terminal"

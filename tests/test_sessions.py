@@ -7,7 +7,10 @@ import pytest
 
 from inkbox_claude import sessions as sessions_mod
 from inkbox_claude.config import BridgeConfig
-from inkbox_claude.delivery_policy import sms_tool_failure_kind
+from inkbox_claude.delivery_policy import (
+    sms_delivery_failure_policy,
+    sms_tool_failure_kind,
+)
 from inkbox_claude.sessions import (
     ContactSession,
     _parse_index,
@@ -315,6 +318,9 @@ def test_tool_failure_capture_keeps_only_sanitized_classification():
         (422, {"error": "content_rejected_by_carrier"}, "recoverable"),
         (502, {"error": "carrier_unavailable"}, "recoverable"),
         (429, {"error": "carrier_rate_limit"}, "recoverable"),
+        (None, {"error": "carrier_rate_limit"}, "recoverable"),
+        (None, {"error": "inkbox_duplicate_body"}, "recoverable"),
+        (None, {"error": "forbidden"}, "terminal"),
         (403, {"error": "recipient_opted_out"}, "terminal"),
         (422, {"error": "invalid_phone_number"}, "terminal"),
     ],
@@ -336,6 +342,12 @@ def test_tool_failure_capture_uses_structured_sms_policy(status, detail, expecte
     assert sms_tool_failure_kind(Failure()) == expected
     assert "message_blocked" not in repr(captured)
     assert "emoji" not in repr(captured)
+
+
+def test_hosted_tool_status_rules_do_not_broaden_normal_delivery_policy():
+    assert sms_delivery_failure_policy("carrier_rate_limit", "") == "conditional"
+    assert sms_delivery_failure_policy("inkbox_duplicate_body", "") == "conditional"
+    assert sms_delivery_failure_policy("forbidden", "") == "conditional"
 
 
 def test_pending_escalation_consumes_next_inbound():
