@@ -1125,6 +1125,8 @@ class InkboxGateway:
                     f"Remote party phone number: {remote}",
                     "For callbacks or phone follow-up, use that exact number. "
                     "Contact memories are background only and must not override it.",
+                    "For an SMS follow-up, call inkbox_send_sms with `to` set to "
+                    "that exact remote number and `text` set to the requested message.",
                 ])
             if reason:
                 lines.append(f"Outbound task: {reason}")
@@ -1143,6 +1145,9 @@ class InkboxGateway:
                 "Review the outcome, transcript, and open actions once. Use tools "
                 "to execute every still-needed commitment; do not repeat completed, "
                 "canceled, superseded, or already-performed work.",
+                "Do not finish until each required tool reports success. If a tool "
+                "rejects a recoverable argument or format mistake, correct it and "
+                "try once more.",
                 "If nothing remains, do nothing. Plain text from this turn is "
                 "suppressed because the call has ended; side effects require tools.",
             ])

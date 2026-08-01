@@ -97,6 +97,9 @@ def test_hosted_completion_runs_once_and_suppresses_plain_text(tmp_path):
         assert len(prompts) == 1
         assert "Remote party phone number: +15551112222" in prompts[0]
         assert "Contact memories are background only" in prompts[0]
+        assert "inkbox_send_sms" in prompts[0]
+        assert "`to` set to that exact remote number" in prompts[0]
+        assert "Do not finish until each required tool reports success" in prompts[0]
         assert "Send the summary" in prompts[0]
         assert gateway.sessions.chat_ids == ["contact-1"]
         assert json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]["state"] == "completed"
