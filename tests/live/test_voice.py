@@ -25,7 +25,6 @@ import uuid
 
 import pytest
 
-
 # The agent answers a call request by dialing back, not by texting, so these
 # driver→AUT SMS never get an SMS reply to reset the server's conversation
 # cadence. Two identical no-reply sends to the same number trip the
@@ -49,6 +48,7 @@ BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 REAL = os.environ.get("LIVE_REAL_MODEL") == "1"
 SCENARIO = os.environ.get("VOICE_SCENARIO", "")
 HOSTED_POST_CALL_MARKER = os.environ.get("HOSTED_POST_CALL_MARKER", "")
+GATEWAY_LOG = os.environ.get("GATEWAY_LOG", "")
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
 TIMEOUT_S = float(os.environ.get("LIVE_VOICE_TIMEOUT", "220"))
 POLL_EVERY_S = 6.0
@@ -79,6 +79,15 @@ def _client(key):
 def _driver_state() -> dict:
     with open(STATE_FILE) as fh:
         return json.load(fh)
+
+
+def _gateway_log_since(offset: int) -> str:
+    """Return gateway log output emitted after the hosted-call request."""
+    if not GATEWAY_LOG or not os.path.exists(GATEWAY_LOG):
+        return ""
+    with open(GATEWAY_LOG, encoding="utf-8", errors="replace") as handle:
+        handle.seek(offset)
+        return handle.read()
 
 
 def _aut_phone(aut) -> str:
@@ -264,7 +273,6 @@ def test_outbound_call_hosted_and_post_call_wakeup():
     aut_numbers = aut.phone_numbers.list()
     assert aut_numbers, "AUT identity has no phone number"
     aut_phone = aut_numbers[0].number
-    aut_number_id = str(aut_numbers[0].id)
     tail = _digits(aut_phone)[-10:]
 
     def _inbound_calls():
@@ -279,14 +287,12 @@ def test_outbound_call_hosted_and_post_call_wakeup():
                 if (getattr(c, "direction", "") or "").lower() == "outbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == driver_tail]
 
-    def _aut_outbound_texts():
-        return [m for m in aut.texts.list(aut_number_id, limit=200)
-                if (getattr(m, "direction", "") or "").lower() == "outbound"
-                and _digits(getattr(m, "remote_phone_number", "") or "")[-10:] == driver_tail]
-
     before_calls = {c.id for c in _inbound_calls()}
     before_outbound = {c.id for c in _outbound_calls()}
-    before_texts = {m.id for m in _aut_outbound_texts()}
+    assert GATEWAY_LOG and os.path.exists(GATEWAY_LOG), (
+        "GATEWAY_LOG must expose the bridge's host-native tool settlement"
+    )
+    log_offset = os.path.getsize(GATEWAY_LOG)
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     call_id = None
@@ -314,33 +320,36 @@ def test_outbound_call_hosted_and_post_call_wakeup():
         # ends the call itself. Let that complete so Voice AI can acknowledge
         # and persist the instruction before call.ended wakes Claude Code.
         _wait_for_call_end(remote, call_id)
+        segments, _remote_segments, _local_segments = _segments(
+            remote, st["number_id"], call_id,
+        )
+        assert any(
+            HOSTED_POST_CALL_MARKER in (segment.text or "")
+            for segment in segments
+        ), "the driver's post-call instruction was not persisted in the transcript"
     finally:
         _hangup_call(remote, call_id)
 
+    placed_call_id = str(placed.id)
+    tool_marker = (
+        "confirmed hosted call SMS tool completion "
+        f"call_id={placed_call_id}"
+    )
+    completed_marker = f"completed hosted call completion call_id={placed_call_id}"
     deadline = time.monotonic() + TIMEOUT_S
-    delivered = []
+    log = ""
     while time.monotonic() < deadline:
-        delivered = [
-            message for message in _aut_outbound_texts()
-            if message.id not in before_texts
-            and HOSTED_POST_CALL_MARKER in (message.text or "")
-        ]
-        if delivered:
+        log = _gateway_log_since(log_offset)
+        if tool_marker in log and completed_marker in log:
             break
         time.sleep(POLL_EVERY_S)
-    assert delivered, (
-        "hosted call ended but Claude Code did not execute its post-call SMS action"
+    assert tool_marker in log, (
+        "hosted call ended without one exact-recipient SMS confirmed by the "
+        "Claude session's post-SDK-return delivery marker"
     )
-
-    # Prove the explicit tool side effect is the only post-call SMS; a plain
-    # captured model reply must not leak onto the requesting channel.
-    time.sleep(2 * POLL_EVERY_S)
-    new_texts = [
-        message for message in _aut_outbound_texts()
-        if message.id not in before_texts
-    ]
-    assert len(new_texts) == 1, (
-        "hosted post-call processing leaked model text or duplicated the "
-        f"commitment: {[getattr(message, 'text', '') for message in new_texts]}"
+    assert completed_marker in log, (
+        "hosted SMS was sent but its post-call receipt did not complete"
     )
-    assert HOSTED_POST_CALL_MARKER in (new_texts[0].text or "")
+    assert log.count(tool_marker) == 1, (
+        "hosted post-call processing recorded duplicate successful SMS side effects"
+    )

@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
+    from .delivery_policy import sms_tool_failure_kind
+except ImportError:  # pragma: no cover - direct local import/test fallback
+    from delivery_policy import sms_tool_failure_kind
+
+try:
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -87,8 +92,28 @@ class _Turn:
     """
 
     text: str
-    future: Optional["asyncio.Future[str]"] = None
+    future: Optional["asyncio.Future[Any]"] = None
     a2a_context: Optional[Dict[str, Any]] = None
+    capture_tools: bool = False
+
+
+@dataclass(frozen=True)
+class ToolDeliveryResult:
+    """Sanitized host-native outcome for one messaging tool attempt."""
+
+    mode: str
+    target: str
+    sent: bool
+    error_kind: str
+
+
+@dataclass(frozen=True)
+class CapturedTurnResult:
+    """Capture-turn text plus host-native messaging-tool outcomes."""
+
+    text: str
+    tool_deliveries: tuple[ToolDeliveryResult, ...]
+    aborted: bool = False
 
 # Leading slash-commands the human can text to steer the conversation itself.
 # The bridge acts on these locally — they never reach Claude as a turn.
@@ -353,6 +378,7 @@ class ContactSession:
         # and recipient as the inbound turn. The tool's message is the reply;
         # do not follow it with Claude's usually-redundant "sent it" result.
         self._current_channel_tool_delivery = False
+        self._current_tool_deliveries: list[ToolDeliveryResult] = []
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -504,7 +530,14 @@ class ContactSession:
             except asyncio.QueueEmpty:
                 break
             if turn.future is not None and not turn.future.done():
-                turn.future.set_result("")
+                if turn.capture_tools:
+                    turn.future.set_result(CapturedTurnResult(
+                        text="",
+                        tool_deliveries=(),
+                        aborted=True,
+                    ))
+                else:
+                    turn.future.set_result("")
 
     async def _begin_resume(self) -> None:
         """List recent sessions and let the human pick one to reopen.
@@ -611,10 +644,19 @@ class ContactSession:
         Cross-channel sends and sends to third parties still need the normal
         automatic reply so the human hears that the action completed.
         """
-        if not self._turn_active or str(mode or "").strip().lower() != self.mode:
+        if not self._turn_active:
             return
 
+        normalized_mode = str(mode or "").strip().lower()
         target = str(target or "").strip()
+        self._current_tool_deliveries.append(ToolDeliveryResult(
+            mode=normalized_mode,
+            target=target,
+            sent=True,
+            error_kind="none",
+        ))
+        if normalized_mode != self.mode:
+            return
         matched = False
         if self.mode == "email":
             current = str(
@@ -642,9 +684,21 @@ class ContactSession:
                 self.mode,
             )
 
+    def mark_tool_failure(self, mode: str, target: str, error: Any) -> None:
+        """Record a failed host-native tool attempt without retaining its payload."""
+        if not self._turn_active:
+            return
+        self._current_tool_deliveries.append(ToolDeliveryResult(
+            mode=str(mode or "").strip().lower(),
+            target=str(target or "").strip(),
+            sent=False,
+            error_kind=sms_tool_failure_kind(error),
+        ))
+
     async def _run_turn(self, turn: _Turn) -> None:
         self._interrupting = False  # fresh turn starts un-interrupted
         self._current_channel_tool_delivery = False
+        self._current_tool_deliveries: list[ToolDeliveryResult] = []
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         retried_missing_resume = False
@@ -701,7 +755,14 @@ class ContactSession:
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.
             if turn.future is not None and not turn.future.done():
-                turn.future.set_exception(exc)
+                if turn.capture_tools and self._interrupting:
+                    turn.future.set_result(CapturedTurnResult(
+                        text="",
+                        tool_deliveries=tuple(self._current_tool_deliveries),
+                        aborted=True,
+                    ))
+                else:
+                    turn.future.set_exception(exc)
                 return
             raise
         finally:
@@ -722,7 +783,16 @@ class ContactSession:
         # interrupted this one, in which case the partial answer is dropped.
         if turn.future is not None:
             if not turn.future.done():
-                turn.future.set_result(reply or "I finished that, but didn't have anything to say back.")
+                if turn.capture_tools:
+                    turn.future.set_result(CapturedTurnResult(
+                        text=reply,
+                        tool_deliveries=tuple(self._current_tool_deliveries),
+                        aborted=self._interrupting,
+                    ))
+                else:
+                    turn.future.set_result(
+                        reply or "I finished that, but didn't have anything to say back."
+                    )
             return
         if self._interrupting:
             return
@@ -804,6 +874,15 @@ class ContactSession:
         await self._queue.put(
             _Turn(text=query, future=future, a2a_context=a2a_context)
         )
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        return await future
+
+    async def run_consult_detailed(self, query: str) -> CapturedTurnResult:
+        """Run a capture turn and return sanitized host-native tool outcomes."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[CapturedTurnResult] = loop.create_future()
+        await self._queue.put(_Turn(text=query, future=future, capture_tools=True))
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
         return await future

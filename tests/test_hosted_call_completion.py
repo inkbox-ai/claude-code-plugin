@@ -3,8 +3,28 @@ import json
 import types
 
 from inkbox_claude import gateway as gateway_module
-from inkbox_claude.gateway import InkboxGateway
 from inkbox_claude.config import BridgeConfig, VoiceStack
+from inkbox_claude.gateway import InkboxGateway
+from inkbox_claude.sessions import CapturedTurnResult, ToolDeliveryResult
+
+
+def _sms_result(
+    *,
+    target="+15551112222",
+    sent=True,
+    error_kind="none",
+    aborted=False,
+):
+    return CapturedTurnResult(
+        text="This plain text must not be delivered",
+        tool_deliveries=(ToolDeliveryResult(
+            mode="sms",
+            target=target,
+            sent=sent,
+            error_kind=error_kind,
+        ),),
+        aborted=aborted,
+    )
 
 
 def _payload(call_id="call-1"):
@@ -23,7 +43,11 @@ def _payload(call_id="call-1"):
             "contacts": [{"id": "contact-1", "preferred_name": "Dima"}],
             "outcome": "completed",
             "post_call_action_items": [
-                {"action": "Send the summary", "status": "open"},
+                {
+                    "action": "Send the summary",
+                    "details": "Use SMS after hangup",
+                    "status": "open",
+                },
             ],
             "transcript": {
                 "entries": [
@@ -36,9 +60,11 @@ def _payload(call_id="call-1"):
 
 
 class _Session:
-    def __init__(self, prompts, error=None):
+    def __init__(self, prompts, error=None, results=None):
         self.prompts = prompts
         self.error = error
+        self.results = list(results or [_sms_result()])
+        self.detailed_calls = 0
 
     async def run_consult(self, prompt):
         self.prompts.append(prompt)
@@ -46,16 +72,24 @@ class _Session:
             raise self.error
         return "This plain text must not be delivered"
 
+    async def run_consult_detailed(self, prompt):
+        self.detailed_calls += 1
+        self.prompts.append(prompt)
+        if self.error:
+            raise self.error
+        return self.results.pop(0)
+
 
 class _Sessions:
-    def __init__(self, prompts, error=None):
+    def __init__(self, prompts, error=None, results=None):
         self.prompts = prompts
         self.error = error
         self.chat_ids = []
+        self.session = _Session(self.prompts, self.error, results)
 
     def get(self, chat_id):
         self.chat_ids.append(chat_id)
-        return _Session(self.prompts, self.error)
+        return self.session
 
 
 class _Inkbox:
@@ -71,14 +105,14 @@ class _TranscriptFailureInkbox:
         return types.SimpleNamespace(list_transcripts=fail)
 
 
-def _gateway(tmp_path, *, error=None):
+def _gateway(tmp_path, *, error=None, results=None):
     gateway_module.web = types.SimpleNamespace(json_response=lambda value: value)
     cfg = BridgeConfig(identity="claude", voice_stack=VoiceStack.INKBOX_VOICE_AI)
     gateway = InkboxGateway(cfg)
     gateway._hosted_call_registry_path = tmp_path / "hosted.json"
     gateway._inkbox = _Inkbox()
     prompts = []
-    gateway.sessions = _Sessions(prompts, error)
+    gateway.sessions = _Sessions(prompts, error, results)
     return gateway, prompts
 
 
@@ -104,12 +138,201 @@ def test_hosted_completion_runs_once_and_suppresses_plain_text(tmp_path):
         assert "After a terminal error or a failed second attempt" in prompts[0]
         assert "stop without claiming success or duplicating the send" in prompts[0]
         assert "Send the summary" in prompts[0]
+        assert "Use SMS after hangup" in prompts[0]
         assert gateway.sessions.chat_ids == ["contact-1"]
         assert json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]["state"] == "completed"
 
         await gateway._on_hosted_call_ended(_payload())
         await _drain(gateway)
         assert len(prompts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_recoverable_failure_gets_one_correction(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path, results=[
+            _sms_result(sent=False, error_kind="recoverable"),
+            _sms_result(),
+        ])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 2
+        assert "only correction attempt" in prompts[1]
+        assert "+15551112222" in prompts[1]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_failed_correction_is_terminal_and_not_replayed(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path, results=[
+            _sms_result(sent=False, error_kind="recoverable"),
+            _sms_result(sent=False, error_kind="recoverable"),
+        ])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 2
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted, restarted_prompts = _gateway(tmp_path)
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_terminal_failure_does_not_get_correction(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path, results=[
+            _sms_result(sent=False, error_kind="terminal"),
+        ])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_wrong_target_does_not_get_correction(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path, results=[
+            _sms_result(target="+19999999999"),
+        ])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_duplicate_successes_do_not_get_correction(tmp_path):
+    async def scenario():
+        duplicate = CapturedTurnResult(
+            text="",
+            tool_deliveries=_sms_result().tool_deliveries * 2,
+        )
+        gateway, prompts = _gateway(tmp_path, results=[duplicate])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_failure_then_success_in_one_turn_is_terminal(tmp_path):
+    async def scenario():
+        mixed = CapturedTurnResult(
+            text="",
+            tool_deliveries=(
+                _sms_result(sent=False, error_kind="recoverable").tool_deliveries[0],
+                _sms_result().tool_deliveries[0],
+            ),
+        )
+        gateway, prompts = _gateway(tmp_path, results=[mixed])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_aborted_capture_is_terminal_without_correction(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path, results=[_sms_result(aborted=True)])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+        restarted, restarted_prompts = _gateway(tmp_path)
+        await restarted._recover_hosted_call_completions()
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_missing_attempt_gets_one_clean_correction(tmp_path):
+    async def scenario():
+        missing = CapturedTurnResult(text="", tool_deliveries=())
+        gateway, prompts = _gateway(tmp_path, results=[missing, _sms_result()])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 2
+        assert "tool was not called" in prompts[1]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_correction_requires_one_clean_success(tmp_path):
+    async def scenario():
+        mixed = CapturedTurnResult(
+            text="",
+            tool_deliveries=(
+                _sms_result().tool_deliveries[0],
+                _sms_result(sent=False, error_kind="recoverable").tool_deliveries[0],
+            ),
+        )
+        gateway, prompts = _gateway(tmp_path, results=[
+            _sms_result(sent=False, error_kind="recoverable"),
+            mixed,
+        ])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert len(prompts) == 2
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_hosted_non_sms_action_preserves_plain_capture_behavior(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path)
+        payload = _payload()
+        payload["data"]["post_call_action_items"] = [{
+            "action": "Update the release checklist",
+            "status": "open",
+        }]
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        assert gateway.sessions.session.detailed_calls == 0
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
 
     asyncio.run(scenario())
 

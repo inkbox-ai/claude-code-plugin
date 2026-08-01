@@ -3,12 +3,15 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from inkbox_claude import sessions as sessions_mod
 from inkbox_claude.config import BridgeConfig
+from inkbox_claude.delivery_policy import sms_tool_failure_kind
 from inkbox_claude.sessions import (
     ContactSession,
-    _Turn,
     _parse_index,
+    _Turn,
     list_recent_sessions,
 )
 
@@ -48,6 +51,84 @@ def test_abort_settles_queued_capture_future():
         assert fut.done()
         assert fut.result() == ""
         assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_abort_settles_queued_detailed_capture_with_empty_tool_result():
+    async def scenario():
+        session = make_session([])
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await session._queue.put(_Turn(
+            text="do work",
+            future=fut,
+            capture_tools=True,
+        ))
+
+        await session._abort_in_flight()
+
+        result = fut.result()
+        assert result.text == ""
+        assert result.tool_deliveries == ()
+        assert result.aborted is True
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_aborts_queued_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        parked_worker = asyncio.create_task(asyncio.sleep(30))
+        session._worker = parked_worker
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.sleep(0)
+
+        await session.handle_inbound("/stop", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1] == "Stopped."
+        parked_worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_aborts_running_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class FakeClient:
+            async def query(self, _text):
+                started.set()
+
+            async def receive_response(self):
+                await interrupted.wait()
+                raise RuntimeError("Claude turn interrupted")
+                yield  # pragma: no cover
+
+            async def interrupt(self):
+                interrupted.set()
+
+            async def disconnect(self):
+                interrupted.set()
+
+        session._client = FakeClient()
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await session.handle_inbound("/clear", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1].startswith("Started a fresh conversation")
 
     asyncio.run(scenario())
 
@@ -188,6 +269,10 @@ def test_tool_delivery_matches_sms_and_imessage_routing():
     session.reply_meta = {"to": "+1 (555) 111-2222", "conversation_id": "sms-conv"}
     session.mark_tool_delivery("sms", "+15551112222")
     assert session._current_channel_tool_delivery is True
+    captured = session._current_tool_deliveries[-1]
+    assert (captured.mode, captured.target, captured.sent, captured.error_kind) == (
+        "sms", "+15551112222", True, "none",
+    )
 
     session._current_channel_tool_delivery = False
     session.mark_tool_delivery("sms", "sms-conv")
@@ -198,6 +283,59 @@ def test_tool_delivery_matches_sms_and_imessage_routing():
     session.reply_meta = {"conversation_id": "imessage-conv"}
     session.mark_tool_delivery("imessage", "imessage-conv")
     assert session._current_channel_tool_delivery is True
+
+
+def test_tool_failure_capture_keeps_only_sanitized_classification():
+    session = make_session([])
+    session._turn_active = True
+
+    class Failure(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.detail = {
+                "message": "invalid phone number secret-provider-payload",
+                "provider_id": "provider-secret-123",
+            }
+
+    session.mark_tool_failure("sms", "+15551112222", Failure("forbidden raw body"))
+
+    captured = session._current_tool_deliveries[-1]
+    assert (captured.mode, captured.target, captured.sent, captured.error_kind) == (
+        "sms", "+15551112222", False, "terminal",
+    )
+    assert "secret" not in repr(captured)
+    assert "provider" not in repr(captured)
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected"),
+    [
+        (422, {"error": "message_blocked_spam_filter", "rule": "emoji_overload"}, "recoverable"),
+        (422, {"error": "message_blocked_spam_filter", "rule": "profanity"}, "recoverable"),
+        (422, {"error": "content_rejected_by_carrier"}, "recoverable"),
+        (502, {"error": "carrier_unavailable"}, "recoverable"),
+        (429, {"error": "carrier_rate_limit"}, "recoverable"),
+        (403, {"error": "recipient_opted_out"}, "terminal"),
+        (422, {"error": "invalid_phone_number"}, "terminal"),
+    ],
+)
+def test_tool_failure_capture_uses_structured_sms_policy(status, detail, expected):
+    session = make_session([])
+    session._turn_active = True
+
+    class Failure(Exception):
+        def __init__(self):
+            super().__init__("opaque SDK error")
+            self.status_code = status
+            self.detail = detail
+
+    session.mark_tool_failure("sms", "+15551112222", Failure())
+
+    captured = session._current_tool_deliveries[-1]
+    assert captured.error_kind == expected
+    assert sms_tool_failure_kind(Failure()) == expected
+    assert "message_blocked" not in repr(captured)
+    assert "emoji" not in repr(captured)
 
 
 def test_pending_escalation_consumes_next_inbound():

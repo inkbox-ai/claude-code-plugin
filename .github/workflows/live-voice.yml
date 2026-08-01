@@ -132,6 +132,7 @@ jobs:
           CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           VOICE_SCENARIO: ${{ matrix.scenario }}
           LIVE_REAL_MODEL: "1"
+          GATEWAY_LOG: /tmp/gateway.log
         run: python3 -m pytest tests/live/test_voice.py -v
 
       # Logs can carry live call transcripts — surface them only when needed.

@@ -26,19 +26,19 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
-    from .config import BridgeConfig, INKBOX_WS_PATH, VoiceStack, call_contexts_dir
     from .a2a_delegations import (
         find_by_task,
         promote_after_send,
         record_before_send,
     )
+    from .config import INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import BridgeConfig, INKBOX_WS_PATH, VoiceStack, call_contexts_dir
     from a2a_delegations import (
         find_by_task,
         promote_after_send,
         record_before_send,
     )
+    from config import INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir
 
 try:
     from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -99,6 +99,14 @@ def _mark_tool_delivery(mode: str, target: str) -> None:
     mark = getattr(session, "mark_tool_delivery", None)
     if callable(mark):
         mark(mode, target)
+
+
+def _mark_tool_failure(mode: str, target: str, error: Any) -> None:
+    """Tell the active session that a host-native send tool failed."""
+    session = CURRENT_SESSION.get()
+    mark = getattr(session, "mark_tool_failure", None)
+    if callable(mark):
+        mark(mode, target, error)
 
 
 def _current_channel_hint() -> Optional[str]:
@@ -396,8 +404,10 @@ def build_inkbox_mcp_server(
         text = str(args.get("text") or "")
         target = str(args.get("to") or "").strip()
         if len(text) > SMS_MAX_LENGTH:
+            reason = _message_too_long_reason("SMS", text, SMS_MAX_LENGTH)
+            _mark_tool_failure("sms", target, reason)
             return _error(
-                _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
+                reason,
                 error_code="sms_too_long",
                 char_count=len(text),
                 max_chars=SMS_MAX_LENGTH,
@@ -424,6 +434,7 @@ def build_inkbox_mcp_server(
             _mark_tool_delivery("sms", target)
             return _result(result)
         except Exception as exc:
+            _mark_tool_failure("sms", target, exc)
             _log_send_rejection("inkbox_send_sms", exc)
             return _error(str(exc))
 

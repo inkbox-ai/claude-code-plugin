@@ -634,6 +634,68 @@ def test_successful_message_tool_notifies_current_session():
     assert deliveries == [("email", "ada@example.com")]
 
 
+def test_sms_tool_marks_success_only_after_sdk_send_returns():
+    client = _FakeClient()
+    events = []
+
+    class _Session:
+        def mark_tool_delivery(self, mode, target):
+            events.append(("delivered", mode, target, len(client.identity.sent_texts)))
+
+        def mark_tool_failure(self, mode, target, error):
+            events.append(("failed", mode, target, str(error)))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        data = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert data["sent"] is True
+    assert events == [("delivered", "sms", "+15551112222", 1)]
+
+
+def test_sms_tool_marks_sdk_failure_without_success():
+    client = _FakeClient()
+    events = []
+
+    class Rejected(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.detail = {"message": "recipient opted out"}
+
+    def reject(**_kwargs):
+        raise Rejected("provider rejected send")
+
+    client.identity.send_text = reject
+
+    class _Session:
+        def mark_tool_delivery(self, mode, target):
+            events.append(("delivered", mode, target))
+
+        def mark_tool_failure(self, mode, target, error):
+            events.append(("failed", mode, target, error))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        data = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert "error" in data
+    assert len(events) == 1
+    assert events[0][:3] == ("failed", "sms", "+15551112222")
+    assert isinstance(events[0][3], Rejected)
+
+
 def test_send_imessage_group_requires_dedicated_outbound_line():
     client = _FakeClient()
     data = _call(
