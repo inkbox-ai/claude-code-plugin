@@ -46,6 +46,7 @@ jobs:
           - outbound-multi
     env:
       INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_VOICEMAIL_DETECTION: "disabled"
       INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
       CLAUDE_PROJECT_DIR: ${{ github.workspace }}
       INKBOX_PERMISSION_TIMEOUT_S: "30"

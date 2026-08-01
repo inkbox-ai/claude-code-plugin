@@ -163,7 +163,12 @@ These match only when the whole message is exactly the command, so "please /clea
 
 ## Voice
 
-Calls have two modes, chosen per call:
+The configured phone voice stack applies to inbound and outbound calls:
+
+- **Inkbox Voice AI:** Inkbox handles the conversation on the agent's behalf.
+  When the call ends, a signed `call.ended` event wakes the same contact-keyed
+  Claude Code session once to execute remaining commitments. Plain model text
+  from that synthetic turn is suppressed; explicit tool side effects still run.
 
 - **OpenAI Realtime** (when configured): the bridge pre-opens an OpenAI Realtime session and accepts the call in raw-media mode, so a natural, low-latency voice handles the conversation. It runs the call itself and has these tools:
   - `consult_agent` — do real work *now* in the project; runs in the *same* contact-keyed session as your SMS/iMessage and its answer is spoken back.
@@ -180,7 +185,7 @@ Calls — inbound and outbound — can run over either of two lines, and the age
 - **The dedicated phone number.** The agent's own number (the same line SMS uses). Outbound calls present this number; inbound calls to it ring the agent.
 - **The shared Inkbox iMessage line.** The agent can also place and receive voice calls with a person it's connected to over iMessage, over the same shared line that person already messages. The underlying number is never surfaced — Inkbox resolves it from the iMessage connection — and it only works for people already connected over iMessage (an unknown caller is rejected; an outbound call with no connection is refused).
 
-Inbound answering is configured once per identity (`auto_accept` → open the call bridge WebSocket), so a single setting governs both lines. Outbound, the agent sets `origination` on `inkbox_place_call` (`dedicated_number` / `shared_imessage_number`), or omits it — then it resolves to the only line available, or, when both are, to the line matching the current conversation's channel (an iMessage turn calls over the shared line; an SMS/phone turn over the dedicated number).
+Inbound answering is configured once per identity (`hosted_agent` for Inkbox Voice AI, otherwise `auto_accept` to the call bridge WebSocket), so a single setting governs both lines. Outbound, the agent sets `origination` on `inkbox_place_call` (`dedicated_number` / `shared_imessage_number`), or omits it — then it resolves to the only line available, or, when both are, to the line matching the current conversation's channel (an iMessage turn calls over the shared line; an SMS/phone turn over the dedicated number).
 
 ## External webhooks
 
@@ -219,6 +224,9 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 | `INKBOX_BRIDGE_PORT` | no | `8767` | Local webhook server port. |
 | `INKBOX_PERMISSION_TIMEOUT_S` | no | `600` | Seconds to wait for a permission/poll reply. |
 | `INKBOX_AUTO_ALLOWED_TOOLS` | no | read-only set | Tools that never need a permission text. |
+| `INKBOX_VOICE_STACK` | no | `inkbox_tts_stt` | `inkbox_voice_ai`, `openai_realtime`, or `inkbox_tts_stt`. |
+| `INKBOX_VOICE_AI_AUTHORITY_MODE` | no | `contact_scoped` | Local mirror used by doctor for the saved Voice AI authority. |
+| `INKBOX_VOICEMAIL_DETECTION` | no | `enabled` | Default outbound policy: `enabled` or `disabled`. |
 | `INKBOX_REALTIME_ENABLED` | no | `false` | Use OpenAI Realtime for calls. Needs a key; off → Inkbox STT/TTS. |
 | `INKBOX_REALTIME_API_KEY` | realtime | `OPENAI_API_KEY` | OpenAI key with `/v1/realtime` access. |
 | `INKBOX_REALTIME_MODEL` | no | `gpt-realtime-2` | Realtime model id. |
@@ -243,7 +251,49 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
 
-The bridge requires Inkbox SDK 0.5.8 or newer.
+The bridge requires Inkbox SDK 0.5.9 or newer.
+
+### Phone call voice stack
+
+`inkbox-claude setup` presents a **Phone call voice stack** section with three
+choices:
+
+1. **Inkbox Voice AI** handles the call and wakes Claude Code after it ends.
+   Choose contact-scoped or YOLO authority during setup. Authority changes
+   require an admin API key, but that credential is used only in memory and is
+   never written to the plugin `.env`.
+2. **OpenAI Realtime API** uses a separately validated Realtime API key for
+   low-latency call audio while Claude Code handles complex work.
+3. **Inkbox TTS/STT** keeps the full agent turn in Claude Code and uses Inkbox
+   speech services, with higher latency.
+
+The canonical selection is `INKBOX_VOICE_STACK` (`inkbox_voice_ai`,
+`openai_realtime`, or `inkbox_tts_stt`). `INKBOX_VOICEMAIL_DETECTION` accepts
+`enabled` or `disabled` and applies to outbound calls unless the tool call
+explicitly overrides it. Voice AI outbound calls send a reason and use the
+saved server-side authority default; the plugin does not elevate authority per
+call.
+
+### Local/manual Docker test environment
+
+This image is for interactive local testing. It installs Claude Code, this
+plugin, and the pinned Inkbox SDK, but contains no credentials. It uses your
+native Claude login; an Anthropic or OpenAI API key is not embedded in the
+image. An OpenAI key is only needed if you select OpenAI Realtime for calls.
+
+```bash
+docker build -f Dockerfile.manual-test -t inkbox-claude-manual .
+docker run -d --name inkbox-claude-manual \
+  -v "$HOME/.claude:/home/node/.claude" \
+  -v inkbox-claude-state:/home/node/.inkbox-claude \
+  -v "$PWD:/workspace" \
+  inkbox-claude-manual
+docker exec -it inkbox-claude-manual bash
+claude --version
+inkbox-claude setup
+inkbox-claude doctor
+inkbox-claude run
+```
 
 On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent`, `register_post_call_action` / `edit_post_call_action` / `delete_post_call_action`, and `hang_up_call` — see [Voice](#voice).
 

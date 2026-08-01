@@ -29,6 +29,7 @@ import os
 import re
 import time
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
@@ -38,6 +39,8 @@ BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 REAL = os.environ.get("LIVE_REAL_MODEL") == "1"
 TIMEOUT_S = float(os.environ.get("LIVE_XCHANNEL_TIMEOUT", "200"))
 POLL_EVERY_S = 6.0
+CALL_PAIR_MAX_S = 60.0
+CALL_DUPLICATE_GRACE_S = 2 * POLL_EVERY_S
 
 pytestmark = pytest.mark.skipif(
     not (REMOTE_KEY and AUT_KEY and REAL),
@@ -47,6 +50,24 @@ pytestmark = pytest.mark.skipif(
 
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
+
+
+def _voicemail_detection_value(call) -> str:
+    value = getattr(call, "voicemail_detection", "")
+    return str(getattr(value, "value", value))
+
+
+def _record_created_at(record):
+    value = getattr(record, "created_at", None)
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _client(key):
@@ -105,7 +126,8 @@ def xc():
     try:
         yield {
             "remote": remote, "aut": aut,
-            "remote_email": remote_email, "remote_pid": remote_pid,
+            "remote_email": remote_email, "remote_phone": remote_phone,
+            "remote_pid": remote_pid,
             "aut_email": aut_email, "aut_phone": aut_phone,
         }
     finally:
@@ -175,19 +197,99 @@ def _inbound_calls_from_aut(remote, remote_pid: str, aut_phone: str):
             and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == tail]
 
 
-def _wait_for_new_call(remote, remote_pid: str, aut_phone: str, before: set):
-    """Block until an inbound call from the AUT with an id not in ``before`` appears.
+def _outbound_calls_to_remote(aut, remote_phone: str):
+    """The AUT's outbound records targeting the driver's number."""
+    tail = _digits(remote_phone)[-10:]
+    return [c for c in aut.calls.list(limit=30)
+            if (getattr(c, "direction", "") or "").lower() == "outbound"
+            and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == tail]
 
-    ``before`` is the pre-request snapshot, so a stale call can't satisfy the
-    assertion — same new-id correlation the SMS/email legs use. Fails on timeout.
-    """
+
+def _fresh_calls(records, before: set, watermark: datetime):
+    return [
+        record for record in records
+        if record.id not in before
+        and (created_at := _record_created_at(record)) is not None
+        and created_at >= watermark
+    ]
+
+
+def _wait_for_new_call_pair(
+    remote,
+    aut,
+    *,
+    remote_pid: str,
+    remote_phone: str,
+    aut_phone: str,
+    before_driver: set,
+    before_aut: set,
+    driver_watermark: datetime,
+    aut_watermark: datetime,
+):
+    """Correlate one fresh driver inbound leg with one fresh AUT outbound leg."""
     deadline = time.monotonic() + TIMEOUT_S
     while time.monotonic() < deadline:
-        for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone):
-            if c.id not in before:
-                return  # a fresh call from the AUT landed on the driver's number
+        driver_calls = _fresh_calls(
+            _inbound_calls_from_aut(remote, remote_pid, aut_phone),
+            before_driver,
+            driver_watermark,
+        )
+        aut_calls = _fresh_calls(
+            _outbound_calls_to_remote(aut, remote_phone),
+            before_aut,
+            aut_watermark,
+        )
+        assert len(driver_calls) <= 1, f"duplicate driver call legs: {driver_calls!r}"
+        assert len(aut_calls) <= 1, f"duplicate AUT call legs: {aut_calls!r}"
+        if driver_calls and aut_calls:
+            driver_created = _record_created_at(driver_calls[0])
+            aut_created = _record_created_at(aut_calls[0])
+            assert driver_created is not None and aut_created is not None
+            assert abs((driver_created - aut_created).total_seconds()) <= CALL_PAIR_MAX_S
+            break
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"agent did not place a call to the driver within {TIMEOUT_S:.0f}s")
+    else:
+        pytest.fail(
+            f"agent did not persist both call legs within {TIMEOUT_S:.0f}s"
+        )
+
+    time.sleep(CALL_DUPLICATE_GRACE_S)
+    driver_calls = _fresh_calls(
+        _inbound_calls_from_aut(remote, remote_pid, aut_phone),
+        before_driver,
+        driver_watermark,
+    )
+    aut_calls = _fresh_calls(
+        _outbound_calls_to_remote(aut, remote_phone),
+        before_aut,
+        aut_watermark,
+    )
+    assert len(driver_calls) == 1, f"expected one fresh driver leg, got {driver_calls!r}"
+    assert len(aut_calls) == 1, f"expected one fresh AUT leg, got {aut_calls!r}"
+    return aut_calls[0]
+
+
+def _call_pair_snapshot(remote, aut, remote_pid, remote_phone, aut_phone):
+    driver_calls = _inbound_calls_from_aut(remote, remote_pid, aut_phone)
+    aut_calls = _outbound_calls_to_remote(aut, remote_phone)
+    driver_times = [
+        value for call in driver_calls
+        if (value := _record_created_at(call)) is not None
+    ]
+    aut_times = [
+        value for call in aut_calls
+        if (value := _record_created_at(call)) is not None
+    ]
+    return {
+        "before_driver": {call.id for call in driver_calls},
+        "before_aut": {call.id for call in aut_calls},
+        "driver_watermark": max(
+            driver_times, default=datetime.min.replace(tzinfo=UTC)
+        ),
+        "aut_watermark": max(
+            aut_times, default=datetime.min.replace(tzinfo=UTC)
+        ),
+    }
 
 
 # The driver auto-rejects these call probes so they cannot leak into the voice
@@ -208,10 +310,11 @@ def _reset_aut_session(remote, remote_pid: str, aut_phone: str) -> None:
 
 def test_email_request_gets_call(xc):
     """Email asks the agent to CALL; a new inbound call must land on the driver."""
-    remote, remote_pid, aut_phone = xc["remote"], xc["remote_pid"], xc["aut_phone"]
+    remote, aut = xc["remote"], xc["aut"]
+    remote_pid, remote_phone = xc["remote_pid"], xc["remote_phone"]
+    aut_phone = xc["aut_phone"]
     _reset_aut_session(remote, remote_pid, aut_phone)  # fresh session, no prior-call context
-    # Snapshot BEFORE sending so a pre-existing call can't be mistaken for the reply.
-    before = {c.id for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone)}
+    snapshot = _call_pair_snapshot(remote, aut, remote_pid, remote_phone, aut_phone)
     remote.messages.send(
         xc["remote_email"], to=[xc["aut_email"]], subject="please call me",
         body_text=(
@@ -219,14 +322,21 @@ def test_email_request_gets_call(xc):
             "voicemail_detection disabled — I'd rather talk than type."
         ),
     )
-    _wait_for_new_call(remote, remote_pid, aut_phone, before)
+    call = _wait_for_new_call_pair(
+        remote, aut,
+        remote_pid=remote_pid, remote_phone=remote_phone, aut_phone=aut_phone,
+        **snapshot,
+    )
+    assert _voicemail_detection_value(call) == "disabled"
 
 
 def test_sms_request_gets_call(xc):
     """SMS asks the agent to CALL; a new inbound call must land on the driver."""
-    remote, remote_pid, aut_phone = xc["remote"], xc["remote_pid"], xc["aut_phone"]
+    remote, aut = xc["remote"], xc["aut"]
+    remote_pid, remote_phone = xc["remote_pid"], xc["remote_phone"]
+    aut_phone = xc["aut_phone"]
     _reset_aut_session(remote, remote_pid, aut_phone)  # fresh session, no prior-call context
-    before = {c.id for c in _inbound_calls_from_aut(remote, remote_pid, aut_phone)}
+    snapshot = _call_pair_snapshot(remote, aut, remote_pid, remote_phone, aut_phone)
     # Be explicit that we want an actual dial — a terse "call me" lets the model
     # answer by text; the email leg's wording is unambiguous, so match it here.
     # Fresh body each send: the agent replies by calling, not texting, so this
@@ -240,4 +350,9 @@ def test_sms_request_gets_call(xc):
             f"(ref {_token()})"
         ),
     )
-    _wait_for_new_call(remote, remote_pid, aut_phone, before)
+    call = _wait_for_new_call_pair(
+        remote, aut,
+        remote_pid=remote_pid, remote_phone=remote_phone, aut_phone=aut_phone,
+        **snapshot,
+    )
+    assert _voicemail_detection_value(call) == "disabled"

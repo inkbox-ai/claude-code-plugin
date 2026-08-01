@@ -8,7 +8,7 @@ SDKs that predate ``set_incoming_call_action``.
 import types
 
 from inkbox_claude import gateway
-from inkbox_claude.config import BridgeConfig
+from inkbox_claude.config import BridgeConfig, VoiceStack
 
 
 class _FakeSubscriptions:
@@ -91,8 +91,10 @@ def _phone():
     return types.SimpleNamespace(id="phone-1", number="+15550001111")
 
 
-def _patched_gateway(identity, subscriptions=None):
-    gw = gateway.InkboxGateway(BridgeConfig(identity="claude", require_signature=False))
+def _patched_gateway(identity, subscriptions=None, *, voice_stack=VoiceStack.INKBOX_TTS_STT):
+    gw = gateway.InkboxGateway(BridgeConfig(
+        identity="claude", require_signature=False, voice_stack=voice_stack
+    ))
     gw._inkbox = _FakeInkbox(identity, subscriptions)
     gw._public_url = "https://agent.example"
     gw._public_host = "agent.example"
@@ -111,6 +113,17 @@ def test_incoming_call_config_is_identity_scoped_with_number():
     }
     # The identity-scoped write replaces the legacy number-scoped one.
     assert gw._inkbox.phone_numbers.updated == []
+
+
+def test_voice_ai_reconciles_hosted_incoming_action_without_local_urls():
+    identity = _Identity(phone=_phone())
+    _patched_gateway(identity, voice_stack=VoiceStack.INKBOX_VOICE_AI)
+
+    assert identity.incoming_call_kwargs == {
+        "incoming_call_action": "hosted_agent",
+        "client_websocket_url": None,
+        "incoming_call_webhook_url": None,
+    }
 
 
 def test_incoming_call_config_registered_for_imessage_only_identity():
@@ -174,9 +187,11 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
 
     assert [created["event_types"] for created in subscriptions.created] == [
         gateway.A2A_EVENTS,
+        gateway.CALL_EVENTS,
         gateway.IMESSAGE_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.example/webhook",
         "https://agent.example/webhook",
         "https://agent.example/webhook",
     ]
@@ -195,11 +210,10 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
     )
 
     assert subscriptions.deleted == []
-    assert subscriptions.created == [{
-        "agent_identity_id": "identity-1",
-        "url": "https://agent.example/webhook",
-        "event_types": gateway.IMESSAGE_EVENTS,
-    }]
+    assert [created["event_types"] for created in subscriptions.created] == [
+        gateway.CALL_EVENTS,
+        gateway.IMESSAGE_EVENTS,
+    ]
 
 
 def test_a2a_only_subscription_is_skipped_on_older_api():
@@ -209,4 +223,4 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert subscriptions.created == []
+    assert [created["event_types"] for created in subscriptions.created] == [gateway.CALL_EVENTS]

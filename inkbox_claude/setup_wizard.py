@@ -26,22 +26,53 @@ from typing import Any
 from urllib.parse import urlencode
 
 try:
-    from .config import INKBOX_BASE_URL_DEFAULT, inkbox_base_url_kwargs, inkbox_client_kwargs
+    from .config import (
+        INKBOX_BASE_URL_DEFAULT,
+        INKBOX_WS_PATH,
+        VoiceStack,
+        inkbox_base_url_kwargs,
+        inkbox_client_kwargs,
+        resolve_voice_stack,
+    )
     from .realtime import DEFAULT_MODEL as REALTIME_MODEL, REALTIME_URL
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_BASE_URL_DEFAULT, inkbox_base_url_kwargs, inkbox_client_kwargs
+    from config import (
+        INKBOX_BASE_URL_DEFAULT,
+        INKBOX_WS_PATH,
+        VoiceStack,
+        inkbox_base_url_kwargs,
+        inkbox_client_kwargs,
+        resolve_voice_stack,
+    )
     from realtime import DEFAULT_MODEL as REALTIME_MODEL, REALTIME_URL
 
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's other dependency (claude-agent-sdk) is checked by doctor.
-INKBOX_MIN_VERSION = (0, 5, 6)
-INKBOX_REQUIREMENTS = ("inkbox>=0.5.6,<1.0.0", "aiohttp>=3.9")
+INKBOX_MIN_VERSION = (0, 5, 9)
+INKBOX_REQUIREMENTS = ("inkbox>=0.5.9,<1.0.0", "aiohttp>=3.9")
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
 _AVATAR_PATH = Path(__file__).resolve().parent / "assets" / "claude_code_avatar.png"
 _RAW_AVATAR_BASE_URL_DEFAULT = "https://inkbox.ai"
+VOICE_STACK_CHOICES = [
+    (
+        VoiceStack.INKBOX_VOICE_AI,
+        "Inkbox Voice AI — Inkbox handles calls on behalf of your agent; "
+        "Claude Code is notified when the call ends.",
+    ),
+    (
+        VoiceStack.OPENAI_REALTIME,
+        "OpenAI Realtime API — Bring your own API key; the realtime agent can "
+        "consult Claude Code for complex tasks.",
+    ),
+    (
+        VoiceStack.INKBOX_TTS_STT,
+        "Inkbox TTS/STT — Claude Code talks through the Inkbox voice stack with "
+        "increased latency.",
+    ),
+]
 
 
 # ----------------------------------------------------------------------
@@ -900,6 +931,321 @@ def _configure_realtime_calls(identity: Any, *, imessage_enabled: bool = False) 
         return
 
 
+def _voice_stack_default_index(detected_realtime_key: str) -> int:
+    stack, _ = resolve_voice_stack(
+        _env("INKBOX_VOICE_STACK"),
+        realtime_enabled=_env("INKBOX_REALTIME_ENABLED") or None,
+        realtime_api_key=detected_realtime_key,
+    )
+    return next(
+        (index for index, (candidate, _) in enumerate(VOICE_STACK_CHOICES) if candidate is stack),
+        2,
+    )
+
+
+def _local_call_ws_url(identity: Any) -> str:
+    phone = getattr(identity, "phone_number", None)
+    existing = str(getattr(phone, "client_websocket_url", "") or "").strip()
+    if existing:
+        return existing
+    public_url = _env("INKBOX_PUBLIC_URL").strip().rstrip("/")
+    if public_url:
+        scheme, _, host = public_url.partition("://")
+        return f"{'wss' if scheme == 'https' else 'ws'}://{host}{INKBOX_WS_PATH}"
+    handle = str(getattr(identity, "agent_handle", "") or "").strip()
+    tunnel_name = _env("INKBOX_TUNNEL_NAME").strip() or handle
+    return (
+        f"wss://{tunnel_name}.inkboxwire.com{INKBOX_WS_PATH}"
+        if tunnel_name
+        else ""
+    )
+
+
+def _set_local_incoming_call_action(identity: Any) -> None:
+    setter = getattr(identity, "set_incoming_call_action", None)
+    if not callable(setter):
+        raise RuntimeError("the installed Inkbox SDK cannot configure identity-scoped calls")
+    ws_url = _local_call_ws_url(identity)
+    if not ws_url:
+        # The gateway reconciles the final tunnel URL at startup. Do not write
+        # a guessed URL during setup when the tunnel has not started yet.
+        return
+    setter(
+        incoming_call_action="auto_accept",
+        client_websocket_url=ws_url,
+        incoming_call_webhook_url=None,
+    )
+
+
+def _incoming_call_values(config: Any) -> dict[str, Any]:
+    return {
+        "incoming_call_action": _enum_value(
+            getattr(config, "incoming_call_action", "")
+        ),
+        "client_websocket_url": getattr(config, "client_websocket_url", None),
+        "incoming_call_webhook_url": getattr(
+            config, "incoming_call_webhook_url", None
+        ),
+    }
+
+
+def _restore_voice_ai_config(
+    identity: Any,
+    *,
+    incoming_before: Any,
+    hosted_before: Any,
+    authority_before: str,
+    authority_identity: Any | None,
+    incoming_changed: bool,
+    authority_changed: bool,
+    hosted_changed: bool,
+) -> None:
+    """Best-effort rollback when a multi-step Voice AI update fails."""
+    failures: list[str] = []
+    if incoming_changed:
+        try:
+            identity.set_incoming_call_action(**_incoming_call_values(incoming_before))
+        except Exception as exc:
+            failures.append(f"incoming-call action ({exc})")
+    if authority_changed and authority_identity is not None:
+        try:
+            authority_identity.set_hosted_agent_authority_mode(authority_before)
+        except Exception as exc:
+            failures.append(f"authority mode ({exc})")
+    if hosted_changed:
+        try:
+            identity.set_hosted_agent_config(
+                voice=getattr(hosted_before, "voice", None),
+                model=getattr(hosted_before, "model", None),
+                instructions=getattr(hosted_before, "instructions", None),
+            )
+        except Exception as exc:
+            failures.append(f"Voice AI config ({exc})")
+    if failures:
+        print_warning("  Could not fully restore the previous call configuration:")
+        for failure in failures:
+            print_warning(f"    {failure}")
+
+
+def _load_admin_identity(
+    identity: Any,
+    *,
+    base_url: str,
+    Inkbox: Any,
+    InkboxAPIError: Any,
+    WhoamiApiKeyResponse: Any,
+    ADMIN_SCOPED: Any,
+) -> Any | None:
+    admin_key = prompt(
+        "  Paste an admin-scoped Inkbox API key for this authority change",
+        password=True,
+    ).strip()
+    if not admin_key:
+        print_warning("  No admin key entered. Returning to the voice-stack choices.")
+        return None
+    try:
+        client = Inkbox(**inkbox_client_kwargs(admin_key, base_url))
+        info = client.whoami()
+        if WhoamiApiKeyResponse is not None and not isinstance(info, WhoamiApiKeyResponse):
+            print_error("  This authority change requires an admin-scoped API key.")
+            return None
+        if _enum_value(getattr(info, "auth_subtype", "")) != _enum_value(ADMIN_SCOPED):
+            print_error("  This authority change requires an admin-scoped API key.")
+            return None
+        return client.get_identity(identity.agent_handle)
+    except InkboxAPIError as exc:
+        print_error(f"  Admin key validation failed: HTTP {_error_status(exc)} {_error_detail(exc)}")
+    except Exception as exc:
+        print_error(f"  Admin key validation failed: {exc}")
+    return None
+
+
+def _configure_voice_ai(
+    identity: Any,
+    *,
+    base_url: str,
+    Inkbox: Any,
+    InkboxAPIError: Any,
+    WhoamiApiKeyResponse: Any,
+    ADMIN_SCOPED: Any,
+    authority_identity: Any | None,
+) -> tuple[bool, Any | None, str]:
+    required = (
+        "get_hosted_agent_config",
+        "get_incoming_call_action",
+        "set_hosted_agent_config",
+        "set_incoming_call_action",
+    )
+    if any(not callable(getattr(identity, name, None)) for name in required):
+        print_error("  Inkbox Voice AI requires Inkbox SDK 0.5.9 or newer.")
+        return False, authority_identity, ""
+    try:
+        current = identity.get_hosted_agent_config()
+        incoming_before = identity.get_incoming_call_action()
+    except Exception as exc:
+        print_error(f"  Could not read the Voice AI configuration: {exc}")
+        return False, authority_identity, ""
+    before = _enum_value(getattr(current, "authority_mode", "contact_scoped")) or "contact_scoped"
+    selected = prompt_choice(
+        "  How much authority should Inkbox Voice AI have?",
+        [
+            "Contact-scoped — tools are limited to the current caller and conversation.",
+            "YOLO mode — tools can use the identity's wider authorized capabilities.",
+        ],
+        1 if before == "yolo" else 0,
+    )
+    authority = "yolo" if selected == 1 else "contact_scoped"
+    authority_writer = authority_identity
+    if authority != before and authority_writer is None:
+        authority_writer = _load_admin_identity(
+            identity,
+            base_url=base_url,
+            Inkbox=Inkbox,
+            InkboxAPIError=InkboxAPIError,
+            WhoamiApiKeyResponse=WhoamiApiKeyResponse,
+            ADMIN_SCOPED=ADMIN_SCOPED,
+        )
+    if authority != before and authority_writer is None:
+        return False, authority_identity, ""
+    hosted_changed = False
+    authority_changed = False
+    incoming_changed = False
+    try:
+        # Hosted prompt/model configuration remains server-owned. Re-submit
+        # the authoritative values so setup never clears an existing server
+        # configuration while changing only routing/authority.
+        hosted_changed = True
+        identity.set_hosted_agent_config(
+            voice=getattr(current, "voice", None),
+            model=getattr(current, "model", None),
+            instructions=getattr(current, "instructions", None),
+        )
+        if authority != before:
+            setter = getattr(authority_writer, "set_hosted_agent_authority_mode", None)
+            if not callable(setter):
+                raise RuntimeError("the installed SDK cannot update Voice AI authority")
+            authority_changed = True
+            setter(authority)
+        incoming_changed = True
+        identity.set_incoming_call_action(
+            incoming_call_action="hosted_agent",
+            client_websocket_url=None,
+            incoming_call_webhook_url=None,
+        )
+    except Exception as exc:
+        print_error(f"  Inkbox Voice AI configuration failed: {exc}")
+        _restore_voice_ai_config(
+            identity,
+            incoming_before=incoming_before,
+            hosted_before=current,
+            authority_before=before,
+            authority_identity=authority_writer,
+            incoming_changed=incoming_changed,
+            authority_changed=authority_changed,
+            hosted_changed=hosted_changed,
+        )
+        return False, authority_writer, ""
+    return True, authority_writer, authority
+
+
+def _save_voice_stack(
+    stack: VoiceStack,
+    *,
+    realtime_api_key: str = "",
+    authority_mode: str = "",
+) -> None:
+    if stack is VoiceStack.OPENAI_REALTIME:
+        _save("INKBOX_REALTIME_API_KEY", realtime_api_key)
+        _save("INKBOX_REALTIME_MODEL", REALTIME_MODEL)
+        _save("INKBOX_REALTIME_ENABLED", "true")
+    else:
+        _save("INKBOX_REALTIME_ENABLED", "false")
+    if authority_mode:
+        _save("INKBOX_VOICE_AI_AUTHORITY_MODE", authority_mode)
+    _save("INKBOX_VOICE_STACK", stack.value)
+
+
+def _configure_phone_call_voice_stack(
+    identity: Any,
+    *,
+    base_url: str,
+    Inkbox: Any,
+    InkboxAPIError: Any,
+    WhoamiApiKeyResponse: Any,
+    ADMIN_SCOPED: Any,
+    imessage_enabled: bool = False,
+    authority_identity: Any | None = None,
+) -> None:
+    if getattr(identity, "phone_number", None) is None and not imessage_enabled:
+        return
+    print()
+    prompt("  Press Enter to continue and set up phone call handling")
+    print(color("  --- Phone call voice stack ---", Colors.CYAN))
+    detected = _detect_openai_realtime_key()
+    detected_key = detected[1] if detected else ""
+    default_index = _voice_stack_default_index(detected_key)
+    prompt_for_key = False
+    while True:
+        selected = prompt_choice(
+            "  Choose how this agent should handle phone calls:",
+            [description for _, description in VOICE_STACK_CHOICES],
+            default_index,
+        )
+        stack = VOICE_STACK_CHOICES[selected][0]
+        default_index = selected
+        if stack is VoiceStack.INKBOX_VOICE_AI:
+            ok, authority_identity, authority = _configure_voice_ai(
+                identity,
+                base_url=base_url,
+                Inkbox=Inkbox,
+                InkboxAPIError=InkboxAPIError,
+                WhoamiApiKeyResponse=WhoamiApiKeyResponse,
+                ADMIN_SCOPED=ADMIN_SCOPED,
+                authority_identity=authority_identity,
+            )
+            if not ok:
+                continue
+            _save_voice_stack(stack, authority_mode=authority)
+            print_success("  Inkbox Voice AI is configured for phone calls.")
+            print_info("  Claude Code will be notified when each call ends.")
+            return
+        if stack is VoiceStack.OPENAI_REALTIME:
+            key = ""
+            if detected_key and not prompt_for_key:
+                key = detected_key
+                print_success(f"  Found an OpenAI API key in {detected[0]}.")
+            else:
+                key = prompt("  Paste your OpenAI API key for Realtime calls", password=True).strip()
+            if not key:
+                print_warning("  No key entered. Returning to the voice-stack choices.")
+                prompt_for_key = True
+                continue
+            print_info(f"  Testing OpenAI Realtime access with {REALTIME_MODEL}...")
+            ok, detail = _test_openai_realtime_api_key(key, REALTIME_MODEL)
+            if not ok:
+                print_error("  OpenAI Realtime validation failed.")
+                print_info(f"  {detail}")
+                detected_key = ""
+                prompt_for_key = True
+                continue
+            try:
+                _set_local_incoming_call_action(identity)
+            except Exception as exc:
+                print_error(f"  Could not configure incoming calls: {exc}")
+                continue
+            _save_voice_stack(stack, realtime_api_key=key)
+            print_success("  OpenAI Realtime is configured for phone calls.")
+            return
+        try:
+            _set_local_incoming_call_action(identity)
+        except Exception as exc:
+            print_error(f"  Could not configure incoming calls: {exc}")
+            continue
+        _save_voice_stack(stack)
+        print_success("  Inkbox TTS/STT is configured for phone calls.")
+        return
+
+
 # ----------------------------------------------------------------------
 # iMessage
 # ----------------------------------------------------------------------
@@ -1320,7 +1666,7 @@ def _api_key_flow(
     AGENT_CLAIMED: Any,
     AGENT_UNCLAIMED: Any,
     IdentityPhoneNumberCreateOptions: Any,
-) -> tuple[Any | None, str, bool]:
+) -> tuple[Any | None, str, bool, Any | None]:
     """Validate an operator-supplied API key and resolve its identity.
 
     Args:
@@ -1334,15 +1680,17 @@ def _api_key_flow(
         IdentityPhoneNumberCreateOptions (Any): Phone-options type for creates.
 
     Returns:
-        tuple[Any | None, str, bool]: (identity-or-None, api_key,
+        tuple[Any | None, str, bool, Any | None]: (identity-or-None, api_key,
         did_provision_phone — always False now that number provisioning is a
-        standalone later step).
+        standalone later step, admin-backed identity-or-None). The admin
+        object is retained in memory only so setup can update authority
+        without asking for the same credential twice.
     """
     print()
     api_key = prompt("  Paste your Inkbox API key (ApiKey_...)", password=True).strip()
     if not api_key:
         print_error("  No key provided.")
-        return None, "", False
+        return None, "", False, None
 
     try:
         client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
@@ -1350,14 +1698,14 @@ def _api_key_flow(
     except InkboxAPIError as exc:
         print_error(f"  whoami failed: HTTP {_error_status(exc)} {_error_detail(exc)}")
         print_info("  Double-check the key and the environment it was issued in.")
-        return None, "", False
+        return None, "", False, None
     except Exception as exc:
         print_error(f"  whoami failed: {exc}")
-        return None, "", False
+        return None, "", False, None
 
     if WhoamiApiKeyResponse is not None and not isinstance(info, WhoamiApiKeyResponse):
         print_error("  This wizard requires an API key, but the credential is a JWT.")
-        return None, "", False
+        return None, "", False, None
 
     subtype = _enum_value(getattr(info, "auth_subtype", ""))
     org_id = getattr(info, "organization_id", "")
@@ -1366,13 +1714,17 @@ def _api_key_flow(
     # Agent-scoped keys already point at one identity; admin keys can list,
     # pick, or create, then get scoped down to a per-agent key.
     if subtype in {_enum_value(AGENT_CLAIMED), _enum_value(AGENT_UNCLAIMED)}:
-        return _pick_agent_scoped(client, api_key)
+        identity, agent_key, provisioned = _pick_agent_scoped(client, api_key)
+        return identity, agent_key, provisioned, None
     if subtype == _enum_value(ADMIN_SCOPED):
-        return _pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError)
+        identity, agent_key, provisioned = _pick_admin_scoped(
+            client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError
+        )
+        return identity, agent_key, provisioned, identity
 
     print_error(f"  Unsupported API-key subtype: {subtype!r}.")
     print_info("  Use an admin-scoped or agent-scoped Inkbox API key.")
-    return None, "", False
+    return None, "", False, None
 
 
 def _pick_agent_scoped(client: Any, api_key: str) -> tuple[Any | None, str, bool]:
@@ -1828,10 +2180,11 @@ def interactive_setup() -> None:
 
     if not has_key:
         identity, api_key, _ = _self_signup_flow(base_url, Inkbox, InkboxAPIError)
+        authority_identity = None
         if identity is None:
             return
     else:
-        identity, api_key, _ = _api_key_flow(
+        identity, api_key, _, authority_identity = _api_key_flow(
             base_url,
             Inkbox,
             InkboxAPIError,
@@ -1873,6 +2226,9 @@ def interactive_setup() -> None:
     try:
         dedicated_client = Inkbox(**inkbox_client_kwargs(api_key, base_url))
         identity, did_provision_phone = _offer_dedicated_number(dedicated_client, identity)
+        # Refresh even when number provisioning was skipped: self-signup may
+        # return a minimal identity shim that has no hosted-call methods.
+        identity = dedicated_client.get_identity(identity.agent_handle)
     except Exception as exc:
         print_warning(f"  Skipping dedicated-number setup: {exc}")
 
@@ -1884,7 +2240,16 @@ def interactive_setup() -> None:
     if did_provision_phone:
         _wait_for_sms_opt_in(api_key, base_url, getattr(identity, "phone_number", None), Inkbox)
 
-    _configure_realtime_calls(identity, imessage_enabled=imessage_on)
+    _configure_phone_call_voice_stack(
+        identity,
+        base_url=base_url,
+        Inkbox=Inkbox,
+        InkboxAPIError=InkboxAPIError,
+        WhoamiApiKeyResponse=WhoamiApiKeyResponse,
+        ADMIN_SCOPED=ADMIN_SCOPED,
+        imessage_enabled=imessage_on,
+        authority_identity=authority_identity,
+    )
 
     _setup_signing_key(api_key, base_url, Inkbox)
 

@@ -75,6 +75,11 @@ The shared line only works for people connected to you over iMessage
 first, or fall back to your dedicated number), and its number is managed
 by Inkbox: never state a number for it. If you omit origination it
 follows the current conversation's channel, or the only line available.
+Always provide a concrete purpose for a call. In Inkbox Voice AI mode that
+purpose becomes the hosted agent's task, so include enough context for it to
+know what outcome it should achieve. Voice AI authority comes from the saved
+agent configuration unless an administrator changes it; never guess or request
+a per-call authority elevation.
 
 # Inkbox contacts
 

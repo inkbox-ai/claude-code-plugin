@@ -4,6 +4,7 @@ name: Live voice e2e
 #   * inbound_inkbox    — driver calls the agent; Inkbox STT/TTS answers.
 #   * outbound_realtime — driver texts "call me"; the agent dials back powered
 #                         by the realtime voice API.
+#   * outbound_hosted   — Voice AI runs the call and call.ended wakes Claude.
 # A driver process (tests/live/voice_driver.py) is the peer on the other end
 # of the call, bridged over the driver identity's own Inkbox tunnel.
 
@@ -31,9 +32,10 @@ jobs:
       max-parallel: 1
       fail-fast: false
       matrix:
-        scenario: [inbound_inkbox, outbound_realtime]
+        scenario: [inbound_inkbox, outbound_realtime, outbound_hosted]
     env:
       INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_VOICEMAIL_DETECTION: "disabled"
       INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
       CLAUDE_PROJECT_DIR: ${{ github.workspace }}
       INKBOX_PERMISSION_TIMEOUT_S: "30"
@@ -58,7 +60,7 @@ jobs:
       - name: Install bridge + driver deps
         run: |
           pip install \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
+            "inkbox==0.5.9" \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI
@@ -79,10 +81,36 @@ jobs:
       - name: Configure speech mode (${{ matrix.scenario }})
         run: |
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
+            echo "INKBOX_VOICE_STACK=openai_realtime" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=true" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
+            # The marker crosses TTS -> PSTN -> STT. Use ordinary phonetic
+            # words instead of punctuation and long digit strings so the live
+            # assertion proves the current request without depending on exact
+            # ASR formatting.
+            RADIO_WORDS=(
+              alpha bravo charlie delta echo foxtrot golf hotel india juliet
+              kilo lima mike november oscar papa quebec romeo sierra tango
+              uniform victor whiskey xray yankee zulu
+            )
+            marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
+            marker=""
+            for _ in 1 2 3 4 5; do
+              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
+              marker="${marker:+$marker }${RADIO_WORDS[$marker_index]}"
+              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
+            done
+            echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
+            echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
+            echo "HOSTED_POST_CALL_MARKER=$marker" >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_LINE=After we hang up, send me one SMS. Create the post-call action now with this exact SMS body: $marker. Read those five words back to me after the action is saved. Do not send it during the call." >> "$GITHUB_ENV"
+            # Keep the media peer alive while the test waits for Voice AI to
+            # persist the open post-call action, then let the test hang up.
+            echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"
           else
+            echo "INKBOX_VOICE_STACK=inkbox_tts_stt" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
           fi
 
@@ -122,17 +150,18 @@ jobs:
           CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           VOICE_SCENARIO: ${{ matrix.scenario }}
           LIVE_REAL_MODEL: "1"
+          GATEWAY_LOG: /tmp/gateway.log
         run: python3 -m pytest tests/live/test_voice.py -v
 
       # Logs can carry live call transcripts — surface them only when needed.
       - name: Dump logs on failure
-        if: failure()
+        if: failure() || cancelled()
         run: |
           echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
           echo "=== voice_driver.log ==="; tail -n 150 /tmp/voice_driver.log 2>/dev/null || true
 
       - name: Upload logs on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: live-voice-${{ matrix.scenario }}-logs

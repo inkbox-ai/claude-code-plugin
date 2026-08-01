@@ -45,6 +45,7 @@ jobs:
         leg: [mock, real]
     env:
       INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
+      INKBOX_VOICEMAIL_DETECTION: "disabled"
       INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
       CLAUDE_PROJECT_DIR: ${{ github.workspace }}
       # A stray permission escalation should fail a test fast, not park the
@@ -67,7 +68,7 @@ jobs:
       - name: Install bridge
         run: |
           pip install \
-            "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@a4dd76b534e33c0a8352148d8f0e9ab25199f05b#subdirectory=sdk/python" \
+            "inkbox==0.5.9" \
             -e . pytest
 
       - name: Install Claude Code CLI
@@ -90,7 +91,7 @@ jobs:
         run: |
           nohup python3 tests/live/mock_anthropic.py 8089 > /tmp/mock_anthropic.log 2>&1 &
           for i in $(seq 1 10); do
-            curl -fsS http://127.0.0.1:8089/ > /dev/null 2>&1 && exit 0
+            curl -fsS --connect-timeout 1 --max-time 3 http://127.0.0.1:8089/ > /dev/null 2>&1 && exit 0
             sleep 1
           done
           echo "mock model server never came up"; exit 1
@@ -138,13 +139,13 @@ jobs:
 
       # Logs can carry live message content — surface them only when needed.
       - name: Dump logs on failure
-        if: failure()
+        if: failure() || cancelled()
         run: |
           echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
           echo "=== mock_anthropic.log ==="; tail -n 100 /tmp/mock_anthropic.log 2>/dev/null || true
 
       - name: Upload logs on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: live-channels-${{ matrix.leg }}-logs

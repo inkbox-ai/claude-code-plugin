@@ -220,8 +220,8 @@ def test_reports_sender_details(ctx):
         ctx["aut_email"],
         remote_email,
         "Who am I to you? Tell me everything you have on file about me. "
-        "Include my phone number in full — every digit, with no masking, "
-        "asterisks, or abbreviation.",
+        "Include my email address and phone number in full — every character "
+        "and digit, with no masking, asterisks, or abbreviation.",
         accept=lambda candidate: (
             (not name or name.lower() in candidate)
             and any(e.lower() in candidate for e in emails)

@@ -3,12 +3,19 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from inkbox_claude import sessions as sessions_mod
 from inkbox_claude.config import BridgeConfig
+from inkbox_claude.delivery_policy import (
+    sms_delivery_failure_policy,
+    sms_tool_failure_kind,
+)
+from inkbox_claude.hosted_sms_guard import hosted_sms_attempt_state
 from inkbox_claude.sessions import (
     ContactSession,
-    _Turn,
     _parse_index,
+    _Turn,
     list_recent_sessions,
 )
 
@@ -34,6 +41,93 @@ def make_session(sent, typing=None):
     )
 
 
+def test_hosted_sms_preflight_is_durable_exact_target_and_single_use(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    session = make_session([])
+    session._turn_active = True
+    session._current_hosted_sms_context = {
+        "call_id": "call-1",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }
+
+    blocked = session.preflight_hosted_sms("+15559990000")
+    assert blocked and blocked["kind"] == "terminal"
+    assert blocked["message"].startswith("Hosted-call SMS target does not match")
+    assert hosted_sms_attempt_state("call-1", 1) is None
+    assert session.preflight_hosted_sms("+15551112222") is None
+    assert hosted_sms_attempt_state("call-1", 1) == "pending"
+    duplicate = session.preflight_hosted_sms("+15551112222")
+    assert duplicate and duplicate["kind"] == "duplicate"
+    assert "duplicate send blocked" in duplicate["message"]
+
+    session.mark_tool_delivery("sms", "+15551112222")
+    assert hosted_sms_attempt_state("call-1", 1) == "success"
+    attempt_path = next((tmp_path / "hosted_sms_attempts").glob("*.json"))
+    assert attempt_path.stat().st_mode & 0o777 == 0o600
+    assert attempt_path.parent.stat().st_mode & 0o777 == 0o700
+
+    restarted = make_session([])
+    restarted._turn_active = True
+    restarted._current_hosted_sms_context = dict(
+        session._current_hosted_sms_context
+    )
+    duplicate = restarted.preflight_hosted_sms("+15551112222")
+    assert duplicate and duplicate["kind"] == "duplicate"
+
+
+def test_hosted_sms_recoverable_result_settles_reserved_attempt(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    session = make_session([])
+    session._turn_active = True
+    session._current_hosted_sms_context = {
+        "call_id": "call-2",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }
+    assert session.preflight_hosted_sms("+15551112222") is None
+
+    session.mark_tool_failure(
+        "sms",
+        "+15551112222",
+        "SMS message is too long; maximum is 1600 characters.",
+    )
+
+    assert hosted_sms_attempt_state("call-2", 1) == "recoverable"
+
+
+def test_hosted_sms_terminal_preflight_failure_is_durably_settled(
+    tmp_path, monkeypatch,
+):
+    class Forbidden(RuntimeError):
+        error_code = "forbidden"
+
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    session = make_session([])
+    session._turn_active = True
+    session._current_hosted_sms_context = {
+        "call_id": "call-3",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }
+
+    blocked = session.preflight_hosted_sms("+15559990000")
+    assert blocked and blocked["kind"] == "terminal"
+    session.mark_tool_failure(
+        "sms",
+        "+15559990000",
+        Forbidden(blocked["message"]),
+    )
+
+    assert hosted_sms_attempt_state("call-3", 1) == "terminal"
+    assert session._current_tool_deliveries[-1].sent is False
+    assert session._current_tool_deliveries[-1].error_kind == "terminal"
+
+
 def test_abort_settles_queued_capture_future():
     # A consult/post-call/failure turn waiting in the queue must not hang when
     # the session is aborted (/stop, /clear) — its future settles to "".
@@ -48,6 +142,137 @@ def test_abort_settles_queued_capture_future():
         assert fut.done()
         assert fut.result() == ""
         assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_abort_settles_queued_detailed_capture_with_empty_tool_result():
+    async def scenario():
+        session = make_session([])
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await session._queue.put(_Turn(
+            text="do work",
+            future=fut,
+            capture_tools=True,
+        ))
+
+        await session._abort_in_flight()
+
+        result = fut.result()
+        assert result.text == ""
+        assert result.tool_deliveries == ()
+        assert result.aborted is True
+        assert session._queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_aborts_queued_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        parked_worker = asyncio.create_task(asyncio.sleep(30))
+        session._worker = parked_worker
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.sleep(0)
+
+        await session.handle_inbound("/stop", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1] == "Stopped."
+        parked_worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_aborts_queued_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        parked_worker = asyncio.create_task(asyncio.sleep(30))
+        session._worker = parked_worker
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.sleep(0)
+
+        await session.handle_inbound("/clear", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1].startswith("Started a fresh conversation")
+        parked_worker.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_aborts_running_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class FakeClient:
+            async def query(self, _text):
+                started.set()
+
+            async def receive_response(self):
+                await interrupted.wait()
+                raise RuntimeError("Claude turn interrupted")
+                yield  # pragma: no cover
+
+            async def interrupt(self):
+                interrupted.set()
+
+        session._client = FakeClient()
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await session.handle_inbound("/stop", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1] == "Stopped."
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_aborts_running_detailed_capture():
+    async def scenario():
+        sent = []
+        session = make_session(sent)
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class FakeClient:
+            async def query(self, _text):
+                started.set()
+
+            async def receive_response(self):
+                await interrupted.wait()
+                raise RuntimeError("Claude turn interrupted")
+                yield  # pragma: no cover
+
+            async def interrupt(self):
+                interrupted.set()
+
+            async def disconnect(self):
+                interrupted.set()
+
+        session._client = FakeClient()
+        consult = asyncio.create_task(session.run_consult_detailed("post-call"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        await session.handle_inbound("/clear", "sms", {"to": "+15551112222"})
+
+        result = await asyncio.wait_for(consult, timeout=1)
+        assert result.aborted is True
+        assert result.tool_deliveries == ()
+        assert sent[-1][1].startswith("Started a fresh conversation")
 
     asyncio.run(scenario())
 
@@ -188,6 +413,10 @@ def test_tool_delivery_matches_sms_and_imessage_routing():
     session.reply_meta = {"to": "+1 (555) 111-2222", "conversation_id": "sms-conv"}
     session.mark_tool_delivery("sms", "+15551112222")
     assert session._current_channel_tool_delivery is True
+    captured = session._current_tool_deliveries[-1]
+    assert (captured.mode, captured.target, captured.sent, captured.error_kind) == (
+        "sms", "+15551112222", True, "none",
+    )
 
     session._current_channel_tool_delivery = False
     session.mark_tool_delivery("sms", "sms-conv")
@@ -198,6 +427,71 @@ def test_tool_delivery_matches_sms_and_imessage_routing():
     session.reply_meta = {"conversation_id": "imessage-conv"}
     session.mark_tool_delivery("imessage", "imessage-conv")
     assert session._current_channel_tool_delivery is True
+
+
+def test_tool_failure_capture_keeps_only_sanitized_classification():
+    session = make_session([])
+    session._turn_active = True
+
+    class Failure(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.detail = {
+                "message": "invalid phone number secret-provider-payload",
+                "provider_id": "provider-secret-123",
+            }
+
+    session.mark_tool_failure("sms", "+15551112222", Failure("forbidden raw body"))
+
+    captured = session._current_tool_deliveries[-1]
+    assert (captured.mode, captured.target, captured.sent, captured.error_kind) == (
+        "sms", "+15551112222", False, "terminal",
+    )
+    assert "secret" not in repr(captured)
+    assert "provider" not in repr(captured)
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "expected"),
+    [
+        (422, {"error": "message_blocked_spam_filter", "rule": "emoji_overload"}, "recoverable"),
+        (422, {"error": "message_blocked_spam_filter", "rule": "profanity"}, "recoverable"),
+        (422, {"error": "content_rejected_by_carrier"}, "recoverable"),
+        (502, {"error": "carrier_unavailable"}, "terminal"),
+        (429, {"error": "carrier_rate_limit"}, "terminal"),
+        (None, {"error": "carrier_rate_limit"}, "terminal"),
+        (None, {"error": "inkbox_duplicate_body"}, "terminal"),
+        (408, {"error": "request_timeout"}, "terminal"),
+        (503, {"error": "upstream_failure"}, "terminal"),
+        (None, {"error": "forbidden"}, "terminal"),
+        (403, {"error": "recipient_opted_out"}, "terminal"),
+        (422, {"error": "invalid_phone_number"}, "terminal"),
+    ],
+)
+def test_tool_failure_capture_uses_structured_sms_policy(status, detail, expected):
+    session = make_session([])
+    session._turn_active = True
+
+    class Failure(Exception):
+        def __init__(self):
+            super().__init__("opaque SDK error")
+            self.status_code = status
+            self.detail = detail
+
+    session.mark_tool_failure("sms", "+15551112222", Failure())
+
+    captured = session._current_tool_deliveries[-1]
+    assert captured.error_kind == expected
+    assert sms_tool_failure_kind(Failure()) == expected
+    assert "message_blocked" not in repr(captured)
+    assert "emoji" not in repr(captured)
+
+
+def test_hosted_tool_status_rules_do_not_broaden_normal_delivery_policy():
+    assert sms_delivery_failure_policy("carrier_unavailable", "") == "retry"
+    assert sms_delivery_failure_policy("carrier_rate_limit", "") == "conditional"
+    assert sms_delivery_failure_policy("inkbox_duplicate_body", "") == "conditional"
+    assert sms_delivery_failure_policy("forbidden", "") == "conditional"
 
 
 def test_pending_escalation_consumes_next_inbound():

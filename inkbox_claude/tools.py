@@ -26,19 +26,19 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from media import file_to_email_attachment
 
 try:
-    from .config import INKBOX_WS_PATH, call_contexts_dir
     from .a2a_delegations import (
         find_by_task,
         promote_after_send,
         record_before_send,
     )
+    from .config import INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir
 except ImportError:  # pragma: no cover - direct local import/test fallback
-    from config import INKBOX_WS_PATH, call_contexts_dir
     from a2a_delegations import (
         find_by_task,
         promote_after_send,
         record_before_send,
     )
+    from config import INKBOX_WS_PATH, BridgeConfig, VoiceStack, call_contexts_dir
 
 try:
     from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -99,6 +99,27 @@ def _mark_tool_delivery(mode: str, target: str) -> None:
     mark = getattr(session, "mark_tool_delivery", None)
     if callable(mark):
         mark(mode, target)
+
+
+def _mark_tool_failure(mode: str, target: str, error: Any) -> None:
+    """Tell the active session that a host-native send tool failed."""
+    session = CURRENT_SESSION.get()
+    mark = getattr(session, "mark_tool_failure", None)
+    if callable(mark):
+        mark(mode, target, error)
+
+
+class _HostedSMSPreflightError(RuntimeError):
+    """A trusted hosted-call guard rejected a send before provider I/O."""
+
+    error_code = "forbidden"
+
+
+def _hosted_sms_preflight(target: str) -> Optional[Dict[str, str]]:
+    """Ask the active hosted turn to reserve this send before provider I/O."""
+    session = CURRENT_SESSION.get()
+    preflight = getattr(session, "preflight_hosted_sms", None)
+    return preflight(target) if callable(preflight) else None
 
 
 def _current_channel_hint() -> Optional[str]:
@@ -271,12 +292,36 @@ def _write_call_context(
     return token
 
 
-def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, List[str]]:
+def _hosted_call_reason(args: Dict[str, Any]) -> str:
+    """Build a bounded, useful Voice AI task from the local-call inputs."""
+    parts = [
+        str(args.get("purpose") or "").strip(),
+        (
+            f"Opening guidance: {str(args.get('opening_message') or '').strip()}"
+            if str(args.get("opening_message") or "").strip()
+            else ""
+        ),
+        (
+            f"Additional context: {str(args.get('context') or '').strip()}"
+            if str(args.get("context") or "").strip()
+            else ""
+        ),
+    ]
+    reason = "\n\n".join(part for part in parts if part)
+    return reason if len(reason) <= 2_000 else reason[:1_999].rstrip() + "…"
+
+
+def build_inkbox_mcp_server(
+    client: Any,
+    identity_handle: str,
+    cfg: Optional[BridgeConfig] = None,
+) -> Tuple[Any, List[str]]:
     """Build the in-process MCP server carrying the Inkbox tools.
 
     Args:
         client (Inkbox): Authenticated Inkbox SDK client.
         identity_handle (str): Agent identity handle the tools act as.
+        cfg (Optional[BridgeConfig]): Runtime voice-stack policy.
 
     Returns:
         Tuple[Any, List[str]]: (sdk mcp server, fully-qualified tool names
@@ -284,6 +329,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
     """
     if not CLAUDE_SDK_AVAILABLE:
         raise RuntimeError("claude-agent-sdk is not installed")
+    cfg = cfg or BridgeConfig()
 
     def _identity():
         return client.get_identity(identity_handle)
@@ -370,9 +416,21 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
     async def inkbox_send_sms(args: Dict[str, Any]) -> Dict[str, Any]:
         text = str(args.get("text") or "")
         target = str(args.get("to") or "").strip()
+        blocked = _hosted_sms_preflight(target)
+        if blocked:
+            message = str(blocked.get("message") or "Hosted-call SMS send blocked.")
+            if blocked.get("kind") == "terminal":
+                _mark_tool_failure(
+                    "sms",
+                    target,
+                    _HostedSMSPreflightError(message),
+                )
+            return _error(message, error_code="hosted_sms_send_blocked")
         if len(text) > SMS_MAX_LENGTH:
+            reason = _message_too_long_reason("SMS", text, SMS_MAX_LENGTH)
+            _mark_tool_failure("sms", target, reason)
             return _error(
-                _message_too_long_reason("SMS", text, SMS_MAX_LENGTH),
+                reason,
                 error_code="sms_too_long",
                 char_count=len(text),
                 max_chars=SMS_MAX_LENGTH,
@@ -399,6 +457,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
             _mark_tool_delivery("sms", target)
             return _result(result)
         except Exception as exc:
+            _mark_tool_failure("sms", target, exc)
             _log_send_rejection("inkbox_send_sms", exc)
             return _error(str(exc))
 
@@ -473,8 +532,8 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         'shared iMessage line (origination "shared_imessage_number"; only works '
         "if they are connected to you over iMessage, otherwise the call is "
         "rejected). If origination is omitted it is resolved automatically. The "
-        "call's audio bridges to the running gateway. Always pass purpose so the "
-        "live call opens with context; optionally pass opening_message, context, "
+        "configured phone-call voice stack handles the call. Always pass purpose "
+        "so the live call or hosted agent knows why it is calling; optionally pass opening_message, context, "
         "and voicemail_detection (enabled or disabled).",
         {
             "to_number": str,
@@ -496,7 +555,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                     "purpose is required so the live call opens with context"
                 )
             voicemail_detection = str(
-                args.get("voicemail_detection") or ""
+                args.get("voicemail_detection") or cfg.voicemail_detection
             ).strip().lower()
             if voicemail_detection not in {"", "enabled", "disabled"}:
                 raise ValueError(
@@ -514,6 +573,37 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                     "number and iMessage is not enabled. Provision a number or "
                     "enable iMessage first."
                 )
+
+            if cfg.voice_stack_invalid_value:
+                raise RuntimeError(
+                    f"invalid INKBOX_VOICE_STACK={cfg.voice_stack_invalid_value!r}; rerun setup"
+                )
+            hosted = cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI
+            if hosted:
+                call = identity.place_call(
+                    to_number=to_number,
+                    origination=origination,
+                    mode="hosted_agent",
+                    reason=_hosted_call_reason(args),
+                    voicemail_detection=voicemail_detection,
+                )
+                record = getattr(call, "call", None) or call
+                return {
+                    "placed": True,
+                    "id": str(getattr(record, "id", "")),
+                    "to": to_number,
+                    "origination": origination,
+                    "mode": str(getattr(getattr(record, "mode", ""), "value", getattr(record, "mode", "")) or "hosted_agent"),
+                    "hosted_agent_authority_mode": str(
+                        getattr(
+                            getattr(record, "hosted_agent_authority_mode", ""),
+                            "value",
+                            getattr(record, "hosted_agent_authority_mode", ""),
+                        ) or ""
+                    ),
+                    "voicemail_detection": voicemail_detection,
+                    "status": _json_safe(getattr(record, "status", None)),
+                }
 
             phone = getattr(identity, "phone_number", None)
             ws_url = str(getattr(phone, "client_websocket_url", "") or "").strip()
@@ -538,24 +628,21 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
                 "to_number": to_number,
                 "origination": origination,
                 "client_websocket_url": ws_url,
+                "mode": "client_websocket",
+                "voicemail_detection": voicemail_detection,
             }
-            if voicemail_detection:
-                call_kwargs["voicemail_detection"] = voicemail_detection
             try:
                 call = identity.place_call(**call_kwargs)
             except TypeError:
-                if voicemail_detection:
-                    raise RuntimeError(
-                        "voicemail_detection requires inkbox SDK 0.5.8 or newer"
-                    )
-                # Older SDK without ``origination`` support → dedicated only.
-                call = identity.place_call(to_number=to_number, client_websocket_url=ws_url)
+                raise RuntimeError("phone call voice stacks require inkbox SDK 0.5.9 or newer")
             return {
                 "placed": True,
                 "id": str(getattr(call, "id", "")),
                 "to": to_number,
                 "origination": origination,
                 "context_token": token,
+                "mode": "client_websocket",
+                "voicemail_detection": voicemail_detection,
                 "status": _json_safe(getattr(call, "status", None)),
             }
 
@@ -1098,7 +1185,7 @@ def build_inkbox_mcp_server(client: Any, identity_handle: str) -> Tuple[Any, Lis
         inkbox_a2a_ask_caller,
         inkbox_a2a_fail,
     ]
-    server = create_sdk_mcp_server(name="inkbox", version="0.2.7", tools=tools)
+    server = create_sdk_mcp_server(name="inkbox", version="0.2.8", tools=tools)
     tool_names = [
         "mcp__inkbox__inkbox_whoami",
         "mcp__inkbox__inkbox_send_email",

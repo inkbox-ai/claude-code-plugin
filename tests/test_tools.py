@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from inkbox_claude import tools as tools_mod
+from inkbox_claude.config import BridgeConfig, VoiceStack
 
 
 @pytest.fixture(autouse=True)
@@ -171,14 +172,20 @@ class _FakeClient:
         return self.identity
 
 
-def _tool_map(client):
-    server, tool_names = tools_mod.build_inkbox_mcp_server(client, "claude-agent")
+def _tool_map(client, cfg=None):
+    server, tool_names = tools_mod.build_inkbox_mcp_server(client, "claude-agent", cfg)
     return {tool._inkbox_tool_name: tool for tool in server["tools"]}, tool_names
 
 
 def _call(client, name, arguments):
     tools, _tool_names = _tool_map(client)
     result = asyncio.run(tools[name](arguments))
+    return json.loads(result["content"][0]["text"])
+
+
+def _call_with_config(client, cfg, name, arguments):
+    registered, _ = _tool_map(client, cfg)
+    result = asyncio.run(registered[name](arguments))
     return json.loads(result["content"][0]["text"])
 
 
@@ -191,6 +198,38 @@ def test_call_tools_are_registered():
     assert "mcp__inkbox__inkbox_place_call" in tool_names
     assert "mcp__inkbox__inkbox_list_calls" in tool_names
     assert "mcp__inkbox__inkbox_get_call_transcript" in tool_names
+
+
+def test_hosted_place_call_uses_reason_and_saved_authority_default():
+    client = _FakeClient()
+    result = _call_with_config(
+        client,
+        BridgeConfig(
+            voice_stack=VoiceStack.INKBOX_VOICE_AI,
+            voicemail_detection="disabled",
+        ),
+        "inkbox_place_call",
+        {
+            "to_number": "+15551112222",
+            "purpose": "Confirm the release window",
+            "opening_message": "Introduce yourself first",
+            "context": "The release is currently green",
+        },
+    )
+
+    assert result["mode"] == "hosted_agent"
+    assert client.identity.place_call_kwargs == {
+        "to_number": "+15551112222",
+        "origination": "dedicated_number",
+        "mode": "hosted_agent",
+        "reason": (
+            "Confirm the release window\n\n"
+            "Opening guidance: Introduce yourself first\n\n"
+            "Additional context: The release is currently green"
+        ),
+        "voicemail_detection": "disabled",
+    }
+    assert "hosted_agent_authority_mode" not in client.identity.place_call_kwargs
 
 
 def test_coding_agent_tool_tier_is_registered():
@@ -593,6 +632,144 @@ def test_successful_message_tool_notifies_current_session():
         "attachments": None,
     }]
     assert deliveries == [("email", "ada@example.com")]
+
+
+def test_sms_tool_marks_success_only_after_sdk_send_returns():
+    client = _FakeClient()
+    events = []
+
+    class _Session:
+        def mark_tool_delivery(self, mode, target):
+            events.append(("delivered", mode, target, len(client.identity.sent_texts)))
+
+        def mark_tool_failure(self, mode, target, error):
+            events.append(("failed", mode, target, str(error)))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        data = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert data["sent"] is True
+    assert events == [("delivered", "sms", "+15551112222", 1)]
+
+
+def test_sms_tool_preflight_blocks_duplicate_before_second_sdk_send():
+    client = _FakeClient()
+    reservations = 0
+    deliveries = []
+
+    class _Session:
+        def preflight_hosted_sms(self, target):
+            nonlocal reservations
+            assert target == "+15551112222"
+            reservations += 1
+            if reservations > 1:
+                return {
+                    "kind": "duplicate",
+                    "message": "duplicate send blocked",
+                }
+            return None
+
+        def mark_tool_delivery(self, mode, target):
+            deliveries.append((mode, target))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        first = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+        second = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert first["sent"] is True
+    assert second["error_code"] == "hosted_sms_send_blocked"
+    assert len(client.identity.sent_texts) == 1
+    assert deliveries == [("sms", "+15551112222")]
+
+
+def test_sms_tool_preflight_terminal_block_records_failure_without_sdk_send():
+    client = _FakeClient()
+    failures = []
+
+    class _Session:
+        def preflight_hosted_sms(self, target):
+            assert target == "+15559990000"
+            return {
+                "kind": "terminal",
+                "message": "hosted-call target mismatch",
+            }
+
+        def mark_tool_failure(self, mode, target, error):
+            failures.append((mode, target, error.error_code, str(error)))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        result = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15559990000", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert result["error_code"] == "hosted_sms_send_blocked"
+    assert client.identity.sent_texts == []
+    assert failures == [(
+        "sms",
+        "+15559990000",
+        "forbidden",
+        "hosted-call target mismatch",
+    )]
+
+
+def test_sms_tool_marks_sdk_failure_without_success():
+    client = _FakeClient()
+    events = []
+
+    class Rejected(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.detail = {"message": "recipient opted out"}
+
+    def reject(**_kwargs):
+        raise Rejected("provider rejected send")
+
+    client.identity.send_text = reject
+
+    class _Session:
+        def mark_tool_delivery(self, mode, target):
+            events.append(("delivered", mode, target))
+
+        def mark_tool_failure(self, mode, target, error):
+            events.append(("failed", mode, target, error))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        data = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert "error" in data
+    assert len(events) == 1
+    assert events[0][:3] == ("failed", "sms", "+15551112222")
+    assert isinstance(events[0][3], Rejected)
 
 
 def test_send_imessage_group_requires_dedicated_outbound_line():
