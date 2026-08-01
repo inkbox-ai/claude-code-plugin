@@ -167,20 +167,10 @@ _OPEN_ACTION_SMS_COMMITMENT_PATTERNS = (
     re.compile(rf"\b{_TRANSCRIPT_TEXT_VERB}", re.IGNORECASE),
     re.compile(rf"\b{_TRANSCRIPT_SEND_SMS}", re.IGNORECASE),
 )
-_SMS_CLAUSE_SPLIT = re.compile(
-    r"(?:[.!?;]+|\s+—\s+|\b(?:but|however)\b)",
-    re.IGNORECASE,
-)
-
-
 def _clause_requires_sms(text: str, patterns: Any) -> bool:
-    """Match one positive SMS clause without letting another clause negate it."""
-    clauses = [part.strip() for part in _SMS_CLAUSE_SPLIT.split(text) if part.strip()]
-    return any(
-        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(clause)
-        and any(pattern.search(clause) for pattern in patterns)
-        for clause in clauses
-    )
+    """Match positive SMS intent after removing only negated action candidates."""
+    candidate = _TRANSCRIPT_NEGATED_SMS_ACTION.sub("", text)
+    return any(pattern.search(candidate) for pattern in patterns)
 
 
 def _transcript_requires_sms_commitment(transcript: Any) -> bool:
@@ -999,9 +989,12 @@ class InkboxGateway:
         }
         if state == "failed":
             entry["retryable"] = retryable
-        # Only unfinished/retryable work needs replay data. Completed receipts
-        # retain dedupe metadata but immediately discard call content.
-        if state in {"queued", "running", "failed"} and replay_payload is not None:
+        # Only unfinished/retryable work needs replay data. Completed and
+        # terminal-failed receipts retain dedupe metadata but discard content.
+        replayable = state in {"queued", "running"} or (
+            state == "failed" and retryable
+        )
+        if replayable and replay_payload is not None:
             entry["payload"] = replay_payload
         current[call_id] = entry
         if len(current) > 1_000:
@@ -1110,6 +1103,82 @@ class InkboxGateway:
         self._hosted_call_jobs[call_id] = task
         task.add_done_callback(lambda _task, key=call_id: self._hosted_call_jobs.pop(key, None))
 
+    def _schedule_hosted_sms_correction_recovery(
+        self,
+        call_id: str,
+        event_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        task = asyncio.create_task(
+            self._run_hosted_sms_correction_recovery(call_id, event_id, payload),
+            name=f"hosted-sms-correction:{call_id}",
+        )
+        self._hosted_call_jobs[call_id] = task
+        task.add_done_callback(
+            lambda _task, key=call_id: self._hosted_call_jobs.pop(key, None)
+        )
+
+    async def _run_hosted_sms_correction_recovery(
+        self,
+        call_id: str,
+        event_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Resume only the one safe SMS correction after a known rejection."""
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        call = data.get("call") if isinstance(data.get("call"), dict) else {}
+        outcome = str(data.get("outcome") or call.get("status") or "unknown")
+        self._write_hosted_call_registry(
+            call_id,
+            event_id=event_id,
+            state="running",
+            payload=payload,
+            outcome=outcome,
+        )
+        try:
+            remote = str(call.get("remote_phone_number") or "").strip()
+            contacts = data.get("contacts") if isinstance(data.get("contacts"), list) else []
+            contact = contacts[0] if contacts and isinstance(contacts[0], dict) else {}
+            if not remote or self.sessions is None:
+                raise _HostedToolSettlementError("hosted SMS correction context is unavailable")
+            session = self.sessions.get(str(contact.get("id") or remote))
+            corrected = await session.run_consult_detailed(
+                _hosted_sms_correction_prompt(remote, missing=False),
+                hosted_sms_context={
+                    "call_id": call_id,
+                    "attempt": 2,
+                    "remote_phone": remote,
+                },
+            )
+            if _hosted_sms_settlement(corrected, remote) != "success":
+                raise _HostedToolSettlementError(
+                    "recovered hosted SMS correction did not complete safely"
+                )
+            self._write_hosted_call_registry(
+                call_id,
+                event_id=event_id,
+                state="completed",
+                outcome=outcome,
+            )
+        except asyncio.CancelledError:
+            self._write_hosted_call_registry(
+                call_id,
+                event_id=event_id,
+                state="failed",
+                outcome=outcome,
+                retryable=False,
+            )
+            raise
+        except Exception:
+            self._write_hosted_call_registry(
+                call_id,
+                event_id=event_id,
+                state="failed",
+                outcome=outcome,
+                retryable=False,
+            )
+            logger.exception("[bridge] hosted SMS correction recovery failed: %s", call_id)
+
     async def _recover_hosted_call_completions(self) -> None:
         """Requeue work left queued/running/failed by a previous process."""
         for call_id, entry in self._read_hosted_call_registry().items():
@@ -1117,10 +1186,20 @@ class InkboxGateway:
                 continue
             if entry.get("state") == "failed" and entry.get("retryable") is False:
                 continue
-            if any(
-                hosted_sms_attempt_state(str(call_id), attempt) is not None
-                for attempt in (1, 2)
+            attempt_one = hosted_sms_attempt_state(str(call_id), 1)
+            attempt_two = hosted_sms_attempt_state(str(call_id), 2)
+            payload = entry.get("payload")
+            if (
+                attempt_one == "recoverable"
+                and attempt_two is None
+                and isinstance(payload, dict)
+                and call_id not in self._hosted_call_jobs
             ):
+                self._schedule_hosted_sms_correction_recovery(
+                    str(call_id), str(entry.get("event_id") or ""), payload
+                )
+                continue
+            if attempt_one is not None or attempt_two is not None:
                 self._write_hosted_call_registry(
                     str(call_id),
                     event_id=str(entry.get("event_id") or ""),
@@ -1135,7 +1214,6 @@ class InkboxGateway:
                     call_id,
                 )
                 continue
-            payload = entry.get("payload")
             if not isinstance(payload, dict) or call_id in self._hosted_call_jobs:
                 continue
             self._write_hosted_call_registry(

@@ -5,7 +5,10 @@ import types
 from inkbox_claude import gateway as gateway_module
 from inkbox_claude.config import BridgeConfig, VoiceStack
 from inkbox_claude.gateway import InkboxGateway
-from inkbox_claude.hosted_sms_guard import reserve_hosted_sms_attempt
+from inkbox_claude.hosted_sms_guard import (
+    reserve_hosted_sms_attempt,
+    settle_hosted_sms_attempt,
+)
 from inkbox_claude.sessions import CapturedTurnResult, ToolDeliveryResult
 
 
@@ -219,6 +222,41 @@ def test_restart_does_not_replay_a_reserved_hosted_sms_attempt(tmp_path, monkeyp
         )["call-1"]
         assert entry["state"] == "failed"
         assert entry["retryable"] is False
+        assert "payload" not in entry
+
+    asyncio.run(scenario())
+
+
+def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
+    async def scenario():
+        monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+        gateway, prompts = _gateway(tmp_path)
+        gateway._write_hosted_call_registry(
+            "call-1",
+            event_id="event-call-1",
+            state="running",
+            payload=_payload(),
+            outcome="completed",
+        )
+        assert reserve_hosted_sms_attempt(
+            "call-1", 1, "+15551112222"
+        ) is True
+        settle_hosted_sms_attempt("call-1", 1, "recoverable")
+
+        await gateway._recover_hosted_call_completions()
+        await _drain(gateway)
+
+        assert len(prompts) == 1
+        assert "[hosted_post_call_sms_correction]" in prompts[0]
+        assert "Review the outcome, transcript" not in prompts[0]
+        assert gateway.sessions.session.hosted_contexts == [{
+            "call_id": "call-1",
+            "attempt": 2,
+            "remote_phone": "+15551112222",
+        }]
+        entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
+        assert entry["state"] == "completed"
+        assert "payload" not in entry
 
     asyncio.run(scenario())
 
@@ -255,6 +293,7 @@ def test_hosted_sms_failed_correction_is_terminal_and_not_replayed(tmp_path):
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
         assert entry["state"] == "failed"
         assert entry["retryable"] is False
+        assert "payload" not in entry
 
         restarted, restarted_prompts = _gateway(tmp_path)
         await restarted._recover_hosted_call_completions()
@@ -500,6 +539,12 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
     assert gateway_module._hosted_requires_sms(
         [],
         [("remote", "Don't text me now; after this call ends, text me the code.")],
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "After this call ends; text me release-ready.")]
+    )
+    assert gateway_module._hosted_requires_sms(
+        [], [("remote", "Text me release-ready. Do it once this call is over.")]
     )
     assert not gateway_module._hosted_requires_sms(
         [],
