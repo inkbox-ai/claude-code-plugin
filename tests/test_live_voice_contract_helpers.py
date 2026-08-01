@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _load_voice_module():
     path = Path(__file__).parent / "live" / "test_voice.py"
@@ -60,6 +62,45 @@ def test_voicemail_detection_value_accepts_sdk_enum_or_wire_string():
     ) == "disabled"
 
 
+def test_call_pair_correlation_keeps_driver_and_aut_ownership():
+    stamp = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    driver = SimpleNamespace(
+        id="driver-1", created_at=stamp, voicemail_detection="enabled"
+    )
+    aut = SimpleNamespace(
+        id="aut-1", created_at=stamp, voicemail_detection="disabled"
+    )
+
+    assert voice._correlate_fresh_call_pair(
+        [driver],
+        [aut],
+        before_driver=set(),
+        before_aut=set(),
+        driver_watermark=stamp,
+        aut_watermark=stamp,
+    ) == (driver, aut)
+
+
+def test_call_pair_duplicate_diagnostic_names_owner_and_ids():
+    stamp = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    driver = SimpleNamespace(id="driver-1", created_at=stamp)
+    aut = [
+        SimpleNamespace(id="aut-1", created_at=stamp),
+        SimpleNamespace(id="aut-2", created_at=stamp),
+    ]
+
+    with pytest.raises(
+        AssertionError,
+        match=r"phase=call_pairing .*aut-1.*aut-2.*duplicate AUT legs",
+    ):
+        voice._correlate_fresh_call_pair(
+            [driver],
+            aut,
+            before_driver=set(),
+            before_aut=set(),
+            driver_watermark=stamp,
+            aut_watermark=stamp,
+        )
 def test_matching_post_call_action_requires_open_current_marker_sms():
     marker = "victor echo juliet"
     matching = {

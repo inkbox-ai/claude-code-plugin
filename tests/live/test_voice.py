@@ -87,6 +87,51 @@ def _voicemail_detection_value(call) -> str:
     return _enum_value(getattr(call, "voicemail_detection", ""))
 
 
+def _fresh_call_records(records, before: set, watermark: datetime):
+    return [
+        record for record in records
+        if record.id not in before
+        and (created_at := _message_created_at(record)) is not None
+        and created_at >= watermark
+    ]
+
+
+def _call_pair_diagnostic(driver_calls, aut_calls) -> str:
+    return (
+        "phase=call_pairing "
+        f"driver_ids={[str(call.id) for call in driver_calls]} "
+        f"aut_ids={[str(call.id) for call in aut_calls]}"
+    )
+
+
+def _correlate_fresh_call_pair(
+    driver_records,
+    aut_records,
+    *,
+    before_driver: set,
+    before_aut: set,
+    driver_watermark: datetime,
+    aut_watermark: datetime,
+):
+    """Return the exact driver/AUT records for one newly persisted call."""
+    driver_calls = _fresh_call_records(
+        driver_records, before_driver, driver_watermark
+    )
+    aut_calls = _fresh_call_records(aut_records, before_aut, aut_watermark)
+    diagnostic = _call_pair_diagnostic(driver_calls, aut_calls)
+    assert len(driver_calls) <= 1, f"{diagnostic} duplicate driver legs"
+    assert len(aut_calls) <= 1, f"{diagnostic} duplicate AUT legs"
+    if not driver_calls or not aut_calls:
+        return None
+    driver_created = _message_created_at(driver_calls[0])
+    aut_created = _message_created_at(aut_calls[0])
+    assert driver_created is not None and aut_created is not None
+    assert abs((driver_created - aut_created).total_seconds()) <= 60, (
+        f"{diagnostic} timestamps do not describe one call"
+    )
+    return driver_calls[0], aut_calls[0]
+
+
 def _spoken_tokens(value: str | None) -> list[str]:
     """Normalize speech-carried text without depending on punctuation/case."""
     return re.findall(r"[a-z0-9]+", (value or "").casefold())
@@ -367,27 +412,65 @@ def test_outbound_call_realtime():
     remote, aut = _client(REMOTE_KEY), _client(AUT_KEY)
     aut_phone = _aut_phone(aut)
     tail = _digits(aut_phone)[-10:]
+    driver_tail = _digits(st["number"])[-10:]
 
     def _inbound_from_aut():
         return [c for c in remote.calls.list(limit=30)
                 if (getattr(c, "direction", "") or "").lower() == "inbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == tail]
 
-    before = {c.id for c in _inbound_from_aut()}
+    def _outbound_from_aut():
+        return [c for c in aut.calls.list(limit=30)
+                if (getattr(c, "direction", "") or "").lower() == "outbound"
+                and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == driver_tail]
+
+    baseline_driver = _inbound_from_aut()
+    baseline_aut = _outbound_from_aut()
+    before_driver = {call.id for call in baseline_driver}
+    before_aut = {call.id for call in baseline_aut}
+    driver_watermark = max(
+        (
+            created_at for call in baseline_driver
+            if (created_at := _message_created_at(call)) is not None
+        ),
+        default=datetime.min.replace(tzinfo=UTC),
+    )
+    aut_watermark = max(
+        (
+            created_at for call in baseline_aut
+            if (created_at := _message_created_at(call)) is not None
+        ),
+        default=datetime.min.replace(tzinfo=UTC),
+    )
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     call_id = None
+    aut_call = None
     try:
-        # Wait for the agent to dial back, then verify the call transcript.
+        # Pair the driver's inbound media leg with the AUT's outbound request.
         deadline = time.monotonic() + TIMEOUT_S
         while time.monotonic() < deadline:
-            fresh = [c for c in _inbound_from_aut() if c.id not in before]
-            if fresh:
-                call_id = fresh[0].id
+            pair = _correlate_fresh_call_pair(
+                _inbound_from_aut(),
+                _outbound_from_aut(),
+                before_driver=before_driver,
+                before_aut=before_aut,
+                driver_watermark=driver_watermark,
+                aut_watermark=aut_watermark,
+            )
+            if pair is not None:
+                driver_call, aut_call = pair
+                call_id = driver_call.id
                 break
             time.sleep(POLL_EVERY_S)
-        assert call_id, f"agent never placed a call back within {TIMEOUT_S:.0f}s"
-        persisted = remote.calls.get(call_id)
+        assert call_id and aut_call is not None, (
+            f"agent never persisted both call legs within {TIMEOUT_S:.0f}s; "
+            + _call_pair_diagnostic(
+                _fresh_call_records(_inbound_from_aut(), before_driver, driver_watermark),
+                _fresh_call_records(_outbound_from_aut(), before_aut, aut_watermark),
+            )
+        )
+        persisted = aut.calls.get(aut_call.id)
         assert _voicemail_detection_value(persisted) == "disabled"
 
         agent_said = _wait_for_two_way_call(remote, st["number_id"], call_id)
