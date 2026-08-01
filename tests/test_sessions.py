@@ -11,6 +11,7 @@ from inkbox_claude.delivery_policy import (
     sms_delivery_failure_policy,
     sms_tool_failure_kind,
 )
+from inkbox_claude.hosted_sms_guard import hosted_sms_attempt_state
 from inkbox_claude.sessions import (
     ContactSession,
     _parse_index,
@@ -38,6 +39,93 @@ def make_session(sent, typing=None):
         identity_info={"handle": "t", "email": "", "phone": ""},
         typing_fn=typing_fn,
     )
+
+
+def test_hosted_sms_preflight_is_durable_exact_target_and_single_use(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    session = make_session([])
+    session._turn_active = True
+    session._current_hosted_sms_context = {
+        "call_id": "call-1",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }
+
+    blocked = session.preflight_hosted_sms("+15559990000")
+    assert blocked and blocked["kind"] == "terminal"
+    assert blocked["message"].startswith("Hosted-call SMS target does not match")
+    assert hosted_sms_attempt_state("call-1", 1) is None
+    assert session.preflight_hosted_sms("+15551112222") is None
+    assert hosted_sms_attempt_state("call-1", 1) == "pending"
+    duplicate = session.preflight_hosted_sms("+15551112222")
+    assert duplicate and duplicate["kind"] == "duplicate"
+    assert "duplicate send blocked" in duplicate["message"]
+
+    session.mark_tool_delivery("sms", "+15551112222")
+    assert hosted_sms_attempt_state("call-1", 1) == "success"
+    attempt_path = next((tmp_path / "hosted_sms_attempts").glob("*.json"))
+    assert attempt_path.stat().st_mode & 0o777 == 0o600
+    assert attempt_path.parent.stat().st_mode & 0o777 == 0o700
+
+    restarted = make_session([])
+    restarted._turn_active = True
+    restarted._current_hosted_sms_context = dict(
+        session._current_hosted_sms_context
+    )
+    duplicate = restarted.preflight_hosted_sms("+15551112222")
+    assert duplicate and duplicate["kind"] == "duplicate"
+
+
+def test_hosted_sms_recoverable_result_settles_reserved_attempt(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    session = make_session([])
+    session._turn_active = True
+    session._current_hosted_sms_context = {
+        "call_id": "call-2",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }
+    assert session.preflight_hosted_sms("+15551112222") is None
+
+    session.mark_tool_failure(
+        "sms",
+        "+15551112222",
+        "SMS message is too long; maximum is 1600 characters.",
+    )
+
+    assert hosted_sms_attempt_state("call-2", 1) == "recoverable"
+
+
+def test_hosted_sms_terminal_preflight_failure_is_durably_settled(
+    tmp_path, monkeypatch,
+):
+    class Forbidden(RuntimeError):
+        error_code = "forbidden"
+
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    session = make_session([])
+    session._turn_active = True
+    session._current_hosted_sms_context = {
+        "call_id": "call-3",
+        "attempt": 1,
+        "remote_phone": "+15551112222",
+    }
+
+    blocked = session.preflight_hosted_sms("+15559990000")
+    assert blocked and blocked["kind"] == "terminal"
+    session.mark_tool_failure(
+        "sms",
+        "+15559990000",
+        Forbidden(blocked["message"]),
+    )
+
+    assert hosted_sms_attempt_state("call-3", 1) == "terminal"
+    assert session._current_tool_deliveries[-1].sent is False
+    assert session._current_tool_deliveries[-1].error_kind == "terminal"
 
 
 def test_abort_settles_queued_capture_future():

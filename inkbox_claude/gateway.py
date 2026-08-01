@@ -71,6 +71,7 @@ try:
         sms_delivery_failure_policy as _sms_delivery_failure_policy,
     )
     from .media import download_media, inbound_media_note
+    from .hosted_sms_guard import hosted_sms_attempt_state
     from .prompts import (
         contact_marker,
         contact_memories_block,
@@ -100,6 +101,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         sms_delivery_failure_policy as _sms_delivery_failure_policy,
     )
     from media import download_media, inbound_media_note
+    from hosted_sms_guard import hosted_sms_attempt_state
     from prompts import (
         contact_marker,
         contact_memories_block,
@@ -129,7 +131,7 @@ _TRANSCRIPT_POST_CALL_TIMING = (
 )
 _TRANSCRIPT_TEXT_VERB = (
     r"text\s+(?!conversation\b|messages?\b|history\b|thread\b|"
-    r"yesterday\b|earlier\b|from\b)[\w@][\w@.'’+-]*\b"
+    r"exchange\b|yesterday\b|earlier\b|from\b)[\w@][\w@.'’+-]*\b"
 )
 _TRANSCRIPT_TEXT_CLAUSE_PREFIX = (
     r"(?:please\s+|then\s+|(?:(?:can|could|would|will)\s+you|"
@@ -160,6 +162,10 @@ _TRANSCRIPT_SMS_COMMITMENT_PATTERNS = (
         rf"\b{_TRANSCRIPT_SEND_SMS}.{{0,160}}\b{_TRANSCRIPT_POST_CALL_TIMING}\b",
         re.IGNORECASE,
     ),
+)
+_OPEN_ACTION_SMS_COMMITMENT_PATTERNS = (
+    re.compile(rf"\b{_TRANSCRIPT_TEXT_VERB}", re.IGNORECASE),
+    re.compile(rf"\b{_TRANSCRIPT_SEND_SMS}", re.IGNORECASE),
 )
 
 
@@ -197,8 +203,11 @@ def _hosted_requires_sms(
         if str(action.get("status") or "open").strip().lower() == "open"
     )
     action_requires_sms = any(
-        re.search(r"\b(?:sms|text|texted|texting)\b", text, re.IGNORECASE)
-        and not _TRANSCRIPT_NEGATED_SMS_ACTION.search(text)
+        not _TRANSCRIPT_NEGATED_SMS_ACTION.search(text)
+        and any(
+            pattern.search(text)
+            for pattern in _OPEN_ACTION_SMS_COMMITMENT_PATTERNS
+        )
         for text in open_action_texts
     )
     return action_requires_sms or _transcript_requires_sms_commitment(transcript)
@@ -1099,6 +1108,24 @@ class InkboxGateway:
                 continue
             if entry.get("state") == "failed" and entry.get("retryable") is False:
                 continue
+            if any(
+                hosted_sms_attempt_state(str(call_id), attempt) is not None
+                for attempt in (1, 2)
+            ):
+                self._write_hosted_call_registry(
+                    str(call_id),
+                    event_id=str(entry.get("event_id") or ""),
+                    state="failed",
+                    payload=entry.get("payload"),
+                    outcome=str(entry.get("outcome") or ""),
+                    retryable=False,
+                )
+                logger.warning(
+                    "[bridge] hosted SMS attempt was commit-ambiguous after restart; "
+                    "replay blocked call_id=%s",
+                    call_id,
+                )
+                continue
             payload = entry.get("payload")
             if not isinstance(payload, dict) or call_id in self._hosted_call_jobs:
                 continue
@@ -1265,14 +1292,28 @@ class InkboxGateway:
                 # commit-ambiguous: the host may have completed a send before
                 # the model/transport failed to return the detailed result.
                 required_sms_turn_started = True
-                result = await session.run_consult_detailed(prompt)
+                result = await session.run_consult_detailed(
+                    prompt,
+                    hosted_sms_context={
+                        "call_id": call_id,
+                        "attempt": 1,
+                        "remote_phone": remote,
+                    },
+                )
                 settlement = _hosted_sms_settlement(result, remote)
                 if settlement in {"missing", "recoverable"}:
                     correction = _hosted_sms_correction_prompt(
                         remote,
                         missing=settlement == "missing",
                     )
-                    corrected = await session.run_consult_detailed(correction)
+                    corrected = await session.run_consult_detailed(
+                        correction,
+                        hosted_sms_context={
+                            "call_id": call_id,
+                            "attempt": 2,
+                            "remote_phone": remote,
+                        },
+                    )
                     settlement = _hosted_sms_settlement(corrected, remote)
                 if settlement != "success":
                     raise _HostedToolSettlementError(

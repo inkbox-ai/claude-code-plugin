@@ -5,6 +5,7 @@ import types
 from inkbox_claude import gateway as gateway_module
 from inkbox_claude.config import BridgeConfig, VoiceStack
 from inkbox_claude.gateway import InkboxGateway
+from inkbox_claude.hosted_sms_guard import reserve_hosted_sms_attempt
 from inkbox_claude.sessions import CapturedTurnResult, ToolDeliveryResult
 
 
@@ -88,9 +89,10 @@ class _Session:
             raise self.error
         return "This plain text must not be delivered"
 
-    async def run_consult_detailed(self, prompt):
+    async def run_consult_detailed(self, prompt, **kwargs):
         self.detailed_calls += 1
         self.prompts.append(prompt)
+        self.hosted_contexts.append(kwargs.get("hosted_sms_context"))
         if self.gate is not None:
             await self.gate.wait()
         if self.error:
@@ -104,6 +106,7 @@ class _Sessions:
         self.error = error
         self.chat_ids = []
         self.session = _Session(self.prompts, self.error, results, gate)
+        self.session.hosted_contexts = []
 
     def get(self, chat_id):
         self.chat_ids.append(chat_id)
@@ -163,6 +166,59 @@ def test_hosted_completion_runs_once_and_suppresses_plain_text(tmp_path):
         await gateway._on_hosted_call_ended(_payload())
         await _drain(gateway)
         assert len(prompts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_hosted_sms_context_is_bound_to_each_bounded_attempt(tmp_path):
+    async def scenario():
+        gateway, _prompts = _gateway(tmp_path, results=[
+            _sms_result(sent=False, error_kind="recoverable"),
+            _sms_result(),
+        ])
+        await gateway._on_hosted_call_ended(_payload())
+        await _drain(gateway)
+
+        assert gateway.sessions.session.hosted_contexts == [
+            {
+                "call_id": "call-1",
+                "attempt": 1,
+                "remote_phone": "+15551112222",
+            },
+            {
+                "call_id": "call-1",
+                "attempt": 2,
+                "remote_phone": "+15551112222",
+            },
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_restart_does_not_replay_a_reserved_hosted_sms_attempt(tmp_path, monkeypatch):
+    async def scenario():
+        monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+        gateway, _prompts = _gateway(tmp_path)
+        gateway._write_hosted_call_registry(
+            "call-1",
+            event_id="event-call-1",
+            state="running",
+            payload=_payload(),
+        )
+        assert reserve_hosted_sms_attempt(
+            "call-1", 1, "+15551112222"
+        ) is True
+
+        restarted, restarted_prompts = _gateway(tmp_path)
+        await restarted._recover_hosted_call_completions()
+
+        assert restarted._hosted_call_jobs == {}
+        assert restarted_prompts == []
+        entry = json.loads(
+            restarted._hosted_call_registry_path.read_text()
+        )["call-1"]
+        assert entry["state"] == "failed"
+        assert entry["retryable"] is False
 
     asyncio.run(scenario())
 
@@ -459,6 +515,12 @@ def test_hosted_transcript_sms_commitment_classifier_is_narrow():
     )
     assert not gateway_module._hosted_requires_sms(
         [{"status": "open", "action": "Do not send me an SMS."}], []
+    )
+    assert not gateway_module._hosted_requires_sms(
+        [{"status": "open", "action": "Review the text exchange."}], []
+    )
+    assert not gateway_module._hosted_requires_sms(
+        [{"status": "open", "action": "Search SMS history."}], []
     )
     assert gateway_module._hosted_requires_sms(
         [

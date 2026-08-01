@@ -22,8 +22,16 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
     from .delivery_policy import sms_tool_failure_kind
+    from .hosted_sms_guard import (
+        reserve_hosted_sms_attempt,
+        settle_hosted_sms_attempt,
+    )
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from delivery_policy import sms_tool_failure_kind
+    from hosted_sms_guard import (
+        reserve_hosted_sms_attempt,
+        settle_hosted_sms_attempt,
+    )
 
 try:
     from claude_agent_sdk import (
@@ -95,6 +103,7 @@ class _Turn:
     future: Optional["asyncio.Future[Any]"] = None
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
+    hosted_sms_context: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -379,6 +388,7 @@ class ContactSession:
         # do not follow it with Claude's usually-redundant "sent it" result.
         self._current_channel_tool_delivery = False
         self._current_tool_deliveries: list[ToolDeliveryResult] = []
+        self._current_hosted_sms_context: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -655,6 +665,8 @@ class ContactSession:
             sent=True,
             error_kind="none",
         ))
+        if normalized_mode == "sms":
+            self._settle_hosted_sms_attempt("success")
         if normalized_mode != self.mode:
             return
         matched = False
@@ -688,17 +700,80 @@ class ContactSession:
         """Record a failed host-native tool attempt without retaining its payload."""
         if not self._turn_active:
             return
+        error_kind = sms_tool_failure_kind(error)
         self._current_tool_deliveries.append(ToolDeliveryResult(
             mode=str(mode or "").strip().lower(),
             target=str(target or "").strip(),
             sent=False,
-            error_kind=sms_tool_failure_kind(error),
+            error_kind=error_kind,
         ))
+        if str(mode or "").strip().lower() == "sms":
+            self._settle_hosted_sms_attempt(error_kind)
+
+    def preflight_hosted_sms(self, target: str) -> Optional[Dict[str, str]]:
+        """Reserve a trusted hosted SMS attempt before the provider is called."""
+        context = self._current_hosted_sms_context
+        if not self._turn_active or not isinstance(context, dict):
+            return None
+        expected = str(context.get("remote_phone") or "").strip()
+        if not expected or str(target or "").strip() != expected:
+            return {
+                "kind": "terminal",
+                "message": (
+                    "Hosted-call SMS target does not match the authoritative "
+                    "caller; send blocked."
+                ),
+            }
+        try:
+            reserved = reserve_hosted_sms_attempt(
+                str(context.get("call_id") or ""),
+                int(context.get("attempt") or 1),
+                expected,
+            )
+        except Exception:
+            logger.exception(
+                "[session %s] hosted SMS reservation failed; send blocked",
+                self.chat_id,
+            )
+            return {
+                "kind": "terminal",
+                "message": "Hosted-call SMS safety state is unavailable; send blocked.",
+            }
+        if not reserved:
+            return {
+                "kind": "duplicate",
+                "message": (
+                    "This hosted-call SMS attempt was already used; duplicate "
+                    "send blocked."
+                ),
+            }
+        return None
+
+    def _settle_hosted_sms_attempt(self, state: str) -> None:
+        context = self._current_hosted_sms_context
+        if not isinstance(context, dict):
+            return
+        try:
+            settle_hosted_sms_attempt(
+                str(context.get("call_id") or ""),
+                int(context.get("attempt") or 1),
+                state,
+            )
+        except Exception:
+            logger.exception(
+                "[session %s] hosted SMS settlement journal failed",
+                self.chat_id,
+            )
 
     async def _run_turn(self, turn: _Turn) -> None:
         self._interrupting = False  # fresh turn starts un-interrupted
         self._current_channel_tool_delivery = False
         self._current_tool_deliveries: list[ToolDeliveryResult] = []
+        self._current_hosted_sms_context = (
+            dict(turn.hosted_sms_context)
+            if isinstance(turn.hosted_sms_context, dict)
+            else None
+        )
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         retried_missing_resume = False
@@ -770,6 +845,7 @@ class ContactSession:
                 A2A_TURN_CONTEXT.reset(a2a_token)
             self._turn_active = False
             self._current_turn = None
+            self._current_hosted_sms_context = None
             if typing_task is not None:
                 typing_task.cancel()
                 try:
@@ -878,11 +954,21 @@ class ContactSession:
             self._worker = asyncio.create_task(self._drain())
         return await future
 
-    async def run_consult_detailed(self, query: str) -> CapturedTurnResult:
+    async def run_consult_detailed(
+        self,
+        query: str,
+        *,
+        hosted_sms_context: Optional[Dict[str, Any]] = None,
+    ) -> CapturedTurnResult:
         """Run a capture turn and return sanitized host-native tool outcomes."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CapturedTurnResult] = loop.create_future()
-        await self._queue.put(_Turn(text=query, future=future, capture_tools=True))
+        await self._queue.put(_Turn(
+            text=query,
+            future=future,
+            capture_tools=True,
+            hosted_sms_context=hosted_sms_context,
+        ))
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
         return await future

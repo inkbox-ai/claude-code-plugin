@@ -109,6 +109,19 @@ def _mark_tool_failure(mode: str, target: str, error: Any) -> None:
         mark(mode, target, error)
 
 
+class _HostedSMSPreflightError(RuntimeError):
+    """A trusted hosted-call guard rejected a send before provider I/O."""
+
+    error_code = "forbidden"
+
+
+def _hosted_sms_preflight(target: str) -> Optional[Dict[str, str]]:
+    """Ask the active hosted turn to reserve this send before provider I/O."""
+    session = CURRENT_SESSION.get()
+    preflight = getattr(session, "preflight_hosted_sms", None)
+    return preflight(target) if callable(preflight) else None
+
+
 def _current_channel_hint() -> Optional[str]:
     """Which Inkbox channel is the current agent turn happening on?
 
@@ -403,6 +416,16 @@ def build_inkbox_mcp_server(
     async def inkbox_send_sms(args: Dict[str, Any]) -> Dict[str, Any]:
         text = str(args.get("text") or "")
         target = str(args.get("to") or "").strip()
+        blocked = _hosted_sms_preflight(target)
+        if blocked:
+            message = str(blocked.get("message") or "Hosted-call SMS send blocked.")
+            if blocked.get("kind") == "terminal":
+                _mark_tool_failure(
+                    "sms",
+                    target,
+                    _HostedSMSPreflightError(message),
+                )
+            return _error(message, error_code="hosted_sms_send_blocked")
         if len(text) > SMS_MAX_LENGTH:
             reason = _message_too_long_reason("SMS", text, SMS_MAX_LENGTH)
             _mark_tool_failure("sms", target, reason)

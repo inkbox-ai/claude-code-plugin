@@ -659,6 +659,82 @@ def test_sms_tool_marks_success_only_after_sdk_send_returns():
     assert events == [("delivered", "sms", "+15551112222", 1)]
 
 
+def test_sms_tool_preflight_blocks_duplicate_before_second_sdk_send():
+    client = _FakeClient()
+    reservations = 0
+    deliveries = []
+
+    class _Session:
+        def preflight_hosted_sms(self, target):
+            nonlocal reservations
+            assert target == "+15551112222"
+            reservations += 1
+            if reservations > 1:
+                return {
+                    "kind": "duplicate",
+                    "message": "duplicate send blocked",
+                }
+            return None
+
+        def mark_tool_delivery(self, mode, target):
+            deliveries.append((mode, target))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        first = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+        second = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15551112222", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert first["sent"] is True
+    assert second["error_code"] == "hosted_sms_send_blocked"
+    assert len(client.identity.sent_texts) == 1
+    assert deliveries == [("sms", "+15551112222")]
+
+
+def test_sms_tool_preflight_terminal_block_records_failure_without_sdk_send():
+    client = _FakeClient()
+    failures = []
+
+    class _Session:
+        def preflight_hosted_sms(self, target):
+            assert target == "+15559990000"
+            return {
+                "kind": "terminal",
+                "message": "hosted-call target mismatch",
+            }
+
+        def mark_tool_failure(self, mode, target, error):
+            failures.append((mode, target, error.error_code, str(error)))
+
+    token = tools_mod.CURRENT_SESSION.set(_Session())
+    try:
+        result = _call(
+            client,
+            "inkbox_send_sms",
+            {"to": "+15559990000", "text": "release update"},
+        )
+    finally:
+        tools_mod.CURRENT_SESSION.reset(token)
+
+    assert result["error_code"] == "hosted_sms_send_blocked"
+    assert client.identity.sent_texts == []
+    assert failures == [(
+        "sms",
+        "+15559990000",
+        "forbidden",
+        "hosted-call target mismatch",
+    )]
+
+
 def test_sms_tool_marks_sdk_failure_without_success():
     client = _FakeClient()
     events = []
