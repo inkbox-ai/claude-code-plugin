@@ -97,11 +97,18 @@ def _read_pid() -> int | None:
 
 
 def _maybe_load_env_file() -> None:
-    """Fill missing config from a ``.env`` file so the daemon just works.
+    """Fill missing config from every ``.env`` file we know about.
 
-    Loads the first that exists — ``$INKBOX_CLAUDE_ENV_FILE``, then ``./.env``,
-    then ``~/.inkbox-claude/.env`` (where the installer writes it for a global
-    install) — and sets any vars not already in the environment (real env wins).
+    Reads, in priority order, ``$INKBOX_CLAUDE_ENV_FILE``, ``./.env``, then
+    ``~/.inkbox-claude/.env`` (where the installer writes it for a global
+    install), and sets any var not already in the environment. Real env beats
+    every file and an earlier file beats a later one, but a later file still
+    fills what the earlier ones left out.
+
+    Reading all of them rather than stopping at the first hit is what keeps an
+    unrelated ``./.env`` -- a project's own secrets, or a stray one in ``$HOME``
+    -- from hiding the install's config and making `start` report that
+    INKBOX_API_KEY is unset when it is right there in the state dir.
 
     Returns:
         None
@@ -113,17 +120,26 @@ def _maybe_load_env_file() -> None:
     candidates.append(Path.cwd() / ".env")
     candidates.append(_state_dir() / ".env")
 
-    path = next((p for p in candidates if p.exists()), None)
-    if path is None:
-        return
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
+    seen = set()
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            key_path = path.resolve()
+            if key_path in seen:  # cwd == state dir, or a symlink to it
+                continue
+            seen.add(key_path)
+            lines = path.read_text().splitlines()
+        except OSError:  # unreadable is the same as absent, for our purposes
             continue
-        if stripped.startswith("export "):
-            stripped = stripped[len("export "):]
-        key, value = stripped.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[len("export "):]
+            key, value = stripped.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def run_foreground() -> int:
