@@ -202,6 +202,10 @@ def _save(name: str, value: str) -> None:
     if not replaced:
         lines.append(f"{name}={value}")
     path.write_text("\n".join(lines) + "\n")
+    # This file contains the agent API key and webhook signing key.  The
+    # default umask commonly leaves new files world-readable (0644), and
+    # write_text preserves an unsafe mode on an existing file.
+    path.chmod(0o600)
     # Mirror into the live env so a doctor run right after sees the change.
     os.environ[name] = value
 

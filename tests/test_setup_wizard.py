@@ -39,12 +39,14 @@ def test_save_and_env_roundtrip(tmp_path, monkeypatch):
 
     # Persisted to disk and mirrored into the live env for an immediate doctor.
     assert "INKBOX_IDENTITY=dev-agent" in env_file.read_text()
+    assert env_file.stat().st_mode & 0o777 == 0o600
     assert setup_wizard._env("INKBOX_IDENTITY") == "dev-agent"
 
 
 def test_save_upserts_existing_key(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text("export INKBOX_IDENTITY=old\nINKBOX_BRIDGE_PORT=8767\n")
+    env_file.chmod(0o644)
     monkeypatch.setenv("INKBOX_CLAUDE_ENV_FILE", str(env_file))
     monkeypatch.delenv("INKBOX_IDENTITY", raising=False)
 
@@ -55,6 +57,7 @@ def test_save_upserts_existing_key(tmp_path, monkeypatch):
     assert "old" not in text
     # An unrelated line is left intact.
     assert "INKBOX_BRIDGE_PORT=8767" in text
+    assert env_file.stat().st_mode & 0o777 == 0o600
 
 
 def test_save_skips_empty_value(tmp_path, monkeypatch):
