@@ -18,6 +18,10 @@ Env:
   VOICE_DRIVER_PORT       local port the tunnel forwards to (default 8090)
   VOICE_DRIVER_STATE      path to write the JSON state file
   VOICE_DRIVER_LINE       the one line the driver speaks (default below)
+  VOICE_DRIVER_FOLLOWUP_LINE
+                          optional corrective line spoken during the same turn
+  VOICE_DRIVER_FOLLOWUP_AFTER
+                          seconds after the first line to speak the correction
 """
 
 from __future__ import annotations
@@ -47,6 +51,8 @@ LINE = os.environ.get(
     "VOICE_DRIVER_LINE",
     "Hi, this is a quick test call. Please reply out loud with one short sentence, then say goodbye.",
 )
+FOLLOWUP_LINE = os.environ.get("VOICE_DRIVER_FOLLOWUP_LINE", "").strip()
+FOLLOWUP_AFTER_S = float(os.environ.get("VOICE_DRIVER_FOLLOWUP_AFTER", "45"))
 # Answering-machine detection scores whoever answers: a greeting longer than the
 # carrier's `greeting_duration_millis` (3.5s) reads as a voicemail announcement
 # and the call is hung up before the agent ever speaks. Answer the way a person
@@ -95,7 +101,12 @@ async def phone_media_ws(ws: WebSocket) -> None:
         await _say(GREETING)
         await asyncio.sleep(SPEAK_AFTER_S)
         await _speak(LINE)
-        await asyncio.sleep(LISTEN_S)
+        if FOLLOWUP_LINE:
+            await asyncio.sleep(min(FOLLOWUP_AFTER_S, LISTEN_S))
+            await _say(FOLLOWUP_LINE)
+            await asyncio.sleep(max(0.0, LISTEN_S - FOLLOWUP_AFTER_S))
+        else:
+            await asyncio.sleep(LISTEN_S)
         try:
             await ws.send_text(json.dumps({"event": "stop"}))
             log.info("sent stop (hangup)")

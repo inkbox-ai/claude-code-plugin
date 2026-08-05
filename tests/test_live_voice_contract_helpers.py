@@ -27,17 +27,24 @@ def test_voice_driver_allows_realtime_response_latency():
     assert 'VOICE_DRIVER_LISTEN", "30"' in driver
 
 
-def test_workflow_requires_action_first_exact_body_and_readback():
+def test_workflow_requires_exact_action_body_and_corrective_readback():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "First create one open post-call action. Set its title exactly to Send SMS $marker. "
-        "Set its details exactly to Send SMS $marker. List the actions and edit that same "
-        "action until both fields contain the marker and match exactly. After we hang up, "
-        "send me exactly one SMS containing exactly $marker. Only after the action is "
-        "correct, read the five-word SMS body back. Do not send the SMS during the call."
+        "After we hang up, send me exactly one SMS containing exactly $marker. Before we "
+        "hang up, record one post-call action whose action title and details are both exactly "
+        "Send SMS $marker. Read the five-word SMS body back after recording it. Do not send "
+        "the SMS during the call."
         in workflow
     )
+    assert (
+        "Verify the post-call action you just recorded. If its action title or details are "
+        "not exactly Send SMS $marker, edit that same action now so both match exactly. Then "
+        "read back exactly $marker."
+        in workflow
+    )
+    assert "List the actions" not in workflow
+    assert 'VOICE_DRIVER_FOLLOWUP_AFTER=45' in workflow
     assert "banana elephant pineapple" in workflow
     assert "alpha bravo charlie" not in workflow
 
