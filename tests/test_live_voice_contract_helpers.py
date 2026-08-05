@@ -26,11 +26,10 @@ def test_workflow_requires_action_first_exact_body_and_readback():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "After we hang up, send me one SMS containing these exact five words: $marker. "
-        "Create one post-call action now. Set both the action title and the action details "
-        "to this exact seven-word phrase: Send SMS $marker. Wait for the action tool to "
-        "succeed, then read the exact five-word SMS body back to me. Do not paraphrase, "
-        "omit a word, or send the SMS during the call."
+        "Create one post-call action now with both its title and details exactly: Send SMS "
+        "$marker. Then list the actions. If either field lacks that exact phrase, edit that "
+        "same action until both match. Only then read the five-word body back. After we hang "
+        "up, send one SMS containing exactly $marker. Do not send it during the call."
         in workflow
     )
 
