@@ -31,10 +31,11 @@ def test_workflow_requires_action_first_exact_body_and_readback():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "After we hang up, send me one SMS containing exactly $marker. First create one "
-        "post-call action with both its title and details exactly: Send SMS $marker. Then "
-        "list the actions and edit that same action until both fields match. Only then read "
-        "the five-word body back. Do not send it during the call."
+        "First create one open post-call action. Set its title exactly to Send SMS $marker. "
+        "Set its details exactly to Send SMS $marker. List the actions and edit that same "
+        "action until both fields contain the marker and match exactly. After we hang up, "
+        "send me exactly one SMS containing exactly $marker. Only after the action is "
+        "correct, read the five-word SMS body back. Do not send the SMS during the call."
         in workflow
     )
     assert "banana elephant pineapple" in workflow
