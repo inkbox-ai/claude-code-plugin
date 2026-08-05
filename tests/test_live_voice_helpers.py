@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-import importlib.util
 import time
-from pathlib import Path
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 
 
-def _load_live_voice_module():
-    path = Path(__file__).parent / "live" / "test_voice.py"
-    spec = importlib.util.spec_from_file_location("live_voice_helpers", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from tests import live_voice_proof as proof
 
 
 class _Calls:
@@ -33,8 +26,7 @@ class _Calls:
         return self._transcripts
 
 
-def test_wait_for_two_way_call_fails_immediately_on_canceled_leg():
-    voice = _load_live_voice_module()
+def test_agent_two_way_proof_fails_immediately_on_canceled_leg():
     remote = SimpleNamespace(calls=_Calls(
         call=SimpleNamespace(
             status="canceled", reason=None, hangup_reason="remote",
@@ -43,17 +35,15 @@ def test_wait_for_two_way_call_fails_immediately_on_canceled_leg():
         transcripts=[],
     ))
 
-    with pytest.raises(pytest.fail.Exception, match="call ended before a two-way conversation") as exc:
-        voice._wait_for_two_way_call(remote, "unused-number-id", "call-id")
+    with pytest.raises(AssertionError, match="agent leg ended before transcript proof"):
+        proof.wait_for_agent_two_way_conversation(
+            remote,
+            "call-id",
+            deadline=time.monotonic() + 1,
+            poll_every=0,
+        )
 
-    message = str(exc.value)
-    assert "status='canceled'" in message
-    assert "hangup_reason='remote'" in message
-    assert "is_blocked=False" in message
-
-
-def test_wait_for_two_way_call_returns_remote_speech_when_both_parties_spoke():
-    voice = _load_live_voice_module()
+def test_agent_two_way_proof_returns_agent_local_speech():
     segments = [
         SimpleNamespace(party="remote", text="hello"),
         SimpleNamespace(party="local", text="hi back"),
@@ -63,11 +53,29 @@ def test_wait_for_two_way_call_returns_remote_speech_when_both_parties_spoke():
         transcripts=segments,
     ))
 
-    assert voice._wait_for_two_way_call(remote, "unused-number-id", "call-id") == "hello"
+    assert proof.wait_for_agent_two_way_conversation(
+        remote,
+        "call-id",
+        deadline=time.monotonic() + 1,
+        poll_every=0,
+    ) == "hi back"
 
 
-def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unavailable():
-    voice = _load_live_voice_module()
+def test_driver_proof_requires_only_driver_local_speech():
+    remote = SimpleNamespace(calls=_Calls(
+        call=SimpleNamespace(status="answered"),
+        transcripts=[SimpleNamespace(party="local", text="scripted driver line")],
+    ))
+
+    assert proof.wait_for_driver_local_speech(
+        remote,
+        "call-id",
+        deadline=time.monotonic() + 1,
+        poll_every=0,
+    ) == "scripted driver line"
+
+
+def test_agent_two_way_proof_checks_terminal_state_when_transcript_unavailable():
     remote = SimpleNamespace(calls=_Calls(
         call=SimpleNamespace(
             status="failed", reason="upstream", hangup_reason=None,
@@ -76,15 +84,49 @@ def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unava
         transcripts=RuntimeError("404 Call not found"),
     ))
 
-    with pytest.raises(pytest.fail.Exception, match="call ended before a two-way conversation") as exc:
-        voice._wait_for_two_way_call(remote, "unused-number-id", "call-id")
+    with pytest.raises(AssertionError, match="agent leg ended before transcript proof"):
+        proof.wait_for_agent_two_way_conversation(
+            remote,
+            "call-id",
+            deadline=time.monotonic() + 1,
+            poll_every=0,
+        )
 
-    assert "transcripts not ready" in str(exc.value)
-    assert "status='failed'" in str(exc.value)
+
+def test_agent_leg_uses_pair_filter_under_agent_identity():
+    pair_id = "33333333-3333-3333-3333-333333333333"
+    driver_call = SimpleNamespace(id="driver", paired_call_id=pair_id)
+    agent_call = SimpleNamespace(id="agent", direction="inbound")
+    driver_calls = SimpleNamespace(get=lambda _call_id: driver_call)
+
+    class AgentCalls:
+        def __init__(self):
+            self.kwargs = None
+
+        def list(self, **kwargs):
+            self.kwargs = kwargs
+            return [agent_call]
+
+    agent_calls = AgentCalls()
+
+    result = proof.wait_for_agent_leg(
+        SimpleNamespace(calls=driver_calls),
+        SimpleNamespace(calls=agent_calls),
+        "driver",
+        direction="inbound",
+        driver_number="+15555550123",
+        before_agent_ids=set(),
+        started_at=datetime.now(UTC),
+        deadline=time.monotonic() + 1,
+        poll_every=0,
+    )
+
+    assert result is agent_call
+    assert agent_calls.kwargs == {"limit": 2, "paired_call_id": pair_id}
 
 
 def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
-    voice = _load_live_voice_module()
+    voice = __import__("tests.live.test_voice", fromlist=["test_voice"])
     marker = "victor echo juliet"
     remote = SimpleNamespace(calls=_Calls(
         call=SimpleNamespace(

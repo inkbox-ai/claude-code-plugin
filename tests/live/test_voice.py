@@ -11,8 +11,8 @@ workflow sets that up and selects the scenario via VOICE_SCENARIO):
                       then call.ended wakes Claude Code to perform one action.
 
 A companion driver process (voice_driver.py) bridges the driver's side of the call
-over an Inkbox tunnel and speaks one line. We then read the stored call transcript
-and assert both parties spoke — proving the agent reached the caller out loud.
+over an Inkbox tunnel and speaks one line. The driver-owned leg must preserve that
+local line; the paired agent-owned leg must preserve both parties.
 """
 
 from __future__ import annotations
@@ -25,6 +25,12 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
+
+from tests.live_voice_proof import (
+    wait_for_agent_leg,
+    wait_for_agent_two_way_conversation,
+    wait_for_driver_local_speech,
+)
 
 # The agent answers a call request by dialing back, not by texting, so these
 # driver→AUT SMS never get an SMS reply to reset the server's conversation
@@ -61,12 +67,10 @@ HOSTED_SCENARIO_TIMEOUT_S = (
     + HOSTED_DUPLICATE_GRACE_S
     + POLL_EVERY_S
 )
-TERMINAL_FAILURE_STATUSES = {"canceled", "failed"}
 # A call can end normally and still never carry a conversation - answering-machine
 # detection hanging up on the driver ends it `completed`, hangup_reason=voicemail.
 # Transcript rows can still land during teardown, so allow a short grace period
 # before giving up rather than polling a finished call for the full timeout.
-ENDED_STATUSES = {"completed"}
 ENDED_GRACE_S = float(os.environ.get("LIVE_VOICE_ENDED_GRACE", "15"))
 
 pytestmark = pytest.mark.skipif(
@@ -334,66 +338,10 @@ def _wait_for_persisted_hosted_request(
     )
 
 
-def _call_state(remote, call_id) -> tuple[str, str]:
-    """Compact current call state for progress and terminal-failure output."""
-    call = remote.calls.get(call_id)
-    status = (getattr(call, "status", "") or "").lower()
-    fields = (
-        f"status={status!r}",
-        f"reason={getattr(call, 'reason', None)!r}",
-        f"hangup_reason={getattr(call, 'hangup_reason', None)!r}",
-        f"started_at={getattr(call, 'started_at', None)!r}",
-        f"ended_at={getattr(call, 'ended_at', None)!r}",
-        f"is_blocked={getattr(call, 'is_blocked', None)!r}",
-    )
-    return status, " ".join(fields)
-
-
-def _wait_for_two_way_call(remote, number_id, call_id, *, deadline=None):
-    """Block until the call transcript shows BOTH the agent and the driver spoke."""
-    if deadline is None:
-        deadline = time.monotonic() + TIMEOUT_S
-    last = ""
-    ended_at = None
-    while time.monotonic() < deadline:
-        transcript_state = ""
-        try:
-            _all, rem, loc = _segments(remote, number_id, call_id)
-        except Exception as exc:  # transcripts may 404 until the call is set up
-            rem, loc = [], []
-            transcript_state = f"transcripts not ready: {exc!r}"
-        if not transcript_state and rem and loc:
-            agent_said = " | ".join(s.text.strip() for s in rem)
-            return agent_said  # the agent reached the caller out loud, in a two-way call
-        try:
-            status, state = _call_state(remote, call_id)
-        except Exception as exc:
-            state = f"call state unavailable: {exc!r}"
-            status = ""
-        progress = transcript_state or f"segments so far: remote={len(rem)} local={len(loc)}"
-        last = f"{progress}; {state}"
-        if status in TERMINAL_FAILURE_STATUSES:
-            pytest.fail(f"call ended before a two-way conversation ({last})")
-        if status in ENDED_STATUSES:
-            if ended_at is None:
-                ended_at = time.monotonic()
-            elif time.monotonic() - ended_at > ENDED_GRACE_S:
-                pytest.fail(f"call ended without a two-way conversation ({last})")
-        time.sleep(POLL_EVERY_S)
-    pytest.fail(f"agent never held a two-way call within {TIMEOUT_S:.0f}s ({last})")
-
-
-def _aut_speech_mode(aut, direction, driver_number):
-    """(use_inkbox_tts, use_inkbox_stt) of the agent's most recent answered call
-    in `direction` with the driver. Tells Inkbox STT/TTS (True/True) from realtime
-    (False/False), so each leg can prove it ran the speech path it claims."""
-    tail = _digits(driver_number)[-10:]
-    answered = [c for c in aut.calls.list(limit=10)
-                if (getattr(c, "direction", "") or "").lower() == direction
-                and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == tail
-                and c.use_inkbox_tts is not None]
-    assert answered, f"no answered {direction} agent call with the driver found"
-    c = answered[0]  # newest first
+def _aut_speech_mode(aut, call_id):
+    """Speech flags from the exact call leg fetched with the AUT identity."""
+    c = aut.calls.get(call_id)
+    assert c.use_inkbox_tts is not None, "agent call has not persisted speech flags"
     return c.use_inkbox_tts, c.use_inkbox_stt
 
 
@@ -426,6 +374,15 @@ def test_inbound_call_inkbox_tts_stt():
     st = _driver_state()
     remote, aut = _client(REMOTE_KEY), _client(AUT_KEY)
     aut_phone = _aut_phone(aut)
+    driver_tail = _digits(st["number"])[-10:]
+    baseline_aut = [
+        candidate
+        for candidate in aut.calls.list(limit=200)
+        if (getattr(candidate, "direction", "") or "").lower() == "inbound"
+        and _digits(getattr(candidate, "remote_phone_number", "") or "")[-10:]
+        == driver_tail
+    ]
+    started_at = datetime.now(UTC)
 
     # Place the call to the agent, handing Inkbox the driver's own media WS.
     call = remote.calls.place(
@@ -435,12 +392,37 @@ def test_inbound_call_inkbox_tts_stt():
         voicemail_detection="disabled",
     )
     try:
-        agent_said = _wait_for_two_way_call(remote, st["number_id"], call.id)
+        deadline = time.monotonic() + TIMEOUT_S
+        aut_call = wait_for_agent_leg(
+            remote,
+            aut,
+            call.id,
+            direction="inbound",
+            driver_number=st["number"],
+            before_agent_ids={candidate.id for candidate in baseline_aut},
+            started_at=started_at,
+            deadline=deadline,
+            poll_every=POLL_EVERY_S,
+        )
+        wait_for_driver_local_speech(
+            remote,
+            call.id,
+            deadline=deadline,
+            poll_every=POLL_EVERY_S,
+            ended_grace=ENDED_GRACE_S,
+        )
+        agent_said = wait_for_agent_two_way_conversation(
+            aut,
+            aut_call.id,
+            deadline=deadline,
+            poll_every=POLL_EVERY_S,
+            ended_grace=ENDED_GRACE_S,
+        )
         assert agent_said, "agent produced no speech on the inbound call"
         persisted = remote.calls.get(call.id)
         assert _voicemail_detection_value(persisted) == "disabled"
 
-        tts, stt = _aut_speech_mode(aut, "inbound", st["number"])
+        tts, stt = _aut_speech_mode(aut, aut_call.id)
         assert tts and stt, f"inbound call should run Inkbox STT/TTS, got tts={tts} stt={stt}"
     finally:
         _hangup_call(remote, call.id)
@@ -483,6 +465,7 @@ def test_outbound_call_realtime():
         ),
         default=datetime.min.replace(tzinfo=UTC),
     )
+    call_started_at = datetime.now(UTC)
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     call_id = None
@@ -511,13 +494,37 @@ def test_outbound_call_realtime():
                 _fresh_call_records(_outbound_from_aut(), before_aut, aut_watermark),
             )
         )
+        aut_call = wait_for_agent_leg(
+            remote,
+            aut,
+            call_id,
+            direction="outbound",
+            driver_number=st["number"],
+            before_agent_ids=before_aut,
+            started_at=call_started_at,
+            deadline=deadline,
+            poll_every=POLL_EVERY_S,
+        )
         persisted = aut.calls.get(aut_call.id)
         assert _voicemail_detection_value(persisted) == "disabled"
 
-        agent_said = _wait_for_two_way_call(remote, st["number_id"], call_id)
+        wait_for_driver_local_speech(
+            remote,
+            call_id,
+            deadline=deadline,
+            poll_every=POLL_EVERY_S,
+            ended_grace=ENDED_GRACE_S,
+        )
+        agent_said = wait_for_agent_two_way_conversation(
+            aut,
+            aut_call.id,
+            deadline=deadline,
+            poll_every=POLL_EVERY_S,
+            ended_grace=ENDED_GRACE_S,
+        )
         assert agent_said, "agent produced no speech on the outbound call"
 
-        tts, stt = _aut_speech_mode(aut, "outbound", st["number"])
+        tts, stt = _aut_speech_mode(aut, aut_call.id)
         assert tts is False and stt is False, \
             f"outbound call must be powered by the realtime API (Inkbox speech off), got tts={tts} stt={stt}"
     finally:
@@ -604,6 +611,7 @@ def test_outbound_call_hosted_and_post_call_wakeup():
         - HOSTED_DUPLICATE_GRACE_S
         - POLL_EVERY_S
     )
+    call_started_at = datetime.now(UTC)
     remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
 
     call_id = None
@@ -644,11 +652,30 @@ def test_outbound_call_hosted_and_post_call_wakeup():
             f"driver_created_at={driver_created_at!r} "
             f"aut_created_at={aut_created_at!r}"
         )
-        _wait_for_two_way_call(
+        placed = wait_for_agent_leg(
             remote,
-            st["number_id"],
+            aut,
+            call_id,
+            direction="outbound",
+            driver_number=st["number"],
+            before_agent_ids=before_outbound,
+            started_at=call_started_at,
+            deadline=pre_hangup_deadline,
+            poll_every=POLL_EVERY_S,
+        )
+        wait_for_driver_local_speech(
+            remote,
             call_id,
             deadline=pre_hangup_deadline,
+            poll_every=POLL_EVERY_S,
+            ended_grace=ENDED_GRACE_S,
+        )
+        wait_for_agent_two_way_conversation(
+            aut,
+            placed.id,
+            deadline=pre_hangup_deadline,
+            poll_every=POLL_EVERY_S,
+            ended_grace=ENDED_GRACE_S,
         )
 
         # A phone call has two independently handled legs. The driver's inbound
