@@ -22,6 +22,11 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
+def test_voice_driver_allows_realtime_response_latency():
+    driver = (Path(__file__).parent / "live/voice_driver.py").read_text()
+    assert 'VOICE_DRIVER_LISTEN", "30"' in driver
+
+
 def test_workflow_requires_action_first_exact_body_and_readback():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 

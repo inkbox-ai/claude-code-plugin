@@ -55,7 +55,7 @@ GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
-LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
+LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "30"))
 
 app = FastAPI()
 
