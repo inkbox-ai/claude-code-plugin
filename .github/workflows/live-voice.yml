@@ -86,26 +86,24 @@ jobs:
             echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"
           elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
-            # The marker crosses TTS -> PSTN -> STT. Use ordinary phonetic
-            # words instead of punctuation and long digit strings so the live
-            # assertion proves the current request without depending on exact
-            # ASR formatting.
-            RADIO_WORDS=(
-              alpha bravo charlie delta echo foxtrot golf hotel india juliet
-              kilo lima mike november oscar papa quebec romeo sierra tango
-              uniform victor whiskey xray yankee zulu
+            # The marker crosses TTS -> PSTN -> STT. Use longer everyday words
+            # instead of short radio codes, punctuation, or digit strings.
+            SPEECH_WORDS=(
+              banana elephant pineapple alligator motorcycle umbrella dinosaur
+              potato computer volcano airplane butterfly kangaroo octopus
+              calendar chocolate hospital library sandwich telescope
             )
             marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
             marker=""
             for _ in 1 2 3 4 5; do
-              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
-              marker="${marker:+$marker }${RADIO_WORDS[$marker_index]}"
-              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
+              marker_index=$((marker_value % ${#SPEECH_WORDS[@]}))
+              marker="${marker:+$marker }${SPEECH_WORDS[$marker_index]}"
+              marker_value=$((marker_value / ${#SPEECH_WORDS[@]}))
             done
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER=$marker" >> "$GITHUB_ENV"
-            echo "VOICE_DRIVER_LINE=Create one post-call action now with both its title and details exactly: Send SMS $marker. Then list the actions. If either field lacks that exact phrase, edit that same action until both match. Only then read the five-word body back. After we hang up, send me one SMS containing exactly $marker. Do not send it during the call." >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_LINE=After we hang up, send me one SMS containing exactly $marker. First create one post-call action with both its title and details exactly: Send SMS $marker. Then list the actions and edit that same action until both fields match. Only then read the five-word body back. Do not send it during the call." >> "$GITHUB_ENV"
             # Keep the media peer alive while the test waits for Voice AI to
             # persist the open post-call action, then let the test hang up.
             echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"

@@ -31,12 +31,14 @@ def test_workflow_requires_action_first_exact_body_and_readback():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "Create one post-call action now with both its title and details exactly: Send SMS "
-        "$marker. Then list the actions. If either field lacks that exact phrase, edit that "
-        "same action until both match. Only then read the five-word body back. After we hang "
-        "up, send me one SMS containing exactly $marker. Do not send it during the call."
+        "After we hang up, send me one SMS containing exactly $marker. First create one "
+        "post-call action with both its title and details exactly: Send SMS $marker. Then "
+        "list the actions and edit that same action until both fields match. Only then read "
+        "the five-word body back. Do not send it during the call."
         in workflow
     )
+    assert "banana elephant pineapple" in workflow
+    assert "alpha bravo charlie" not in workflow
 
 
 def test_spoken_marker_normalizes_punctuation_and_case():
