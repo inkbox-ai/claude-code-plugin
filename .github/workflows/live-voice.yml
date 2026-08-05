@@ -105,7 +105,7 @@ jobs:
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER=$marker" >> "$GITHUB_ENV"
-            echo "VOICE_DRIVER_LINE=Create one post-call action now with both its title and details exactly: Send SMS $marker. Then list the actions. If either field lacks that exact phrase, edit that same action until both match. Only then read the five-word body back. After we hang up, send one SMS containing exactly $marker. Do not send it during the call." >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_LINE=Create one post-call action now with both its title and details exactly: Send SMS $marker. Then list the actions. If either field lacks that exact phrase, edit that same action until both match. Only then read the five-word body back. After we hang up, send me one SMS containing exactly $marker. Do not send it during the call." >> "$GITHUB_ENV"
             # Keep the media peer alive while the test waits for Voice AI to
             # persist the open post-call action, then let the test hang up.
             echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"

@@ -29,7 +29,7 @@ def test_workflow_requires_action_first_exact_body_and_readback():
         "Create one post-call action now with both its title and details exactly: Send SMS "
         "$marker. Then list the actions. If either field lacks that exact phrase, edit that "
         "same action until both match. Only then read the five-word body back. After we hang "
-        "up, send one SMS containing exactly $marker. Do not send it during the call."
+        "up, send me one SMS containing exactly $marker. Do not send it during the call."
         in workflow
     )
 
