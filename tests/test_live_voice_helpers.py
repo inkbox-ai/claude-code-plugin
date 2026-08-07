@@ -49,10 +49,10 @@ def test_wait_for_two_way_call_fails_immediately_on_canceled_leg():
     message = str(exc.value)
     assert "status='canceled'" in message
     assert "hangup_reason='remote'" in message
-    assert "is_blocked=False" in message
+    assert " reason=" not in message
 
 
-def test_wait_for_two_way_call_returns_remote_speech_when_both_parties_spoke():
+def test_wait_for_two_way_call_returns_aut_local_speech_when_both_parties_spoke():
     voice = _load_live_voice_module()
     segments = [
         SimpleNamespace(party="remote", text="hello"),
@@ -63,7 +63,22 @@ def test_wait_for_two_way_call_returns_remote_speech_when_both_parties_spoke():
         transcripts=segments,
     ))
 
-    assert voice._wait_for_two_way_call(remote, "unused-number-id", "call-id") == "hello"
+    assert voice._wait_for_two_way_call(remote, "unused-number-id", "call-id") == "hi back"
+
+
+def test_driver_leg_requires_only_driver_local_speech():
+    voice = _load_live_voice_module()
+    remote = SimpleNamespace(calls=_Calls(
+        call=SimpleNamespace(status="answered"),
+        transcripts=[SimpleNamespace(party="local", text="scripted caller line")],
+    ))
+
+    assert voice._wait_for_driver_local_speech(
+        remote,
+        "unused-number-id",
+        "call-id",
+        deadline=time.monotonic() + 1,
+    ) == "scripted caller line"
 
 
 def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unavailable():

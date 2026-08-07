@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,17 +23,20 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
-def test_workflow_requires_action_first_exact_body_and_readback():
+def test_workflow_requires_three_word_action_body_and_readback():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "After we hang up, send me one SMS containing these exact five words: $marker. "
-        "Create one post-call action now. Set both the action title and the action details "
-        "to this exact seven-word phrase: Send SMS $marker. Wait for the action tool to "
-        "succeed, then read the exact five-word SMS body back to me. Do not paraphrase, "
-        "omit a word, or send the SMS during the call."
+        "After we hang up, send me one SMS with this exact three-word body: $marker. "
+        "Record that post-call SMS action now. Once the action tool succeeds, read the "
+        "exact three words back to me. Do not send the SMS during the call."
         in workflow
     )
+    assert "Upload logs on failure" not in workflow
+    assert "Dump logs on failure" not in workflow
+    assert "candidates={current_candidates" not in (
+        Path(__file__).parent / "live" / "test_voice.py"
+    ).read_text()
 
 
 def test_spoken_marker_normalizes_punctuation_and_case():
@@ -75,7 +79,7 @@ def test_voicemail_detection_value_accepts_sdk_enum_or_wire_string():
     ) == "disabled"
 
 
-def test_call_pair_correlation_keeps_driver_and_aut_ownership():
+def test_call_pair_correlation_keeps_driver_and_aut_ownership(monkeypatch):
     stamp = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
     driver = SimpleNamespace(
         id="driver-1", created_at=stamp, voicemail_detection="enabled"
@@ -84,17 +88,20 @@ def test_call_pair_correlation_keeps_driver_and_aut_ownership():
         id="aut-1", created_at=stamp, voicemail_detection="disabled"
     )
 
-    assert voice._correlate_fresh_call_pair(
-        [driver],
-        [aut],
-        before_driver=set(),
-        before_aut=set(),
-        driver_watermark=stamp,
-        aut_watermark=stamp,
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+
+    assert voice._wait_for_fresh_call_pair(
+        lambda: [driver],
+        lambda: [aut],
+        set(),
+        set(),
+        not_before=stamp,
+        deadline=time.monotonic() + 1,
+        label="test",
     ) == (driver, aut)
 
 
-def test_call_pair_duplicate_diagnostic_names_owner_and_ids():
+def test_call_pair_duplicate_diagnostic_names_owner(monkeypatch):
     stamp = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
     driver = SimpleNamespace(id="driver-1", created_at=stamp)
     aut = [
@@ -102,18 +109,83 @@ def test_call_pair_duplicate_diagnostic_names_owner_and_ids():
         SimpleNamespace(id="aut-2", created_at=stamp),
     ]
 
-    with pytest.raises(
-        AssertionError,
-        match=r"phase=call_pairing .*aut-1.*aut-2.*duplicate AUT legs",
-    ):
-        voice._correlate_fresh_call_pair(
-            [driver],
-            aut,
-            before_driver=set(),
-            before_aut=set(),
-            driver_watermark=stamp,
-            aut_watermark=stamp,
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+
+    with pytest.raises(AssertionError, match="test created duplicate AUT records"):
+        voice._wait_for_fresh_call_pair(
+            lambda: [driver],
+            lambda: aut,
+            set(),
+            set(),
+            not_before=stamp,
+            deadline=time.monotonic() + 1,
+            label="test",
         )
+
+
+def test_delayed_old_call_is_ignored_after_snapshot(monkeypatch):
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    old = SimpleNamespace(id="old", created_at=now - timedelta(minutes=2))
+    driver = SimpleNamespace(id="driver", created_at=now)
+    aut = SimpleNamespace(id="aut", created_at=now + timedelta(seconds=1))
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+
+    assert voice._wait_for_fresh_call_pair(
+        lambda: [old, driver],
+        lambda: [aut],
+        set(),
+        set(),
+        not_before=now - timedelta(seconds=10),
+        deadline=time.monotonic() + 1,
+        label="test",
+    ) == (driver, aut)
+
+
+def test_fresh_call_cleanup_ends_every_post_baseline_record(monkeypatch):
+    calls = [
+        SimpleNamespace(id="baseline"),
+        SimpleNamespace(id="current-1"),
+        SimpleNamespace(id="current-2"),
+    ]
+    ended = []
+    monkeypatch.setattr(voice, "_hangup_call", lambda _client, call_id: ended.append(call_id))
+
+    voice._hangup_fresh_calls(
+        SimpleNamespace(), lambda: calls, {"baseline"}
+    )
+
+    assert ended == ["current-1", "current-2"]
+
+
+def test_pre_sweep_ends_active_calls_and_preserves_terminal_history(monkeypatch):
+    active = SimpleNamespace(id="active", status="answered")
+    terminal = SimpleNamespace(id="terminal", status="completed")
+    statuses = {"active": active, "terminal": terminal}
+    ended = []
+
+    def hangup(_client, call_id):
+        ended.append(call_id)
+        statuses[call_id].status = "completed"
+
+    client = SimpleNamespace(
+        calls=SimpleNamespace(get=lambda call_id: statuses[call_id])
+    )
+    monkeypatch.setattr(voice, "_hangup_call", hangup)
+
+    voice._sweep_matching_calls(client, lambda: [active, terminal])
+
+    assert ended == ["active"]
+
+
+def test_aut_speech_mode_reads_the_exact_call_id():
+    seen = []
+    aut = SimpleNamespace(calls=SimpleNamespace(get=lambda call_id: (
+        seen.append(call_id)
+        or SimpleNamespace(use_inkbox_tts=False, use_inkbox_stt=False)
+    )))
+
+    assert voice._aut_speech_mode(aut, "aut-current") == (False, False)
+    assert seen == ["aut-current"]
 
 
 def test_matching_post_call_action_requires_open_current_marker_sms():

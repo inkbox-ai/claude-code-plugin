@@ -27,13 +27,13 @@ jobs:
 
       - name: Install bridge + latest SDK
         run: |
-          pip install \
+          tests/ci/retry_install.sh pip install \
             "inkbox==0.5.9" \
             -e . pytest
-          pip install -U claude-agent-sdk
+          tests/ci/retry_install.sh pip install -U claude-agent-sdk
 
       - name: Install latest Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
+        run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
 
       # Re-run the complete offline suite twice daily against the newest SDK
       # and CLI. Live tests self-skip here and are run by Full stack e2e after

@@ -65,12 +65,12 @@ jobs:
 
       - name: Install bridge
         run: |
-          pip install \
+          tests/ci/retry_install.sh pip install \
             "inkbox==0.5.9" \
             -e . pytest
 
       - name: Install Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
+        run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
 
       - name: Derive AUT identity handle
         run: |
@@ -82,7 +82,6 @@ jobs:
           PY
           )
           echo "INKBOX_IDENTITY=$HANDLE" >> "$GITHUB_ENV"
-          echo "AUT handle: $HANDLE"
 
       # Per-run GitHub webhook secret: shared by the bridge (to verify
       # X-Hub-Signature-256) and the test (to sign). Generated fresh each run
@@ -102,11 +101,11 @@ jobs:
               echo "gateway ready"; exit 0
             fi
             if ! kill -0 "$(cat /tmp/gateway.pid)" 2>/dev/null; then
-              echo "gateway process died during startup"; tail -n 150 /tmp/gateway.log; exit 1
+              echo "gateway process died during startup"; exit 1
             fi
             sleep 5
           done
-          echo "gateway never became ready"; tail -n 150 /tmp/gateway.log; exit 1
+          echo "gateway never became ready"; exit 1
 
       # Signed model turn + GitHub HMAC acceptance/rejection.
       - name: Live external-event tests
@@ -120,20 +119,6 @@ jobs:
           python3 -m pytest
           tests/live/test_external_event_intelligence.py
           tests/live/test_external_event_github.py -v
-
-      # Logs can carry live agent content — surface them only when needed.
-      - name: Dump logs on failure
-        if: failure()
-        run: |
-          echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: live-external-events-logs
-          path: /tmp/gateway.log
-          if-no-files-found: ignore
 
       - name: Stop bridge gateway
         if: always()

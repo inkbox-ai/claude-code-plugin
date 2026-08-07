@@ -65,10 +65,10 @@ jobs:
           node-version: 22
 
       - name: Install bridge and protocol driver
-        run: pip install -e .
+        run: tests/ci/retry_install.sh pip install -e .
 
       - name: Install Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
+        run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
 
       - name: Configure the real model and AUT identity
         env:
@@ -108,10 +108,6 @@ jobs:
           AUT_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
         run: python3 tests/live/a2a_driver.py
-
-      - name: Dump gateway log on failure
-        if: failure()
-        run: tail -n 300 "$RUNNER_TEMP/gateway.log" 2>/dev/null || true
 
       - name: Stop bridge gateway
         if: always()

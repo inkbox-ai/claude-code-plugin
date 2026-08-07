@@ -59,12 +59,12 @@ jobs:
       # upgrades, and the driver's call-media endpoint is a WebSocket.
       - name: Install bridge + driver deps
         run: |
-          pip install \
+          tests/ci/retry_install.sh pip install \
             "inkbox==0.5.9" \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
+        run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
 
       - name: Derive AUT identity handle
         run: |
@@ -76,7 +76,6 @@ jobs:
           PY
           )
           echo "INKBOX_IDENTITY=$HANDLE" >> "$GITHUB_ENV"
-          echo "AUT handle: $HANDLE"
 
       - name: Configure speech mode (${{ matrix.scenario }})
         run: |
@@ -86,26 +85,16 @@ jobs:
             echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"
           elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
-            # The marker crosses TTS -> PSTN -> STT. Use ordinary phonetic
-            # words instead of punctuation and long digit strings so the live
-            # assertion proves the current request without depending on exact
-            # ASR formatting.
-            RADIO_WORDS=(
-              alpha bravo charlie delta echo foxtrot golf hotel india juliet
-              kilo lima mike november oscar papa quebec romeo sierra tango
-              uniform victor whiskey xray yankee zulu
-            )
-            marker_value=$((GITHUB_RUN_ID * 10 + GITHUB_RUN_ATTEMPT))
-            marker=""
-            for _ in 1 2 3 4 5; do
-              marker_index=$((marker_value % ${#RADIO_WORDS[@]}))
-              marker="${marker:+$marker }${RADIO_WORDS[$marker_index]}"
-              marker_value=$((marker_value / ${#RADIO_WORDS[@]}))
-            done
+            RUN_TOKEN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            marker="$(python3 tests/live/voice_marker.py "$RUN_TOKEN")"
+            marker_file="$RUNNER_TEMP/hosted_marker.txt"
+            driver_line_file="$RUNNER_TEMP/voice_driver_line.txt"
+            printf '%s' "$marker" > "$marker_file"
+            printf '%s' "After we hang up, send me one SMS with this exact three-word body: $marker. Record that post-call SMS action now. Once the action tool succeeds, read the exact three words back to me. Do not send the SMS during the call." > "$driver_line_file"
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
-            echo "HOSTED_POST_CALL_MARKER=$marker" >> "$GITHUB_ENV"
-            echo "VOICE_DRIVER_LINE=After we hang up, send me one SMS containing these exact five words: $marker. Create one post-call action now. Set both the action title and the action details to this exact seven-word phrase: Send SMS $marker. Wait for the action tool to succeed, then read the exact five-word SMS body back to me. Do not paraphrase, omit a word, or send the SMS during the call." >> "$GITHUB_ENV"
+            echo "HOSTED_POST_CALL_MARKER_FILE=$marker_file" >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_LINE_FILE=$driver_line_file" >> "$GITHUB_ENV"
             # Keep the media peer alive while the test waits for Voice AI to
             # persist the open post-call action, then let the test hang up.
             echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"
@@ -123,11 +112,11 @@ jobs:
           for i in $(seq 1 30); do
             [ -f "$VOICE_DRIVER_STATE" ] && { echo "driver ready"; exit 0; }
             if ! kill -0 "$(cat /tmp/voice_driver.pid)" 2>/dev/null; then
-              echo "voice driver died during startup"; tail -n 100 /tmp/voice_driver.log; exit 1
+              echo "voice driver died during startup"; exit 1
             fi
             sleep 3
           done
-          echo "voice driver never became ready"; tail -n 100 /tmp/voice_driver.log; exit 1
+          echo "voice driver never became ready"; exit 1
 
       - name: Start bridge gateway
         run: |
@@ -138,11 +127,11 @@ jobs:
               echo "gateway ready"; exit 0
             fi
             if ! kill -0 "$(cat /tmp/gateway.pid)" 2>/dev/null; then
-              echo "gateway process died during startup"; tail -n 150 /tmp/gateway.log; exit 1
+              echo "gateway process died during startup"; exit 1
             fi
             sleep 5
           done
-          echo "gateway never became ready"; tail -n 150 /tmp/gateway.log; exit 1
+          echo "gateway never became ready"; exit 1
 
       - name: Live voice test (${{ matrix.scenario }})
         env:
@@ -152,23 +141,6 @@ jobs:
           LIVE_REAL_MODEL: "1"
           GATEWAY_LOG: /tmp/gateway.log
         run: python3 -m pytest tests/live/test_voice.py -v
-
-      # Logs can carry live call transcripts — surface them only when needed.
-      - name: Dump logs on failure
-        if: failure() || cancelled()
-        run: |
-          echo "=== gateway.log ==="; tail -n 300 /tmp/gateway.log 2>/dev/null || true
-          echo "=== voice_driver.log ==="; tail -n 150 /tmp/voice_driver.log 2>/dev/null || true
-
-      - name: Upload logs on failure
-        if: failure() || cancelled()
-        uses: actions/upload-artifact@v7
-        with:
-          name: live-voice-${{ matrix.scenario }}-logs
-          path: |
-            /tmp/gateway.log
-            /tmp/voice_driver.log
-          if-no-files-found: ignore
 
       # Driver first (SIGINT so its cleanup reverts the number's auto-accept),
       # then a beat for the revert to land, then the gateway.

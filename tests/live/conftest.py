@@ -92,16 +92,22 @@ def _hang_up_owned_call(client, call) -> str | None:
         try:
             current = client.calls.get(call_id)
         except Exception as get_exc:
-            return f"hangup={exc!r}; get={get_exc!r}"
+            return (
+                f"hangup_error={type(exc).__name__}; "
+                f"get_error={type(get_exc).__name__}"
+            )
         if _call_status(current) in _ENDED_CALL_STATUSES:
             return None
-        return f"hangup={exc!r}; status={_call_status(current)!r}"
+        return (
+            f"hangup_error={type(exc).__name__}; "
+            f"status={_call_status(current)!r}"
+        )
 
 
 def _finish_new_calls(client, local_phone: str, baseline: set[str]) -> None:
     """Hang up and verify every call created by this pytest session."""
     deadline = time.monotonic() + 12
-    last_errors: dict[str, str] = {}
+    last_errors: list[str] = []
     while True:
         current = _owned_calls(client, local_phone)
         live = {
@@ -114,12 +120,13 @@ def _finish_new_calls(client, local_phone: str, baseline: set[str]) -> None:
         for call_id, call in live.items():
             error = _hang_up_owned_call(client, call)
             if error:
-                last_errors[call_id] = error
+                last_errors.append(error)
         if time.monotonic() >= deadline:
-            states = {call_id: _call_status(call) for call_id, call in live.items()}
+            states = [_call_status(call) for call in live.values()]
             raise RuntimeError(
                 f"live-test calls remained active after API cleanup: "
-                f"states={states!r} errors={last_errors!r}"
+                f"active_count={len(live)} statuses={sorted(set(states))!r} "
+                f"error_count={len(last_errors)} errors={sorted(set(last_errors))!r}"
             )
         time.sleep(0.5)
 
