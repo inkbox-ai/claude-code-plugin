@@ -133,9 +133,10 @@ def test_forged_github_signature_is_rejected_before_agent_wakes():
     marker = _session_marker(envelope)
 
     status, body = _post_github_event(envelope, signature="sha256=deadbeef")
-    assert status == 401, f"forged signature should be rejected, got {status} {body!r}"
+    assert status == 401, f"forged signature should be rejected (status={status})"
     time.sleep(2)
-    assert marker not in _gateway_log(), "forged GitHub event unexpectedly woke an agent session"
+    session_started = marker in _gateway_log()
+    assert not session_started, "forged GitHub event unexpectedly woke an agent session"
 
 
 def test_valid_github_signature_wakes_agent_session():
@@ -144,7 +145,15 @@ def test_valid_github_signature_wakes_agent_session():
     marker = _session_marker(envelope)
 
     status, body = _post_github_event(envelope, secret=GITHUB_SECRET)
-    assert status == 200 and json.loads(body).get("ok") is True, \
-        f"valid webhook not accepted: {status} {body!r}"
-    assert _wait_for_log(marker, SESSION_START_TIMEOUT_S), \
-        f"valid GitHub webhook never started the expected session: {marker}"
+    try:
+        response_ok = json.loads(body).get("ok") is True
+    except json.JSONDecodeError:
+        response_ok = False
+    accepted = status == 200 and response_ok
+    assert accepted, (
+        f"valid webhook not accepted (status={status})"
+    )
+    session_started = _wait_for_log(marker, SESSION_START_TIMEOUT_S)
+    assert session_started, (
+        "valid webhook never started the expected session"
+    )

@@ -88,7 +88,8 @@ def xc():
     aut_email = aut.mailboxes.list()[0].email_address
     rnums = remote.phone_numbers.list()
     anums = aut.phone_numbers.list()
-    assert rnums and anums, "both identities need a phone number for cross-channel"
+    have_both_numbers = bool(rnums and anums)
+    assert have_both_numbers, "both identities need a phone number for cross-channel"
     remote_number = rnums[0]
     remote_phone, remote_pid = remote_number.number, str(remote_number.id)
     aut_phone = anums[0].number
@@ -157,7 +158,9 @@ def test_email_request_gets_sms_response(xc):
             if m.id not in before and token in (getattr(m, "text", "") or "").lower():
                 return  # cross-channel confirmed: email request -> SMS response with the token
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"agent did not send an SMS containing {token!r} within {TIMEOUT_S:.0f}s")
+    pytest.fail(
+        f"agent did not send an SMS with the current marker within {TIMEOUT_S:.0f}s"
+    )
 
 
 def test_sms_request_gets_email_response(xc):
@@ -186,7 +189,9 @@ def test_sms_request_gets_email_response(xc):
             if token in hay:
                 return  # cross-channel confirmed: SMS request -> email response with the token
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"agent did not send an email containing {token!r} within {TIMEOUT_S:.0f}s")
+    pytest.fail(
+        f"agent did not send an email with the current marker within {TIMEOUT_S:.0f}s"
+    )
 
 
 def _inbound_calls_from_aut(remote, remote_pid: str, aut_phone: str):
@@ -239,8 +244,12 @@ def _wait_for_new_call_pair(
             before_aut,
             aut_watermark,
         )
-        assert len(driver_calls) <= 1, f"duplicate driver call legs: {driver_calls!r}"
-        assert len(aut_calls) <= 1, f"duplicate AUT call legs: {aut_calls!r}"
+        assert len(driver_calls) <= 1, (
+            f"duplicate driver call records (count={len(driver_calls)})"
+        )
+        assert len(aut_calls) <= 1, (
+            f"duplicate AUT call records (count={len(aut_calls)})"
+        )
         if driver_calls and aut_calls:
             driver_created = _record_created_at(driver_calls[0])
             aut_created = _record_created_at(aut_calls[0])
@@ -264,8 +273,12 @@ def _wait_for_new_call_pair(
         before_aut,
         aut_watermark,
     )
-    assert len(driver_calls) == 1, f"expected one fresh driver leg, got {driver_calls!r}"
-    assert len(aut_calls) == 1, f"expected one fresh AUT leg, got {aut_calls!r}"
+    assert len(driver_calls) == 1, (
+        f"expected one fresh driver record (count={len(driver_calls)})"
+    )
+    assert len(aut_calls) == 1, (
+        f"expected one fresh AUT record (count={len(aut_calls)})"
+    )
     return aut_calls[0]
 
 

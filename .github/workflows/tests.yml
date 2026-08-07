@@ -23,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test deps
-        run: pip install pytest aiohttp segno claude-agent-sdk
+        run: tests/ci/retry_install.sh pip install pytest aiohttp segno claude-agent-sdk
 
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.
@@ -54,13 +54,13 @@ jobs:
 
       - name: Install bridge + latest SDK
         run: |
-          uv pip install --system \
+          tests/ci/retry_install.sh uv pip install --system \
             "inkbox==0.5.9" \
             -e . pytest
-          uv pip install --system -U claude-agent-sdk
+          tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 
       - name: Install latest Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
+        run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
 
       - name: Contract tests vs latest host
         run: pytest -q tests/contract

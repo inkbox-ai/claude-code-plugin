@@ -127,10 +127,13 @@ def _wait_new_inbound(sms, before: set, timeout_s: float, context: str) -> str:
             if m.id not in before:
                 body = getattr(m, "text", "") or ""
                 bad = [x for x in ERROR_MARKERS if x in body.lower()]
-                assert not bad, f"SMS reply is an error, not a real answer: {bad}\n{body[:200]}"
+                assert not bad, (
+                    "SMS reply is an error, not a real answer "
+                    f"(matched_error_count={len(bad)})"
+                )
                 return body.lower()
         time.sleep(POLL_EVERY_S)
-    pytest.fail(f"no SMS reply within {timeout_s:.0f}s to: {context}")
+    pytest.fail(f"no SMS reply within {timeout_s:.0f}s ({context})")
 
 
 def _diversify(text: str) -> str:
@@ -151,7 +154,7 @@ def _ask_sms(sms, text: str, timeout_s: float = TIMEOUT_S) -> str:
     remote, aut_phone, pid = sms["remote"], sms["aut_phone"], sms["remote_pid"]
     before = _settle_inbound(sms)
     remote.texts.send(pid, to=aut_phone, text=_diversify(text))
-    return _wait_new_inbound(sms, before, timeout_s, repr(text))
+    return _wait_new_inbound(sms, before, timeout_s, "request did not complete")
 
 
 def _ask_sms_besteffort(sms, text: str, timeout_s: float) -> str | None:
@@ -190,7 +193,8 @@ def _gateway_log_size() -> int:
 @mock_only
 def test_sms_reachability(sms):
     body = _ask_sms(sms, "ping")
-    assert "reply_ok" in body, f"mock reachability: missing REPLY_OK marker\n{body[:200]}"
+    marker_present = "reply_ok" in body
+    assert marker_present, "mock reachability reply is missing its marker"
 
 
 @real_only
@@ -203,7 +207,8 @@ def test_sms_basic_reply(sms):
 def test_sms_reports_own_identity(sms):
     aut_email = sms["aut"].mailboxes.list()[0].email_address
     body = _ask_sms(sms, "Reply with just your Inkbox email address and phone number — short.")
-    assert aut_email in body, f"reply missing email {aut_email!r}\n{body[:200]}"
+    email_present = aut_email in body
+    assert email_present, "reply missing the expected email"
 
 
 @real_only
@@ -216,7 +221,8 @@ def test_sms_reports_sender_details(sms):
     name = (getattr(matches[0], "preferred_name", None) or getattr(matches[0], "given_name", None) or "")
     body = _ask_sms(sms, "Who am I to you? Tell me what you have on file about me.")
     if name:
-        assert name.lower() in body, f"reply missing sender name {name!r}\n{body[:200]}"
+        name_present = name.lower() in body
+        assert name_present, "reply missing the expected sender name"
 
 
 @real_only
@@ -224,7 +230,7 @@ def test_sms_aware_of_inkbox_tools(sms):
     tool_names = _plugin_tool_names()
     body = _ask_sms(sms, "Name three of your Inkbox tools (exact names).")
     hits = [t for t in tool_names if t.lower() in body]
-    assert len(hits) >= 2, f"agent named only {hits} of its tools\n{body[:300]}"
+    assert len(hits) >= 2, f"agent named too few tools (matched_count={len(hits)})"
 
 
 # ── Outbound delivery-failure retry loop ────────────────────────────────
@@ -271,10 +277,12 @@ def _inject_inkbox_webhook(envelope: dict) -> int:
 def _assert_wake_logged(log_offset: int, stage: str) -> None:
     """Require the retry loop's gateway-log fingerprint past ``log_offset``."""
     log = _gateway_log_since(log_offset)
-    assert "Woke agent about failed outbound sms" in log, (
+    wake_present = "Woke agent about failed outbound sms" in log
+    stage_present = f"stage={stage}" in log
+    assert wake_present, (
         "no delivery-failure wake-up in the gateway log — retry loop did not run"
     )
-    assert f"stage={stage}" in log
+    assert stage_present, "delivery-failure wake-up has the wrong stage"
 
 
 def _assert_internal_block_surfaced(log_offset: int) -> None:
@@ -336,7 +344,10 @@ def test_sms_retry_after_carrier_delivery_failure(sms):
                 if conversation_id:
                     break
     except Exception as exc:
-        print(f"note: conversation-id lookup failed ({exc!r}); injecting without one")
+        print(
+            "note: conversation lookup unavailable; continuing without it "
+            f"(error_type={type(exc).__name__})"
+        )
 
     log_offset = _gateway_log_size()
     before = _settle_inbound(sms)
@@ -414,14 +425,12 @@ def test_sms_retry_after_internal_spam_block(sms):
     # Best-effort: a reply may or may not come (the request can't be satisfied
     # as literally asked). Its arrival is a bonus signal, not the assertion —
     # the loop-engaged check below is authoritative.
-    body = _ask_sms_besteffort(
+    _ask_sms_besteffort(
         sms,
         "Fun formatting test: reply with ONE short message that contains at "
         "least three different emojis of your choice. Just send it, no questions.",
         timeout_s=RETRY_TIMEOUT_S,
     )
-    print(f"note: compliant follow-up {'delivered' if body and body.strip() else 'not received (acceptable)'}")
-
     # Authoritative: the block reached the agent — the retry loop engaged.
     assert GATEWAY_LOG, "GATEWAY_LOG must be wired for this test to observe the loop"
     _assert_internal_block_surfaced(log_offset)

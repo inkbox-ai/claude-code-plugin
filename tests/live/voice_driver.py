@@ -43,9 +43,14 @@ API_KEY = os.environ["REMOTE_INKBOX_API_KEY"]
 BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 PORT = int(os.environ.get("VOICE_DRIVER_PORT", "8090"))
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
-LINE = os.environ.get(
-    "VOICE_DRIVER_LINE",
-    "Hi, this is a quick test call. Please reply out loud with one short sentence, then say goodbye.",
+LINE_FILE = os.environ.get("VOICE_DRIVER_LINE_FILE", "")
+LINE = (
+    Path(LINE_FILE).read_text(encoding="utf-8").strip()
+    if LINE_FILE
+    else os.environ.get(
+        "VOICE_DRIVER_LINE",
+        "Hi, this is a quick test call. Please reply out loud with one short sentence, then say goodbye.",
+    )
 )
 # Answering-machine detection scores whoever answers: a greeting longer than the
 # carrier's `greeting_duration_millis` (3.5s) reads as a voicemail announcement
