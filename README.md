@@ -40,19 +40,26 @@ Flags: `--start` (launch the background gateway when done), `--no-setup` (instal
 
 ### Bootstrap an existing identity without prompts
 
-For unattended agent setup, install without opening the wizard and pass the API key through the environment (or standard input), never a command-line argument:
+An agent can configure an identity that a human has already assigned without opening the interactive wizard. Start from a trusted checkout, confirm its origin and current changes, and inspect `install.sh` before running the repository installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inkbox-ai/claude-code-plugin/main/install.sh | bash -s -- --no-setup
-export INKBOX_API_KEY="ApiKey_..."
-inkbox-claude bootstrap --identity my-agent --project-dir "$PWD" \
+./install.sh --no-setup
+```
+
+Provide the assigned credential through a private runtime mechanism as `INKBOX_API_KEY` (or use `--api-key-stdin`); never put it in a command argument, source control, a project file, or agent instructions. Direct saved configuration to the private per-user bridge state, then run the complete bootstrap command, replacing `<handle>` and `<url>` with the assigned identity and service URL:
+
+```bash
+export INKBOX_CLAUDE_ENV_FILE="$HOME/.inkbox-claude/.env"
+inkbox-claude bootstrap --identity '<handle>' --base-url '<url>' --project-dir "$PWD" \
   --voice-ai --rotate-signing-key --start-gateway
 unset INKBOX_API_KEY
 ```
 
-`bootstrap` validates that the key can access exactly the requested identity, scopes down an admin key before saving it, preserves existing Voice AI settings, and starts or restarts the detached gateway. Signing-key replacement is opt-in because it transfers verified webhook delivery away from any gateway using the previous key. The command prints a secret-redacted JSON result and is safe to resume.
+Keep the assigned handle unchanged; do not create or select another identity during this flow. `bootstrap` validates that the key can access exactly that identity, scopes down an admin key before saving it to the local bridge configuration, preserves existing Voice AI settings, and starts or restarts the detached gateway. Signing-key replacement transfers verified webhook delivery away from any gateway using the previous key, so that gateway must be set up again before it can receive events.
 
-Check it any time:
+The command is non-interactive, prints a secret-redacted JSON result, and is safe to resume. If `status` is `requires_human`, show the human every entry in `human_actions`, wait for them to complete the requested action, and rerun the same bootstrap command. If `status` is `error`, use the reported error and `inkbox-claude doctor` to diagnose the credential, identity, service URL, Claude Code authentication, or local configuration; correct the cause and retry the same command. Do not switch to a new identity or a separate setup flow. Remove `INKBOX_API_KEY` from the temporary environment after each attempt.
+
+After bootstrap returns `configured`, verify the installation:
 
 ```bash
 inkbox-claude doctor    # config, SDKs, claude CLI, identity reachability
