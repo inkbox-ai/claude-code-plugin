@@ -908,6 +908,14 @@ class InkboxGateway:
 
     def _patch_identity_objects(self) -> None:
         """Point the identity's mailbox/phone/iMessage events at this server."""
+        if self.cfg.skip_webhook_reconcile:
+            logger.info(
+                "[bridge] leaving webhook subscriptions alone; expecting them "
+                "to already deliver to %s%s",
+                self._public_url, DEFAULT_WEBHOOK_PATH,
+            )
+            return
+
         webhook_url = f"{self._public_url}{DEFAULT_WEBHOOK_PATH}"
         ws_url = f"wss://{self._public_host}{INKBOX_WS_PATH}"
         identity = self._inkbox.get_identity(self.cfg.identity)
