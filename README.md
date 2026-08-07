@@ -244,6 +244,7 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 | `CLAUDE_PROJECT_DIR` | yes | cwd | Directory Claude Code works in. |
 | `CLAUDE_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
+| `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
 | `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised/unverified external webhooks (see [External webhooks](#external-webhooks)). |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Include matched-contact memories as background context for human conversations and calls. |
 | `INKBOX_WEBHOOK_SECRET_<NAME>` | per source | - | Verification secret for a registered third-party webhook source (e.g. `INKBOX_WEBHOOK_SECRET_GITHUB`). |
