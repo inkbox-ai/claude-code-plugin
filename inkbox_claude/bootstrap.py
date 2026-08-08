@@ -22,12 +22,6 @@ def _redact(exc: Exception, secrets: list[str]) -> str:
     return message
 
 
-def _skip_voice_on_missing_config(exc: Exception) -> bool:
-    """Voice AI needs a provisioned phone/inbound-call config; without one the
-    voice endpoints return 404. Treat that as skippable rather than fatal."""
-    return getattr(exc, "status_code", None) == 404
-
-
 def _identity_for_key(client: Any, expected: str) -> Any:
     handles = {_handle(str(getattr(item, "agent_handle", ""))) for item in client.list_identities()}
     if expected not in handles:
@@ -219,15 +213,8 @@ def bootstrap(
         actions.append("saved_claude_configuration")
         if voice_ai:
             step = "configure_voice"
-            try:
-                _configure_voice(identity, client, voice_ai_instructions)
-                actions.append("configured_voice_ai")
-            except Exception as exc:
-                # A fresh identity has no phone number, so skip voice rather
-                # than abort the whole bootstrap; real errors still propagate.
-                if not _skip_voice_on_missing_config(exc):
-                    raise
-                actions.append("skipped_voice_ai_no_phone")
+            _configure_voice(identity, client, voice_ai_instructions)
+            actions.append("configured_voice_ai")
         step = "configure_signing"
         blocker = _configure_signing(identity, client, rotate_signing_key, not previous or previous == handle, actions)
         if blocker:

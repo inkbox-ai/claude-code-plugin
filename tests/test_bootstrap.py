@@ -75,37 +75,13 @@ def test_bootstrap_configures_voice_signing_and_gateway(monkeypatch):
     assert saved["INKBOX_SIGNING_KEY"] == "signing-secret"
 
 
-class ApiError(Exception):
-    def __init__(self, status_code, message="api error"):
-        super().__init__(f"HTTP {status_code}: {message}")
-        self.status_code = status_code
-
-
-def test_bootstrap_skips_voice_when_identity_has_no_phone(monkeypatch):
+def test_bootstrap_reports_failed_step_on_error(monkeypatch):
     identity = Identity()
-    # A fresh identity has no phone: the inbound-call config endpoint 404s.
-    identity.get_incoming_call_action = lambda: (_ for _ in ()).throw(
-        ApiError(404, "No inbound-call config set for this identity")
-    )
-    saved = install(monkeypatch, identity)
-    monkeypatch.setattr(subject, "_start_gateway", lambda actions: actions.append("started_gateway_process") or True)
-    result = subject.bootstrap(identity_handle="helper", api_key="agent-secret", voice_ai=True, rotate_signing_key=True, start_gateway=True)
-    assert result["status"] == "configured"
-    assert "skipped_voice_ai_no_phone" in result["actions"]
-    assert "configured_voice_ai" not in result["actions"]
-    # Signing and gateway still ran despite the voice skip.
-    assert saved["INKBOX_SIGNING_KEY"] == "signing-secret"
-    assert result["gateway_running"] is True
-
-
-def test_bootstrap_reports_failed_step_and_propagates_non_404(monkeypatch):
-    identity = Identity()
-    identity.get_hosted_agent_config = lambda: (_ for _ in ()).throw(ApiError(500, "boom"))
+    identity.get_hosted_agent_config = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
     install(monkeypatch, identity)
     result = subject.bootstrap(identity_handle="helper", api_key="agent-secret", voice_ai=True)
     assert result["status"] == "error"
     assert result["failed_step"] == "configure_voice"
-    assert "skipped_voice_ai_no_phone" not in result["actions"]
 
 
 def test_bootstrap_requires_explicit_signing_rotation(monkeypatch):
