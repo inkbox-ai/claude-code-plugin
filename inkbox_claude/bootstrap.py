@@ -22,6 +22,12 @@ def _redact(exc: Exception, secrets: list[str]) -> str:
     return message
 
 
+def _skip_voice_on_missing_config(exc: Exception) -> bool:
+    """Voice AI needs a provisioned phone/inbound-call config; without one the
+    voice endpoints return 404. Treat that as skippable rather than fatal."""
+    return getattr(exc, "status_code", None) == 404
+
+
 def _identity_for_key(client: Any, expected: str) -> Any:
     handles = {_handle(str(getattr(item, "agent_handle", ""))) for item in client.list_identities()}
     if expected not in handles:
@@ -194,12 +200,15 @@ def bootstrap(
         return {"status": "error", "error": "API key is required"}
     actions: list[str] = []
     secrets = [api_key.strip()]
+    step = "start"
     try:
         previous = _handle(_env("INKBOX_IDENTITY"))
         symbols = _load_inkbox_symbols()
+        step = "resolve_credentials"
         scoped_key, identity = _resolve_credentials(api_key.strip(), handle, base_url, symbols, actions)
         secrets.append(scoped_key)
         client = symbols["Inkbox"](**inkbox_client_kwargs(scoped_key, base_url))
+        step = "save_configuration"
         _save("INKBOX_API_KEY", scoped_key)
         _save("INKBOX_IDENTITY", handle)
         if base_url:
@@ -209,16 +218,26 @@ def bootstrap(
         _save("INKBOX_ALLOW_ALL_USERS", "true")
         actions.append("saved_claude_configuration")
         if voice_ai:
-            _configure_voice(identity, client, voice_ai_instructions)
-            actions.append("configured_voice_ai")
+            step = "configure_voice"
+            try:
+                _configure_voice(identity, client, voice_ai_instructions)
+                actions.append("configured_voice_ai")
+            except Exception as exc:
+                # A fresh identity has no phone number, so skip voice rather
+                # than abort the whole bootstrap; real errors still propagate.
+                if not _skip_voice_on_missing_config(exc):
+                    raise
+                actions.append("skipped_voice_ai_no_phone")
+        step = "configure_signing"
         blocker = _configure_signing(identity, client, rotate_signing_key, not previous or previous == handle, actions)
         if blocker:
             return {"status": "requires_human", "identity": handle, "actions": actions, "human_actions": [blocker]}
         running = False
         if start_gateway:
+            step = "start_gateway"
             running = _start_gateway(actions)
             if not running:
-                return {"status": "error", "identity": handle, "actions": actions, "error": "Claude Code gateway did not become ready. Check ~/.inkbox-claude/gateway.log."}
+                return {"status": "error", "identity": handle, "actions": actions, "failed_step": step, "error": "Claude Code gateway did not become ready. Check ~/.inkbox-claude/gateway.log."}
         return {"status": "configured", "identity": handle, "actions": actions, "gateway_running": running}
     except Exception as exc:
-        return {"status": "error", "identity": handle, "actions": actions, "error": _redact(exc, secrets)}
+        return {"status": "error", "identity": handle, "actions": actions, "failed_step": step, "error": _redact(exc, secrets)}

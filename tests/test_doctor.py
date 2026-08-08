@@ -57,6 +57,23 @@ def test_voice_config_probe_failures_do_not_mark_identity_unreachable(
     )
 
 
+def test_doctor_reports_claude_auth_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "_maybe_load_env_file", lambda: None)
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: "/usr/bin/claude")
+    monkeypatch.setattr(doctor, "read_config", lambda: BridgeConfig(project_dir=str(tmp_path)))
+
+    # No ANTHROPIC_API_KEY and no credentials file -> not authenticated.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(doctor.os.path, "isfile", lambda _p: False)
+    by_name = {name: ok for name, ok, _detail in doctor.run_doctor()}
+    assert by_name["claude auth"] is False
+
+    # Env var present -> authenticated.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    by_name = {name: ok for name, ok, _detail in doctor.run_doctor()}
+    assert by_name["claude auth"] is True
+
+
 def test_doctor_reports_remote_routing_mismatch(monkeypatch, tmp_path):
     identity = types.SimpleNamespace(
         mailbox=types.SimpleNamespace(email_address="agent@example.com"),

@@ -79,6 +79,17 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         claude_bin or "not on PATH — install Claude Code first",
     ))
 
+    # Presence of the binary isn't enough; the gateway can't answer without auth.
+    claude_authed = bool(os.environ.get("ANTHROPIC_API_KEY")) or os.path.isfile(
+        os.path.expanduser("~/.claude/.credentials.json")
+    )
+    checks.append((
+        "claude auth",
+        claude_authed,
+        "authenticated" if claude_authed
+        else "not authenticated — set ANTHROPIC_API_KEY or log in with the Claude Code app/CLI",
+    ))
+
     project_dir = cfg.project_dir
     checks.append((
         "project dir",
