@@ -8,6 +8,7 @@ from inkbox_claude.realtime import (
     DELETE_POST_CALL_ACTION_TOOL_NAME,
     EDIT_POST_CALL_ACTION_TOOL_NAME,
     HANG_UP_CALL_TOOL_NAME,
+    OpenedRealtimeBridge,
     POST_CALL_ACTION_TOOL_NAME,
     RealtimeCallMeta,
     RealtimeConfig,
@@ -56,6 +57,31 @@ class _ScriptedOpenAIWS(_FakeWS):
             return next(self._iter)
         except StopIteration:
             raise StopAsyncIteration
+
+
+class _QueuedOpenAIWS(_FakeWS):
+    """Controllable realtime socket for lifecycle ordering tests."""
+
+    def __init__(self):
+        super().__init__()
+        self._queue = asyncio.Queue()
+        self.close_count = 0
+
+    def feed(self, frame):
+        self._queue.put_nowait(_FakeMsg(json.dumps(frame)))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        msg = await self._queue.get()
+        if msg is None:
+            raise StopAsyncIteration
+        return msg
+
+    async def close(self):
+        self.close_count += 1
+        self._queue.put_nowait(None)
 
 
 def _meta():
@@ -266,6 +292,7 @@ def test_dispatch_unknown_tool_refuses():
 
 def test_consult_timeout_reports_error_not_crash():
     ws = _FakeWS()
+    state = _BridgeState()
 
     async def slow_consult(query, transcript):
         await asyncio.sleep(1)
@@ -278,12 +305,43 @@ def test_consult_timeout_reports_error_not_crash():
         call_id="call-4",
         name=CONSULT_TOOL_NAME,
         arguments_json=json.dumps({"query": "x"}),
-        state=_BridgeState(),
+        state=state,
         config=cfg,
         on_agent_consult=slow_consult,
     ))
     item = next(f for f in ws.sent if f.get("type") == "conversation.item.create")
     assert "timed out" in json.loads(item["item"]["output"])["error"]
+    assert any(frame.get("type") == "response.create" for frame in ws.sent)
+
+
+def test_cancelled_consult_releases_call_ownership():
+    async def scenario():
+        started = asyncio.Event()
+
+        async def blocked_consult(query, transcript):
+            started.set()
+            await asyncio.Event().wait()
+
+        state = _BridgeState()
+        task = asyncio.create_task(_dispatch_tool_call(
+            openai_ws=_FakeWS(),
+            inkbox_ws=_FakeInkboxWS(),
+            call_id="consult-cancelled",
+            name=CONSULT_TOOL_NAME,
+            arguments_json=json.dumps({"query": "wait"}),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            on_agent_consult=blocked_consult,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert state.response_bearing_consults == set()
+
+    asyncio.run(scenario())
 
 
 def test_realtime_transcripts_are_mirrored_into_inkbox(monkeypatch):
@@ -515,12 +573,33 @@ class _FakeInkboxWS:
     def __init__(self):
         self.sent = []
         self.closed = False
+        self.close_count = 0
+        self._queue = asyncio.Queue()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        msg = await self._queue.get()
+        if msg is None:
+            raise StopAsyncIteration
+        return msg
 
     async def send_str(self, data):
         self.sent.append(json.loads(data))
 
     async def close(self):
         self.closed = True
+        self.close_count += 1
+        self._queue.put_nowait(None)
+
+
+class _FakeSession:
+    def __init__(self):
+        self.close_count = 0
+
+    async def close(self):
+        self.close_count += 1
 
 
 def test_hangup_is_two_step(monkeypatch):
@@ -535,11 +614,132 @@ def test_hangup_is_two_step(monkeypatch):
     assert state.hangup_armed_at is not None
     assert not any(f.get("event") == "stop" for f in ink.sent)
 
-    # Second call: real stop frame to Inkbox + sockets closed.
+    # Second call: one stop frame and a close request for the bridge lifecycle.
     _dispatch(ws, HANG_UP_CALL_TOOL_NAME, {"reason": "done"}, state, inkbox_ws=ink)
     stop = next(f for f in ink.sent if f.get("event") == "stop")
     assert stop["reason"] == "done" and stop["stream_id"] == "s1"
-    assert ink.closed is True and state.closed is True
+    assert ink.closed is False
+    assert state.local_close_requested.is_set()
+
+
+def test_hangup_waits_for_delayed_consult_response_audio(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(realtime, "HANGUP_CLOSE_DELAY_S", 0.0)
+        monkeypatch.setattr(
+            realtime,
+            "aiohttp",
+            SimpleNamespace(
+                WSMsgType=SimpleNamespace(
+                    TEXT="text", CLOSE="close", CLOSED="closed", ERROR="error"
+                ),
+            ),
+        )
+        openai_ws = _QueuedOpenAIWS()
+        inkbox_ws = _FakeInkboxWS()
+        state = _BridgeState(stream_id="stream-1")
+        consult_started = asyncio.Event()
+        release_consult = asyncio.Event()
+
+        async def delayed_consult(query, transcript):
+            assert query == "check the release"
+            consult_started.set()
+            await release_consult.wait()
+            return "The release is healthy."
+
+        session = _FakeSession()
+        bridge = OpenedRealtimeBridge(
+            session=session,
+            openai_ws=openai_ws,
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            meta=_meta(),
+        )
+
+        async def no_post_call_actions(actions, transcript):
+            raise AssertionError("no post-call actions expected")
+
+        async def call_ended(transcript):
+            return None
+
+        run = asyncio.create_task(
+            bridge.run(
+                inkbox_ws=inkbox_ws,
+                on_agent_consult=delayed_consult,
+                on_post_call_actions=no_post_call_actions,
+                on_call_ended=call_ended,
+            )
+        )
+        openai_ws.feed({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "consult-1",
+                "name": CONSULT_TOOL_NAME,
+                "arguments": json.dumps({"query": "check the release"}),
+            },
+        })
+        await asyncio.wait_for(consult_started.wait(), timeout=1)
+
+        await _dispatch_tool_call(
+            openai_ws=openai_ws,
+            inkbox_ws=inkbox_ws,
+            call_id="hangup-arm",
+            name=HANG_UP_CALL_TOOL_NAME,
+            arguments_json="{}",
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            on_agent_consult=delayed_consult,
+        )
+        await _dispatch_tool_call(
+            openai_ws=openai_ws,
+            inkbox_ws=inkbox_ws,
+            call_id="hangup-close",
+            name=HANG_UP_CALL_TOOL_NAME,
+            arguments_json=json.dumps({"reason": "done"}),
+            state=state,
+            config=RealtimeConfig(api_key="sk-x"),
+            on_agent_consult=delayed_consult,
+        )
+        assert state.deferred_hangup is not None
+        assert inkbox_ws.close_count == 0
+
+        release_consult.set()
+        for _ in range(20):
+            if any(
+                frame.get("item", {}).get("call_id") == "consult-1"
+                for frame in openai_ws.sent
+            ):
+                break
+            await asyncio.sleep(0)
+        assert any(
+            frame.get("item", {}).get("call_id") == "consult-1"
+            for frame in openai_ws.sent
+        )
+
+        openai_ws.feed({"type": "response.created", "response": {"id": "response-1"}})
+        openai_ws.feed({
+            "type": "response.output_audio_transcript.done",
+            "response_id": "response-1",
+            "transcript": "The release is healthy.",
+        })
+        openai_ws.feed({"type": "response.done", "response": {"id": "response-1"}})
+        await asyncio.sleep(0)
+        assert inkbox_ws.close_count == 0
+
+        openai_ws.feed({"type": "response.output_audio.done", "response_id": "response-1"})
+        await asyncio.wait_for(run, timeout=1)
+        await bridge.close()
+
+        assert ("agent", "The release is healthy.") in state.transcript
+        assert [frame.get("event") for frame in inkbox_ws.sent].count("audio_done") == 1
+        assert [frame.get("event") for frame in inkbox_ws.sent].count("stop") == 1
+        events = [frame.get("event") for frame in inkbox_ws.sent]
+        assert events.index("audio_done") < events.index("stop")
+        assert inkbox_ws.close_count == 1
+        assert openai_ws.close_count == 1
+        assert session.close_count == 1
+
+    asyncio.run(scenario())
 
 
 def test_post_call_dispatch_runs_actions_when_queued():
