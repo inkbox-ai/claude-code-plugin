@@ -79,10 +79,10 @@ jobs:
 
       - name: Configure speech mode (${{ matrix.scenario }})
         run: |
+          echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
             echo "INKBOX_VOICE_STACK=openai_realtime" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=true" >> "$GITHUB_ENV"
-            echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"
           elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
             RUN_TOKEN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
