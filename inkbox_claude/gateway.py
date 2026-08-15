@@ -3570,6 +3570,23 @@ class InkboxGateway:
                 "running",
                 progress_text=text,
             )
+            try:
+                authoritative = await asyncio.to_thread(
+                    self._identity.a2a_task,
+                    task_id,
+                )
+                state = str(
+                    getattr(authoritative.state, "value", authoritative.state)
+                )
+                if state in A2A_TERMINAL_STATES:
+                    return False
+            except Exception:
+                logger.warning(
+                    "[bridge] could not recheck A2A progress state for task %s; "
+                    "the worker turn will continue",
+                    task_id,
+                )
+                return True
 
         try:
             if not self._a2a_task_has_text(authoritative, text):

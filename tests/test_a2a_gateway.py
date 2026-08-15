@@ -436,6 +436,35 @@ def test_a2a_progress_stops_for_terminal_task(tmp_path):
     assert gateway.replies == []
 
 
+def test_a2a_progress_rechecks_state_after_summary(tmp_path, monkeypatch):
+    gateway = _gateway(tmp_path)
+    gateway._a2a_authoritative_task.state = "working"
+    key = "task-1:message-1"
+    data = _event()["data"]
+    gateway._write_a2a_registry(key, data, "running", progress_started=True)
+
+    async def settle_during_summary(**_kwargs):
+        gateway._a2a_authoritative_task.state = "canceled"
+        return "I'm checking the request."
+
+    monkeypatch.setattr(
+        gateway_mod,
+        "build_a2a_progress_update",
+        settle_during_summary,
+    )
+    keep_running = asyncio.run(
+        gateway._emit_a2a_progress_update(
+            task_id="task-1",
+            registry_key=key,
+            data=data,
+            task_text="Check the request.",
+        )
+    )
+
+    assert keep_running is False
+    assert gateway.replies == []
+
+
 def test_a2a_progress_runner_waits_configured_interval(monkeypatch, tmp_path):
     gateway = _gateway(tmp_path)
     gateway.cfg.a2a_progress_interval_seconds = 60
