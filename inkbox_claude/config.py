@@ -25,6 +25,7 @@ DISTRIBUTION_NAME = "claude-code-plugin"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8767
 DEFAULT_WEBHOOK_PATH = "/webhook"
+DEFAULT_A2A_PROGRESS_INTERVAL_SECONDS = 180.0
 
 
 class VoiceStack(str, Enum):
@@ -101,6 +102,7 @@ class BridgeConfig:
     voicemail_detection: str = "enabled"
     # OpenAI Realtime voice (off unless the wizard validated a key)
     realtime: RealtimeConfig = field(default_factory=RealtimeConfig)
+    a2a_progress_interval_seconds: float = DEFAULT_A2A_PROGRESS_INTERVAL_SECONDS
 
 
 def inkbox_base_url_kwargs(base_url: str | None = None) -> Dict[str, str]:
@@ -197,6 +199,10 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         claude_model=str(os.getenv("CLAUDE_MODEL") or extra.get("claude_model") or "").strip(),
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
         auto_allowed_tools=_csv_env("INKBOX_AUTO_ALLOWED_TOOLS") or list(DEFAULT_AUTO_ALLOWED_TOOLS),
+        a2a_progress_interval_seconds=float(
+            os.getenv("INKBOX_A2A_PROGRESS_INTERVAL_SECONDS")
+            or DEFAULT_A2A_PROGRESS_INTERVAL_SECONDS
+        ),
         voice_stack=voice_stack,
         voice_stack_invalid_value=invalid_voice_stack,
         voice_ai_authority_mode=str(
