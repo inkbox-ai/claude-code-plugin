@@ -418,6 +418,31 @@ def test_a2a_progress_retry_recovers_accepted_reply_without_duplicate(tmp_path):
     assert "pending" not in progress
 
 
+def test_a2a_progress_elapsed_time_continues_across_caller_follow_up(tmp_path):
+    gateway = _gateway(tmp_path)
+    first_key = "task-1:message-1"
+    gateway._write_a2a_registry(
+        first_key,
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
+    first = json.loads(gateway._a2a_registry_path.read_text())
+    started_at = first[first_key]["progress"]["started_at"]
+    follow_up = _event()["data"] | {"message_id": "message-2"}
+    second_key = "task-1:message-2"
+
+    gateway._write_a2a_registry(
+        second_key,
+        follow_up,
+        "running",
+        progress_started=True,
+    )
+
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert registry[second_key]["progress"]["started_at"] == started_at
+
+
 def test_a2a_progress_stops_for_terminal_task(tmp_path):
     gateway = _gateway(tmp_path)
     gateway._a2a_authoritative_task.state = "completed"
