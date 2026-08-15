@@ -534,3 +534,35 @@ def test_a2a_completion_cancels_progress_timer(tmp_path):
         assert gateway._a2a_progress_tasks == {}
 
     asyncio.run(scenario())
+
+
+def test_a2a_cancellation_drains_worker_and_progress_tasks(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def scenario():
+        stop_event = asyncio.Event()
+        progress_mod.start_a2a_progress("task-1")
+        progress_task = asyncio.create_task(gateway._run_a2a_progress_updates(
+            task_id="task-1",
+            registry_key="task-1:message-1",
+            data=_event()["data"],
+            task_text="Calculate.",
+            stop_event=stop_event,
+        ))
+        worker_task = asyncio.create_task(asyncio.sleep(30))
+        gateway._a2a_progress_tasks["task-1"] = progress_task
+        gateway._a2a_progress_stop_events["task-1"] = stop_event
+        gateway._a2a_jobs["task-1"] = {worker_task}
+        canceled = _event()
+        canceled["event_type"] = "a2a.task.canceled"
+
+        await gateway._on_a2a_event(canceled)
+
+        assert progress_task.done()
+        assert worker_task.cancelled()
+        assert gateway._a2a_progress_tasks == {}
+        assert gateway._a2a_progress_stop_events == {}
+        assert gateway._a2a_jobs == {}
+        assert progress_mod.a2a_activity_snapshot("task-1") == []
+
+    asyncio.run(scenario())
