@@ -376,7 +376,7 @@ def test_current_channel_tool_delivery_suppresses_redundant_reply(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_pre_tool_hook_retains_only_sanitized_a2a_activity():
+def test_pre_tool_hook_retains_only_normalized_tool_name():
     async def scenario():
         session = make_session([])
         session._current_turn = _Turn(
@@ -394,10 +394,10 @@ def test_pre_tool_hook_retains_only_sanitized_a2a_activity():
             None,
         )
 
-        snapshot = progress_mod.a2a_activity_snapshot("task-1")
+        snapshot = progress_mod.a2a_tool_snapshot("task-1")
         progress_mod.stop_a2a_progress("task-1")
         assert result == {}
-        assert snapshot == ["running the requested work"]
+        assert snapshot == ["bash"]
         assert "private-value" not in json.dumps(snapshot)
 
     asyncio.run(scenario())

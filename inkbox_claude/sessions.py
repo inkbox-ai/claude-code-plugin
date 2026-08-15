@@ -705,7 +705,7 @@ class ContactSession:
         _tool_use_id: Optional[str],
         _context: Any,
     ) -> Dict[str, Any]:
-        """Capture only a coarse tool category for an active A2A worker turn."""
+        """Capture only a normalized tool name for an active A2A worker turn."""
         turn = self._current_turn
         a2a_context = turn.a2a_context if turn is not None else None
         if isinstance(a2a_context, dict):

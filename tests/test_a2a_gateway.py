@@ -291,12 +291,27 @@ def test_a2a_acknowledgement_recovers_accepted_reply_without_duplicate(tmp_path)
 
 
 def test_a2a_progress_summary_rejects_terminal_claim():
-    update = progress_mod._clean_update(
+    terminal_updates = (
         "Done — the task is complete.",
-        ["validating the work"],
+        "The final answer is ready.",
+        "I cannot continue without the records.",
+        "I'm waiting for your input.",
     )
+    for update in terminal_updates:
+        assert progress_mod._clean_update(update, ["run_tests"]) == (
+            "I'm continuing the requested work."
+        )
 
-    assert update == "I'm validating the work."
+
+def test_a2a_progress_summary_allows_nonterminal_status_words():
+    updates = (
+        "I'm ready to review the next records.",
+        "The query succeeded and I'm checking the response.",
+        "The issue appears resolved, so I'm validating related behavior.",
+        "I'm finalizing the analysis now.",
+    )
+    for update in updates:
+        assert progress_mod._clean_update(update, ["run_tests"]) == update
 
 
 def test_a2a_progress_summary_uses_tool_free_side_turn(monkeypatch):
@@ -332,7 +347,7 @@ def test_a2a_progress_summary_uses_tool_free_side_turn(monkeypatch):
 
     update = asyncio.run(progress_mod.build_a2a_progress_update(
         task_text="Inspect the calculation.",
-        activities=["reviewing the relevant material"],
+        tool_names=["read_file"],
         previous_update="I'm checking the request.",
         project_dir="/tmp",
     ))
@@ -342,24 +357,37 @@ def test_a2a_progress_summary_uses_tool_free_side_turn(monkeypatch):
     assert captured["options"]["allowed_tools"] == []
     assert captured["options"]["max_turns"] == 1
     assert "Inspect the calculation." in captured["prompt"]
+    assert "read_file" in captured["prompt"]
     assert "I'm checking the request." in captured["prompt"]
 
 
-def test_a2a_progress_activity_is_short_and_does_not_retain_inputs():
+def test_a2a_progress_summary_rejects_echoed_tool_identifier():
+    for update in (
+        "browser_search",
+        "I'm using browser search to investigate.",
+    ):
+        assert progress_mod._clean_update(update, ["browser_search"]) == (
+            "I'm continuing the requested work."
+        )
+
+
+def test_a2a_progress_tool_names_are_bounded_and_do_not_retain_inputs():
     progress_mod.start_a2a_progress("task-1")
 
-    progress_mod.observe_a2a_tool_start("task-1", "run_sql_query")
-    progress_mod.observe_a2a_tool_start("task-1", "list_directory_users")
+    progress_mod.observe_a2a_tool_start("task-1", "run/sql query\n")
+    for index in range(9):
+        progress_mod.observe_a2a_tool_start(
+            "task-1",
+            f"Tool {index} {'x' * 100}",
+        )
 
-    snapshot = progress_mod.a2a_activity_snapshot("task-1")
+    snapshot = progress_mod.a2a_tool_snapshot("task-1")
     progress_mod.stop_a2a_progress("task-1")
-    assert snapshot == [
-        "checking the requested data",
-        "reviewing the requested records",
-    ]
-    assert progress_mod._fallback_update(snapshot) == (
-        "I'm checking the requested data and reviewing the requested records."
-    )
+    assert len(snapshot) == 8
+    assert snapshot[0].startswith("tool_1_")
+    assert all(len(tool_name) <= 80 for tool_name in snapshot)
+    assert progress_mod._safe_tool_name("run/sql query\n") == "run_sql_query"
+    assert progress_mod._fallback_update() == "I'm continuing the requested work."
 
 
 def test_a2a_progress_update_is_durable_and_nonterminal(tmp_path, monkeypatch):
@@ -563,6 +591,6 @@ def test_a2a_cancellation_drains_worker_and_progress_tasks(tmp_path):
         assert gateway._a2a_progress_tasks == {}
         assert gateway._a2a_progress_stop_events == {}
         assert gateway._a2a_jobs == {}
-        assert progress_mod.a2a_activity_snapshot("task-1") == []
+        assert progress_mod.a2a_tool_snapshot("task-1") == []
 
     asyncio.run(scenario())

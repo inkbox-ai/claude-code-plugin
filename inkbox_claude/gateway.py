@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover
 try:
     from .a2a_delegations import find_by_task as find_a2a_delegation
     from .a2a_progress import (
-        a2a_activity_snapshot,
+        a2a_tool_snapshot,
         build_a2a_progress_update,
         start_a2a_progress,
         stop_a2a_progress,
@@ -96,7 +96,7 @@ try:
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from a2a_delegations import find_by_task as find_a2a_delegation
     from a2a_progress import (
-        a2a_activity_snapshot,
+        a2a_tool_snapshot,
         build_a2a_progress_update,
         start_a2a_progress,
         stop_a2a_progress,
@@ -3553,7 +3553,7 @@ class InkboxGateway:
         if not text:
             summary = await build_a2a_progress_update(
                 task_text=task_text,
-                activities=a2a_activity_snapshot(task_id),
+                tool_names=a2a_tool_snapshot(task_id),
                 previous_update=str(progress.get("last_delivered_text") or ""),
                 model=self.cfg.claude_model,
                 project_dir=self.cfg.project_dir,

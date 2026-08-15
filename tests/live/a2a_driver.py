@@ -21,9 +21,12 @@ STOPPED_WIRE_STATES = {
 }
 PROGRESS_RECEIPT_SUFFIX = "Expect progress updates about every 1 minute."
 PROGRESS_UPDATE_RE = re.compile(r"^(.+) \((\d+)s elapsed\)$")
+GENERIC_PROGRESS_FALLBACK = "I'm continuing the requested work."
 TERMINAL_PROGRESS_RE = re.compile(
     r"\b(?:done|complete|completed|finished|failed|failure|blocked|"
-    r"need(?:ed|s)?\s+(?:your\s+)?input|waiting\s+for\s+you)\b",
+    r"final\s+(?:answer|result)|cannot\s+(?:complete|continue)|"
+    r"need(?:ed|s)?\s+(?:your\s+)?input|"
+    r"waiting\s+(?:for\s+)?(?:your\s+)?input|waiting\s+for\s+you)\b",
     re.IGNORECASE,
 )
 
@@ -298,17 +301,24 @@ def _inbound_progress(a2a: Any, target: Any, timeout: float, run: str) -> None:
         )
         history = _wire_history_messages(final)
         progress = []
+        summaries = []
         for index, text in enumerate(history):
             match = PROGRESS_UPDATE_RE.fullmatch(text)
             if match is None:
                 continue
-            if TERMINAL_PROGRESS_RE.search(match.group(1)):
+            summary = match.group(1).strip()
+            if not summary:
+                raise AssertionError("A periodic progress update had an empty summary")
+            if TERMINAL_PROGRESS_RE.search(summary):
                 raise AssertionError("A periodic progress update claimed a terminal state")
+            summaries.append(summary)
             progress.append((index, int(match.group(2))))
         if len(progress) < 2:
             raise AssertionError(
                 f"Expected at least two periodic progress updates, got {len(progress)}"
             )
+        if all(summary == GENERIC_PROGRESS_FALLBACK for summary in summaries):
+            raise AssertionError("The auxiliary progress writer only used its generic fallback")
         elapsed = [seconds for _, seconds in progress]
         first_interval = elapsed[0]
         second_interval = elapsed[1] - elapsed[0]
