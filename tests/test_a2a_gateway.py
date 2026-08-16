@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import types
 
 import pytest
@@ -55,6 +56,7 @@ def _gateway(tmp_path):
     gateway._a2a_progress_tasks = {}
     gateway._a2a_progress_stop_events = {}
     gateway._a2a_progress_owners = {}
+    gateway._a2a_progress_fences = {}
     gateway._a2a_ingest_lock = asyncio.Lock()
     gateway.cfg = BridgeConfig(project_dir=str(tmp_path))
     task = types.SimpleNamespace(state="submitted", messages=[])
@@ -193,7 +195,71 @@ def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):
     registry = json.loads(gateway._a2a_registry_path.read_text())
 
     assert registry["task-1:message-1"]["state"] == "finalized"
-    assert gateway.sessions.session.calls[0][0].endswith("Resume this.")
+    assert gateway.sessions.session.calls[0][0].endswith("Investigate.")
+
+
+def test_a2a_catch_up_resumes_persisted_caller_data_not_worker_history(tmp_path):
+    gateway = _gateway(tmp_path)
+    data = _event()["data"] | {
+        "parts": [{"text": "Original caller request."}],
+    }
+    key = "task-1:message-1"
+    receipt = gateway_mod._a2a_receipt_text(
+        "task-1",
+        gateway.cfg.a2a_progress_interval_seconds,
+    )
+    progress = "I'm checking the original request. (180s elapsed)"
+    gateway._write_a2a_registry(
+        key,
+        data,
+        "running",
+        receipt_text=receipt,
+        progress_started=True,
+    )
+    task = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="working",
+        caller=types.SimpleNamespace(
+            identity_id="caller-1",
+            organization_id="org-1",
+            handle="caller",
+        ),
+        messages=[
+            types.SimpleNamespace(
+                role="ROLE_CALLER",
+                message_id="message-1",
+                parts=[{"text": "Original caller request."}],
+            ),
+            types.SimpleNamespace(
+                role="ROLE_AGENT",
+                message_id="message-ack",
+                parts=[{"text": receipt}],
+            ),
+            types.SimpleNamespace(
+                role="ROLE_AGENT",
+                message_id="message-progress",
+                parts=[{"text": progress}],
+            ),
+        ],
+    )
+    gateway._identity.a2a_task = lambda _task_id: task
+    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter([task])
+
+    async def scenario():
+        await gateway._catch_up_a2a_tasks()
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+
+    assert len(gateway.sessions.session.calls) == 1
+    prompt, _context = gateway.sessions.session.calls[0]
+    assert prompt.endswith("Original caller request.")
+    assert receipt not in prompt
+    assert progress not in prompt
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert list(registry) == [key]
+    assert registry[key]["data"] == data
 
 
 def test_a2a_sent_update_returns_to_the_delegating_session(
@@ -310,6 +376,25 @@ def test_a2a_acknowledgement_ignores_caller_spoof(tmp_path):
     asyncio.run(gateway._record_a2a_acknowledgement(key, data))
 
     assert gateway.replies[-1][1]["text"] == receipt
+
+
+def test_a2a_acknowledgement_accepts_raw_agent_role(tmp_path):
+    gateway = _gateway(tmp_path)
+    key = "task-1:message-1"
+    data = _event()["data"]
+    receipt = gateway_mod._a2a_receipt_text(
+        "task-1",
+        gateway.cfg.a2a_progress_interval_seconds,
+    )
+    gateway._a2a_authoritative_task.messages.append(
+        types.SimpleNamespace(role="ROLE_AGENT", parts=[{"text": receipt}])
+    )
+    gateway._write_a2a_registry(key, data, "queued")
+    reply_count = len(gateway.replies)
+
+    asyncio.run(gateway._record_a2a_acknowledgement(key, data))
+
+    assert len(gateway.replies) == reply_count
 
 
 def test_failed_a2a_acknowledgement_keeps_referenced_background_retry(
@@ -529,7 +614,7 @@ def test_a2a_progress_retry_recovers_accepted_reply_without_duplicate(tmp_path):
     gateway._a2a_authoritative_task.state = "working"
     update = "I'm validating the work. (60s elapsed)"
     gateway._a2a_authoritative_task.messages.append(
-        types.SimpleNamespace(role="agent", parts=[{"text": update}])
+        types.SimpleNamespace(role="ROLE_AGENT", parts=[{"text": update}])
     )
     key = "task-1:message-1"
     data = _event()["data"]
@@ -812,6 +897,118 @@ def test_older_a2a_turn_cannot_stop_follow_up_progress_runner(tmp_path):
         )
 
     asyncio.run(scenario())
+
+
+def test_terminal_fence_drains_inflight_progress_before_reply(tmp_path):
+    gateway = _gateway(tmp_path)
+    gateway._a2a_authoritative_task.state = "working"
+    key = "task-1:message-1"
+    data = _event()["data"]
+    update = "I'm validating the work. (180s elapsed)"
+    gateway._write_a2a_registry(key, data, "running", progress_started=True)
+    gateway._write_a2a_registry(key, data, "running", progress_text=update)
+    started = threading.Event()
+    release = threading.Event()
+    events = []
+    original_reply = gateway._identity.a2a_reply
+
+    def paused_reply(task_id, **kwargs):
+        if kwargs.get("intent") == "progress" and kwargs.get("text") == update:
+            events.append("progress-started")
+            started.set()
+            assert release.wait(timeout=5)
+            events.append("progress-finished")
+        return original_reply(task_id, **kwargs)
+
+    gateway._identity.a2a_reply = paused_reply
+
+    async def scenario():
+        progress_task = asyncio.create_task(gateway._emit_a2a_progress_update(
+            task_id="task-1",
+            registry_key=key,
+            data=data,
+            task_text="Validate the work.",
+        ))
+        gateway._a2a_progress_tasks["task-1"] = progress_task
+        gateway._a2a_progress_stop_events["task-1"] = asyncio.Event()
+        gateway._a2a_progress_owners["task-1"] = key
+        assert await asyncio.to_thread(started.wait, 5)
+
+        fence_task = asyncio.create_task(
+            gateway._fence_a2a_progress_updates("task-1", key, data)
+        )
+        await asyncio.sleep(0)
+        assert not fence_task.done()
+        events.append("terminal-waiting")
+        release.set()
+        await fence_task
+        events.append("terminal-reply")
+
+        assert await progress_task is True
+        assert await gateway._emit_a2a_progress_update(
+            task_id="task-1",
+            registry_key=key,
+            data=data,
+            task_text="Validate the work.",
+        ) is False
+
+    asyncio.run(scenario())
+
+    assert events == [
+        "progress-started",
+        "terminal-waiting",
+        "progress-finished",
+        "terminal-reply",
+    ]
+    saved = json.loads(gateway._a2a_registry_path.read_text())[key]
+    assert saved["progress"]["fenced"] is True
+
+
+def test_a2a_follow_up_reacquires_durably_fenced_progress(tmp_path):
+    gateway = _gateway(tmp_path)
+    first_key = "task-1:message-1"
+    first = _event()["data"]
+    second_key = "task-1:message-2"
+    second = first | {
+        "message_id": "message-2",
+        "parts": [{"text": "The region is west."}],
+    }
+
+    async def scenario():
+        gateway._write_a2a_registry(
+            first_key,
+            first,
+            "running",
+            progress_started=True,
+        )
+        await gateway._fence_a2a_progress_updates("task-1", first_key, first)
+
+        # Restarting the same turn must retain an ambiguous terminal fence.
+        await gateway._start_a2a_progress_updates(
+            task_id="task-1",
+            registry_key=first_key,
+            data=first,
+            task_text="Investigate.",
+        )
+        assert gateway._a2a_progress_tasks == {}
+
+        # A genuine caller follow-up has a new message key and starts a new owner.
+        gateway._write_a2a_registry(second_key, second, "running")
+        await gateway._start_a2a_progress_updates(
+            task_id="task-1",
+            registry_key=second_key,
+            data=second,
+            task_text="The region is west.",
+        )
+        assert gateway._a2a_progress_owners["task-1"] == second_key
+        assert "task-1" not in gateway._a2a_progress_fences
+        await gateway._stop_a2a_progress_updates("task-1", owner=second_key)
+
+    asyncio.run(scenario())
+
+    saved = json.loads(gateway._a2a_registry_path.read_text())
+    assert saved[first_key]["progress"]["fenced"] is True
+    assert saved[second_key]["progress"].get("fenced") is not True
 
 
 def test_a2a_completion_cancels_progress_timer(tmp_path):

@@ -411,6 +411,90 @@ def test_a2a_intent_tools_require_trusted_turn_context():
     ]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "intent"),
+    [
+        ("inkbox_a2a_complete", {"text": "Done."}, "complete"),
+        ("inkbox_a2a_ask_caller", {"text": "Which region?"}, "ask_caller"),
+        ("inkbox_a2a_fail", {"reason": "Unavailable."}, "fail"),
+    ],
+)
+def test_a2a_intent_tools_fence_progress_before_reply(
+    tool_name,
+    arguments,
+    intent,
+):
+    client = _FakeClient()
+    registered, _ = _tool_map(client)
+    events = []
+    original_reply = client.identity.a2a_reply
+
+    async def fence_progress():
+        events.append("fenced")
+
+    def reply(task_id, **kwargs):
+        events.append("reply")
+        return original_reply(task_id, **kwargs)
+
+    client.identity.a2a_reply = reply
+    context = {
+        "task_id": "task-1",
+        "message_id": "message-1",
+        "context_id": "context-1",
+        "reply_intent_committed": False,
+        "fence_progress": fence_progress,
+    }
+
+    async def scenario():
+        token = tools_mod.A2A_TURN_CONTEXT.set(context)
+        try:
+            await registered[tool_name](arguments)
+        finally:
+            tools_mod.A2A_TURN_CONTEXT.reset(token)
+
+    asyncio.run(scenario())
+
+    assert events == ["fenced", "reply"]
+    assert context["reply_intent_committed"] is True
+    assert client.identity.a2a_replies[-1][1]["intent"] == intent
+
+
+def test_failed_a2a_intent_reply_remains_committed_after_fence():
+    client = _FakeClient()
+    registered, _ = _tool_map(client)
+    events = []
+
+    async def fence_progress():
+        events.append("fenced")
+
+    def fail_reply(_task_id, **_kwargs):
+        events.append("reply")
+        raise OSError("response unavailable")
+
+    client.identity.a2a_reply = fail_reply
+    context = {
+        "task_id": "task-1",
+        "message_id": "message-1",
+        "context_id": "context-1",
+        "reply_intent_committed": False,
+        "fence_progress": fence_progress,
+    }
+
+    async def scenario():
+        token = tools_mod.A2A_TURN_CONTEXT.set(context)
+        try:
+            result = await registered["inkbox_a2a_complete"]({"text": "Done."})
+            return json.loads(result["content"][0]["text"])
+        finally:
+            tools_mod.A2A_TURN_CONTEXT.reset(token)
+
+    result = asyncio.run(scenario())
+
+    assert events == ["fenced", "reply"]
+    assert context["reply_intent_committed"] is True
+    assert "response unavailable" in result["error"]
+
+
 def test_place_call_writes_context_and_tags_websocket_url(tmp_path, monkeypatch):
     monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
     client = _FakeClient()
