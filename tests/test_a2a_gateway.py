@@ -1110,6 +1110,88 @@ def test_implicit_completion_response_loss_stays_fenced_across_restart(tmp_path)
     assert restarted._a2a_progress_tasks == {}
 
 
+def test_implicit_completion_failure_does_not_rerun_fenced_turn(tmp_path):
+    gateway = _gateway(tmp_path)
+    original_reply = gateway._identity.a2a_reply
+
+    def failed_without_commit(task_id, **kwargs):
+        if kwargs.get("intent") == "complete":
+            raise OSError("request outcome unknown")
+        original_reply(task_id, **kwargs)
+
+    gateway._identity.a2a_reply = failed_without_commit
+
+    async def first_process():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(first_process())
+
+    saved = json.loads(gateway._a2a_registry_path.read_text())[
+        "task-1:message-1"
+    ]
+    assert saved["state"] == "running"
+    assert saved["progress"]["fenced"] is True
+
+    restarted = _gateway(tmp_path)
+    receipt = gateway_mod._a2a_receipt_text(
+        "task-1",
+        restarted.cfg.a2a_progress_interval_seconds,
+    )
+    task = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="working",
+        caller=types.SimpleNamespace(
+            identity_id="caller-1",
+            organization_id="org-1",
+            handle="caller",
+        ),
+        messages=[
+            types.SimpleNamespace(
+                role="ROLE_CALLER",
+                message_id="message-1",
+                parts=[{"text": "Investigate."}],
+            ),
+            types.SimpleNamespace(
+                role="ROLE_AGENT",
+                message_id="message-ack",
+                parts=[{"text": receipt}],
+            ),
+        ],
+    )
+    restarted._identity.a2a_task = lambda _task_id: task
+    restarted._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
+
+    asyncio.run(restarted._catch_up_a2a_tasks())
+
+    assert restarted.sessions.session.calls == []
+    assert restarted.replies == []
+    assert restarted._a2a_jobs == {}
+
+    async def follow_up():
+        task.messages.append(types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-2",
+            parts=[{"text": "Use the west region."}],
+        ))
+        event = _event()
+        event["event_type"] = "a2a.task.message"
+        event["data"] = event["data"] | {
+            "message_id": "message-2",
+            "parts": [{"text": "Use the west region."}],
+        }
+        await restarted._on_a2a_event(event)
+        await asyncio.gather(*restarted._a2a_jobs["task-1"])
+
+    asyncio.run(follow_up())
+
+    assert len(restarted.sessions.session.calls) == 1
+    assert restarted.sessions.session.calls[0][0].endswith("Use the west region.")
+    registry = json.loads(restarted._a2a_registry_path.read_text())
+    assert registry["task-1:message-2"]["state"] == "finalized"
+
+
 @pytest.mark.parametrize("stopped_state", ["TASK_STATE_INPUT_REQUIRED", "auth_required"])
 def test_waiting_state_restart_settles_and_new_caller_reacquires(
     tmp_path,
@@ -1264,6 +1346,59 @@ def test_a2a_cleanup_drains_acknowledgement_retry(tmp_path):
         await gateway._cleanup()
 
         assert acknowledgement_task.cancelled()
+        assert gateway._a2a_ack_tasks == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stop_reason", ["cancel", "shutdown"])
+def test_a2a_acknowledgement_send_is_drained_before_stop(
+    tmp_path,
+    monkeypatch,
+    stop_reason,
+):
+    gateway = _gateway(tmp_path)
+    monkeypatch.setattr(gateway_mod, "_A2A_RETRY_INTERVAL_SECONDS", 0)
+    key = "task-1:message-1"
+    data = _event()["data"]
+    gateway._write_a2a_registry(key, data, "queued")
+    original_reply = gateway._identity.a2a_reply
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def paused_reply(task_id, **kwargs):
+        started.set()
+        assert release.wait(5)
+        original_reply(task_id, **kwargs)
+        completed.set()
+
+    gateway._identity.a2a_reply = paused_reply
+
+    async def scenario():
+        gateway._schedule_a2a_acknowledgement_retry(key, data)
+        assert await asyncio.to_thread(started.wait, 5)
+
+        if stop_reason == "cancel":
+            event = _event()
+            event["event_type"] = "a2a.task.canceled"
+            stopping = asyncio.create_task(gateway._on_a2a_event(event))
+        else:
+            gateway._hosted_call_jobs = {}
+            gateway.sessions = None
+            gateway._runner = None
+            gateway._tunnel = None
+            stopping = asyncio.create_task(gateway._cleanup())
+
+        await asyncio.sleep(0)
+        was_pending = not stopping.done()
+        release.set()
+        await stopping
+        completed_before_stop_returned = completed.is_set()
+        assert await asyncio.to_thread(completed.wait, 5)
+
+        assert was_pending
+        assert completed_before_stop_returned
         assert gateway._a2a_ack_tasks == {}
 
     asyncio.run(scenario())

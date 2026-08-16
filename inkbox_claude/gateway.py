@@ -3408,12 +3408,21 @@ class InkboxGateway:
         elapsed_intervals = int((now - due_at) // interval) + 1
         return due_at + (elapsed_intervals * interval)
 
+    @staticmethod
+    def _a2a_entry_is_fenced(entry: Any) -> bool:
+        progress = entry.get("progress") if isinstance(entry, dict) else None
+        return isinstance(progress, dict) and progress.get("fenced") is True
+
     def _track_a2a_job(
         self,
         task_id: str,
         registry_key: str,
         data: Dict[str, Any],
     ) -> None:
+        entry = self._read_a2a_registry().get(registry_key)
+        if self._a2a_entry_is_fenced(entry):
+            self._a2a_progress_fences[task_id] = registry_key
+            return
         job = asyncio.create_task(self._run_a2a_turn(registry_key, data))
         self._a2a_jobs.setdefault(task_id, set()).add(job)
         job.add_done_callback(
@@ -3512,12 +3521,19 @@ class InkboxGateway:
         if state in A2A_STOPPED_STATES:
             return True
         if not self._a2a_task_has_text(authoritative, receipt):
-            await asyncio.to_thread(
-                self._identity.a2a_reply,
-                task_id,
-                intent="progress",
-                text=receipt,
+            reply = asyncio.create_task(
+                asyncio.to_thread(
+                    self._identity.a2a_reply,
+                    task_id,
+                    intent="progress",
+                    text=receipt,
+                )
             )
+            try:
+                await asyncio.shield(reply)
+            except asyncio.CancelledError:
+                await asyncio.gather(reply, return_exceptions=True)
+                raise
         entry = self._read_a2a_registry().get(key)
         entry = entry if isinstance(entry, dict) else {}
         self._write_a2a_registry(
@@ -3910,7 +3926,11 @@ class InkboxGateway:
 
         key = f"{task_id}:{message_id}"
         async with self._a2a_ingest_lock:
-            if key in self._read_a2a_registry():
+            existing = self._read_a2a_registry().get(key)
+            if isinstance(existing, dict):
+                if self._a2a_entry_is_fenced(existing):
+                    self._a2a_progress_fences[task_id] = key
+                    return web.json_response({"ok": True, "deduped": True})
                 try:
                     await self._record_a2a_acknowledgement(key, data)
                 except Exception:
@@ -4052,6 +4072,9 @@ class InkboxGateway:
                     self._a2a_progress_fences.pop(task_id, None)
                     self._write_a2a_registry(key, data, "finalized")
                 else:
+                    if self._a2a_entry_is_fenced(entry):
+                        self._a2a_progress_fences[task_id] = key
+                        continue
                     try:
                         await self._record_a2a_acknowledgement(key, data)
                     except Exception:
