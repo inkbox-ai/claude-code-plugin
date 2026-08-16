@@ -192,6 +192,7 @@ def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):
         ),
         messages=[
             types.SimpleNamespace(
+                role="ROLE_CALLER",
                 message_id="message-1",
                 parts=[{"text": "Resume this."}],
             )
@@ -213,7 +214,7 @@ def test_a2a_gateway_resumes_nonfinal_registry_entries(tmp_path, monkeypatch):
     registry = json.loads(gateway._a2a_registry_path.read_text())
 
     assert registry["task-1:message-1"]["state"] == "finalized"
-    assert gateway.sessions.session.calls[0][0].endswith("Investigate.")
+    assert gateway.sessions.session.calls[0][0].endswith("Resume this.")
 
 
 def test_a2a_catch_up_resumes_persisted_caller_data_not_worker_history(tmp_path):
@@ -277,7 +278,7 @@ def test_a2a_catch_up_resumes_persisted_caller_data_not_worker_history(tmp_path)
     assert progress not in prompt
     registry = json.loads(gateway._a2a_registry_path.read_text())
     assert list(registry) == [key]
-    assert registry[key]["data"] == data
+    assert registry[key]["data"] == data | {"state": "working"}
 
 
 def test_a2a_sent_update_returns_to_the_delegating_session(
@@ -489,6 +490,12 @@ def test_failed_a2a_acknowledgement_keeps_referenced_background_retry(
 
     gateway._identity.a2a_reply = fail_once
 
+    async def stay_active(prompt, *, a2a_context=None):
+        gateway.sessions.session.calls.append((prompt, a2a_context))
+        return "[SILENT]"
+
+    gateway.sessions.session.run_consult = stay_active
+
     async def scenario():
         response = await gateway._on_a2a_event(_event())
         assert response.status == 200
@@ -497,10 +504,8 @@ def test_failed_a2a_acknowledgement_keeps_referenced_background_retry(
             "task-1:message-1"
         ]["receipt"]
         assert pending["pending_text"].startswith("Task task-1")
-        for _ in range(20):
-            if "task-1:message-1" not in gateway._a2a_ack_tasks:
-                break
-            await asyncio.sleep(0)
+        retry = gateway._a2a_ack_tasks["task-1:message-1"][1]
+        await retry
         await asyncio.gather(*gateway._a2a_jobs["task-1"])
 
     asyncio.run(scenario())
@@ -1668,6 +1673,151 @@ def test_a2a_admission_rejects_non_authoritative_task(case, expected, tmp_path):
     assert gateway.sessions.session.calls == []
     assert gateway._a2a_jobs == {}
     assert not gateway._a2a_registry_path.exists()
+
+
+def test_a2a_pending_ack_duplicate_rejects_stale_spoofed_generation(tmp_path):
+    gateway = _gateway(tmp_path)
+    task = gateway._a2a_authoritative_task
+    task.state = "working"
+    task.messages.append(types.SimpleNamespace(
+        role="ROLE_CALLER",
+        message_id="message-2",
+        parts=[{"text": "Current caller request."}],
+    ))
+    stale_data = _event()["data"] | {
+        "caller": {"identity_id": "spoofed", "handle": "spoofed"},
+        "parts": [{"text": "Spoofed stale request."}],
+    }
+    key = "task-1:message-1"
+    gateway._write_a2a_registry(
+        key,
+        stale_data,
+        "queued",
+        receipt_text=gateway_mod._a2a_receipt_text(
+            "task-1",
+            gateway.cfg.a2a_progress_interval_seconds,
+        ),
+    )
+
+    response = asyncio.run(gateway._on_a2a_event(_event()))
+
+    assert json.loads(response.text)["ignored"] == "stale-a2a-event"
+    assert gateway.replies == []
+    assert gateway.sessions.session.calls == []
+    saved = json.loads(gateway._a2a_registry_path.read_text())[key]
+    assert saved["state"] == "finalized"
+    assert "pending_text" not in saved.get("receipt", {})
+
+
+def test_a2a_pending_ack_duplicate_uses_authoritative_payload(tmp_path):
+    gateway = _gateway(tmp_path)
+    task = gateway._a2a_authoritative_task
+    task.messages[0].parts = [{"text": "Authoritative request."}]
+    spoofed = _event()["data"] | {
+        "caller": {"identity_id": "spoofed", "handle": "spoofed"},
+        "parts": [{"text": "Spoofed request."}],
+    }
+    key = "task-1:message-1"
+    gateway._write_a2a_registry(
+        key,
+        spoofed,
+        "queued",
+        receipt_text=gateway_mod._a2a_receipt_text(
+            "task-1",
+            gateway.cfg.a2a_progress_interval_seconds,
+        ),
+    )
+    event = _event()
+    event["data"] = spoofed
+
+    response = asyncio.run(gateway._on_a2a_event(event))
+
+    assert json.loads(response.text)["deduped"] is True
+    assert len(gateway.replies) == 1
+    assert gateway.sessions.session.calls == []
+    saved = json.loads(gateway._a2a_registry_path.read_text())[key]
+    assert saved["data"]["parts"] == [{"text": "Authoritative request."}]
+    assert saved["data"]["caller"]["identity_id"] == "caller-1"
+    assert "pending_text" not in saved["receipt"]
+
+
+def test_a2a_ack_retry_rejects_stale_generation(tmp_path, monkeypatch):
+    gateway = _gateway(tmp_path)
+    monkeypatch.setattr(gateway_mod, "_A2A_RETRY_INTERVAL_SECONDS", 0)
+    task = gateway._a2a_authoritative_task
+    task.state = "working"
+    task.messages.append(types.SimpleNamespace(
+        role="ROLE_CALLER",
+        message_id="message-2",
+        parts=[{"text": "Current caller request."}],
+    ))
+    key = "task-1:message-1"
+    data = _event()["data"]
+    gateway._write_a2a_registry(
+        key,
+        data,
+        "queued",
+        receipt_text=gateway_mod._a2a_receipt_text(
+            "task-1",
+            gateway.cfg.a2a_progress_interval_seconds,
+        ),
+    )
+
+    async def scenario():
+        gateway._schedule_a2a_acknowledgement_retry(key, data)
+        await gateway._a2a_ack_tasks[key][1]
+
+    asyncio.run(scenario())
+
+    assert gateway.replies == []
+    saved = json.loads(gateway._a2a_registry_path.read_text())[key]
+    assert saved["state"] == "finalized"
+    assert "pending_text" not in saved.get("receipt", {})
+
+
+def test_a2a_catch_up_rejects_persisted_stale_generation_and_runs_current(tmp_path):
+    gateway = _gateway(tmp_path)
+    stale_key = "task-1:message-1"
+    gateway._write_a2a_registry(stale_key, _event()["data"], "running")
+    task = gateway._a2a_authoritative_task
+    task.state = "working"
+    task.messages.append(types.SimpleNamespace(
+        role="ROLE_CALLER",
+        message_id="message-2",
+        parts=[{"text": "Current caller request."}],
+    ))
+    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter([task])
+
+    async def stay_active(prompt, *, a2a_context=None):
+        gateway.sessions.session.calls.append((prompt, a2a_context))
+        return "[SILENT]"
+
+    gateway.sessions.session.run_consult = stay_active
+
+    async def scenario():
+        await gateway._catch_up_a2a_tasks()
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+        current = _event()
+        current["event_type"] = "a2a.task.message"
+        current["data"] = current["data"] | {
+            "message_id": "message-2",
+            "parts": [{"text": "Spoofed duplicate."}],
+        }
+        return await gateway._on_a2a_event(current)
+
+    duplicate = asyncio.run(scenario())
+
+    assert json.loads(duplicate.text)["deduped"] is True
+    assert len(gateway.sessions.session.calls) == 1
+    prompt, _context = gateway.sessions.session.calls[0]
+    assert prompt.endswith("Current caller request.")
+    assert "Spoofed duplicate." not in prompt
+    assert len(gateway.replies) == 1
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert registry[stale_key]["state"] == "finalized"
+    assert registry["task-1:message-2"]["data"]["parts"] == [
+        {"text": "Current caller request."}
+    ]
 
 
 def test_a2a_cleanup_drains_acknowledgement_retry(tmp_path):

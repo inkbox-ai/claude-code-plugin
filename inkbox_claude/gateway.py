@@ -3567,10 +3567,6 @@ class InkboxGateway:
         """Validate and materialize a new worker turn from authoritative state."""
         authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
         state = _a2a_state(authoritative.state)
-        if state in A2A_STOPPED_STATES:
-            return None, f"task-{state}"
-        if state not in {"submitted", "working"}:
-            return None, "task-inactive"
         authoritative_data = self._a2a_event_data(authoritative)
         if not authoritative_data:
             return None, "stale-a2a-event"
@@ -3584,18 +3580,23 @@ class InkboxGateway:
             or authoritative_key != registry_key
         )
         canceled_keys = self._a2a_canceled_tasks.get(task_id)
+        if not matches_authoritative:
+            if canceled_keys is not None:
+                return None, "task-canceled"
+            return None, "stale-a2a-event"
+        if state in A2A_STOPPED_STATES:
+            return authoritative_data, f"task-{state}"
+        if state not in {"submitted", "working"}:
+            return authoritative_data, "task-inactive"
         if canceled_keys is not None:
             if (
-                matches_authoritative
-                and canceled_keys
+                canceled_keys
                 and registry_key not in canceled_keys
                 and event_type == "a2a.task.message"
             ):
                 self._a2a_canceled_tasks.pop(task_id, None)
-                return authoritative_data, None
-            return None, "task-canceled"
-        if not matches_authoritative:
-            return None, "stale-a2a-event"
+            else:
+                return None, "task-canceled"
         return authoritative_data, None
 
     def _schedule_a2a_acknowledgement_retry(
@@ -3631,6 +3632,37 @@ class InkboxGateway:
             await asyncio.sleep(_A2A_RETRY_INTERVAL_SECONDS)
             try:
                 async with self._a2a_ingest_lock:
+                    admitted_data, ignored = await self._a2a_authoritative_admission(
+                        task_id,
+                        key,
+                        "a2a.task.created",
+                        data,
+                    )
+                    if ignored is not None or admitted_data is None:
+                        entry = self._read_a2a_registry().get(key)
+                        entry = entry if isinstance(entry, dict) else {}
+                        saved_data = entry.get("data")
+                        rejected_data = (
+                            admitted_data
+                            if admitted_data is not None
+                            else saved_data
+                        )
+                        if isinstance(rejected_data, dict):
+                            self._write_a2a_registry(
+                                key,
+                                rejected_data,
+                                "finalized",
+                                receipt_stopped=True,
+                            )
+                        return
+                    data = admitted_data
+                    entry = self._read_a2a_registry().get(key)
+                    entry = entry if isinstance(entry, dict) else {}
+                    self._write_a2a_registry(
+                        key,
+                        data,
+                        str(entry.get("state") or "queued"),
+                    )
                     await self._record_a2a_acknowledgement(key, data)
                 return
             except asyncio.CancelledError:
@@ -4039,27 +4071,6 @@ class InkboxGateway:
                     status=503,
                 )
             existing = self._read_a2a_registry().get(key)
-            if isinstance(existing, dict):
-                if self._a2a_entry_is_fenced(existing):
-                    self._a2a_progress_fences[task_id] = key
-                    return web.json_response({"ok": True, "deduped": True})
-                try:
-                    stopped_state = await self._record_a2a_acknowledgement(
-                        key,
-                        data,
-                    )
-                except Exception:
-                    logger.warning(
-                        "[bridge] could not reconcile A2A acknowledgement for task %s",
-                        task_id,
-                    )
-                    self._schedule_a2a_acknowledgement_retry(key, data)
-                else:
-                    if stopped_state is not None:
-                        return web.json_response(
-                            {"ok": True, "ignored": f"task-{stopped_state}"}
-                        )
-                return web.json_response({"ok": True, "deduped": True})
             try:
                 admitted_data, ignored = await self._a2a_authoritative_admission(
                     task_id,
@@ -4081,10 +4092,59 @@ class InkboxGateway:
                     status=503,
                 )
             if ignored is not None or admitted_data is None:
+                if isinstance(existing, dict):
+                    if (
+                        admitted_data is not None
+                        and str(ignored or "").removeprefix("task-")
+                        in A2A_STOPPED_STATES
+                        and self._a2a_entry_is_fenced(existing)
+                    ):
+                        self._write_a2a_registry(
+                            key,
+                            admitted_data,
+                            str(existing.get("state") or "finalized"),
+                        )
+                        self._a2a_progress_fences[task_id] = key
+                        return web.json_response({"ok": True, "deduped": True})
+                    await self._stop_a2a_acknowledgement_retry(task_id)
+                    saved_data = existing.get("data")
+                    if isinstance(saved_data, dict):
+                        self._write_a2a_registry(
+                            key,
+                            saved_data,
+                            "finalized",
+                            receipt_stopped=True,
+                        )
                 return web.json_response(
                     {"ok": True, "ignored": ignored or "stale-a2a-event"}
                 )
             data = admitted_data
+            if isinstance(existing, dict):
+                self._write_a2a_registry(
+                    key,
+                    data,
+                    str(existing.get("state") or "queued"),
+                )
+                if self._a2a_entry_is_fenced(existing):
+                    self._a2a_progress_fences[task_id] = key
+                    return web.json_response({"ok": True, "deduped": True})
+                try:
+                    stopped_state = await self._record_a2a_acknowledgement(
+                        key,
+                        data,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[bridge] could not reconcile A2A acknowledgement for task %s",
+                        task_id,
+                    )
+                    self._schedule_a2a_acknowledgement_retry(key, data)
+                else:
+                    if stopped_state is not None:
+                        return web.json_response(
+                            {"ok": True, "ignored": f"task-{stopped_state}"}
+                        )
+                return web.json_response({"ok": True, "deduped": True})
             self._write_a2a_registry(key, data, "queued")
             try:
                 stopped_state = await self._record_a2a_acknowledgement(key, data)
@@ -4218,46 +4278,60 @@ class InkboxGateway:
                 task_id = str(entry.get("task_id") or "")
                 if not task_id or self._a2a_jobs.get(task_id):
                     continue
-                full = await asyncio.to_thread(self._identity.a2a_task, task_id)
-                state = _a2a_state(full.state)
                 saved_data = entry.get("data")
-                data = (
-                    dict(saved_data)
-                    if isinstance(saved_data, dict)
-                    else self._a2a_event_data(full)
-                )
+                data = dict(saved_data) if isinstance(saved_data, dict) else {}
                 if not data:
                     continue
-                if state in A2A_STOPPED_STATES:
+                admitted_data, ignored = await self._a2a_authoritative_admission(
+                    task_id,
+                    key,
+                    "a2a.task.created",
+                    data,
+                )
+                if ignored is not None or admitted_data is None:
                     self._a2a_progress_fences.pop(task_id, None)
-                    self._write_a2a_registry(key, data, "finalized")
-                else:
-                    if self._a2a_entry_is_fenced(entry):
-                        self._a2a_progress_fences[task_id] = key
-                        continue
-                    stopped_state = None
-                    try:
-                        stopped_state = await self._record_a2a_acknowledgement(
-                            key,
-                            data,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "[bridge] could not reconcile A2A acknowledgement "
-                            "during catch-up for task %s",
-                            task_id,
-                        )
-                        self._schedule_a2a_acknowledgement_retry(key, data)
-                    if (
-                        stopped_state is None
-                        and entry.get("state") != "finalized"
-                    ):
-                        self._track_a2a_job(task_id, key, data)
+                    self._write_a2a_registry(
+                        key,
+                        admitted_data or data,
+                        "finalized",
+                        receipt_stopped=True,
+                    )
+                    continue
+                data = admitted_data
+                self._write_a2a_registry(
+                    key,
+                    data,
+                    str(entry.get("state") or "queued"),
+                )
+                if self._a2a_entry_is_fenced(entry):
+                    self._a2a_progress_fences[task_id] = key
+                    continue
+                stopped_state = None
+                try:
+                    stopped_state = await self._record_a2a_acknowledgement(
+                        key,
+                        data,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[bridge] could not reconcile A2A acknowledgement "
+                        "during catch-up for task %s",
+                        task_id,
+                    )
+                    self._schedule_a2a_acknowledgement_retry(key, data)
+                if stopped_state is None and entry.get("state") != "finalized":
+                    self._track_a2a_job(task_id, key, data)
 
-            tasks = await asyncio.to_thread(
-                lambda: list(self._identity.iter_a2a_tasks(state="submitted"))
-            )
-            for task in tasks:
+            active_tasks: Dict[str, Any] = {}
+            for state in ("submitted", "working"):
+                tasks = await asyncio.to_thread(
+                    lambda value=state: list(
+                        self._identity.iter_a2a_tasks(state=value)
+                    )
+                )
+                for task in tasks:
+                    active_tasks.setdefault(str(task.id), task)
+            for task in active_tasks.values():
                 full = await asyncio.to_thread(self._identity.a2a_task, task.id)
                 data = self._a2a_event_data(full)
                 if not data:
