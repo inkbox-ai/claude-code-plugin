@@ -681,6 +681,7 @@ A2A_EVENTS = [
 ]
 CALL_EVENTS = ["call.ended"]
 A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
+A2A_STOPPED_STATES = A2A_TERMINAL_STATES | {"input_required", "auth_required"}
 _A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 _A2A_RETRY_INTERVAL_SECONDS = 5.0
 
@@ -707,6 +708,16 @@ def _a2a_receipt_text(task_id: str, progress_interval_seconds: float) -> str:
         interval = f"{progress_interval_seconds:g}"
         unit = "second" if progress_interval_seconds == 1 else "seconds"
     return f"{receipt} Expect progress updates about every {interval} {unit}."
+
+
+def _a2a_state(value: Any) -> str:
+    """Normalize SDK and wire task states to their canonical value."""
+    state = str(getattr(value, "value", value) or "").strip().lower()
+    if state.startswith("task_state_"):
+        return state.removeprefix("task_state_")
+    if state.startswith("a2ataskstate."):
+        return state.removeprefix("a2ataskstate.")
+    return state
 
 
 def _message_too_long_reason(channel: str, content: str, max_chars: int) -> str:
@@ -3434,7 +3445,7 @@ class InkboxGateway:
         return {
             "task_id": str(task.id),
             "context_id": str(task.context_id),
-            "state": str(getattr(task.state, "value", task.state)),
+            "state": _a2a_state(task.state),
             "caller": {
                 "identity_id": str(task.caller.identity_id),
                 "organization_id": task.caller.organization_id,
@@ -3497,8 +3508,8 @@ class InkboxGateway:
             receipt_text=receipt,
         )
         authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
-        state = str(getattr(authoritative.state, "value", authoritative.state))
-        if state in A2A_TERMINAL_STATES:
+        state = _a2a_state(authoritative.state)
+        if state in A2A_STOPPED_STATES:
             return True
         if not self._a2a_task_has_text(authoritative, receipt):
             await asyncio.to_thread(
@@ -3750,7 +3761,7 @@ class InkboxGateway:
         progress = progress if isinstance(progress, dict) else {}
         if (
             progress.get("fenced") is True
-            or self._a2a_progress_fences.get(task_id) is not None
+            or self._a2a_progress_fences.get(task_id) == registry_key
         ):
             return False
         pending = progress.get("pending")
@@ -3759,8 +3770,8 @@ class InkboxGateway:
 
         try:
             authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
-            state = str(getattr(authoritative.state, "value", authoritative.state))
-            if state in A2A_TERMINAL_STATES:
+            state = _a2a_state(authoritative.state)
+            if state in A2A_STOPPED_STATES:
                 return False
         except Exception:
             logger.warning(
@@ -3790,17 +3801,15 @@ class InkboxGateway:
                 "running",
                 progress_text=text,
             )
-            if self._a2a_progress_fences.get(task_id) is not None:
+            if self._a2a_progress_fences.get(task_id) == registry_key:
                 return False
             try:
                 authoritative = await asyncio.to_thread(
                     self._identity.a2a_task,
                     task_id,
                 )
-                state = str(
-                    getattr(authoritative.state, "value", authoritative.state)
-                )
-                if state in A2A_TERMINAL_STATES:
+                state = _a2a_state(authoritative.state)
+                if state in A2A_STOPPED_STATES:
                     return False
             except Exception:
                 logger.warning(
@@ -3811,7 +3820,7 @@ class InkboxGateway:
                 return True
 
         try:
-            if self._a2a_progress_fences.get(task_id) is not None:
+            if self._a2a_progress_fences.get(task_id) == registry_key:
                 return False
             if not self._a2a_task_has_text(authoritative, text):
                 await asyncio.to_thread(
@@ -3860,7 +3869,7 @@ class InkboxGateway:
             self._a2a_jobs.pop(task_id, None)
             return web.json_response({"ok": True})
         if event_type == "a2a.sent_task.updated":
-            state = str(data.get("state") or "").strip().lower()
+            state = _a2a_state(data.get("state"))
             if state in {"submitted", "working"} or state.endswith(
                 ("_submitted", "_working")
             ):
@@ -3975,32 +3984,40 @@ class InkboxGateway:
                 f"{marker}\n{text}".rstrip(),
                 a2a_context=context,
             )
-            await self._stop_a2a_progress_updates(task_id, owner=registry_key)
             if (
                 not context["reply_intent_committed"]
                 and reply.strip()
                 and reply.strip().upper() != "[SILENT]"
             ):
+                await self._fence_a2a_progress_updates(
+                    task_id,
+                    registry_key,
+                    data,
+                )
+                context["reply_intent_committed"] = True
                 authoritative = await asyncio.to_thread(
                     self._identity.a2a_task, task_id
                 )
-                state = str(
-                    getattr(authoritative.state, "value", authoritative.state)
-                )
-                if state not in A2A_TERMINAL_STATES:
+                state = _a2a_state(authoritative.state)
+                if state not in A2A_STOPPED_STATES:
                     await asyncio.to_thread(
                         self._identity.a2a_reply,
                         task_id,
                         intent="complete",
                         text=reply,
                     )
+            else:
+                await self._stop_a2a_progress_updates(
+                    task_id,
+                    owner=registry_key,
+                )
             self._write_a2a_registry(registry_key, data, "finalized")
         except asyncio.CancelledError:
             authoritative = await asyncio.to_thread(
                 self._identity.a2a_task, task_id
             )
-            state = str(getattr(authoritative.state, "value", authoritative.state))
-            if state in A2A_TERMINAL_STATES:
+            state = _a2a_state(authoritative.state)
+            if state in A2A_STOPPED_STATES:
                 self._write_a2a_registry(registry_key, data, "finalized")
             raise
         except Exception:
@@ -4022,7 +4039,7 @@ class InkboxGateway:
                 if not task_id or self._a2a_jobs.get(task_id):
                     continue
                 full = await asyncio.to_thread(self._identity.a2a_task, task_id)
-                state = str(getattr(full.state, "value", full.state))
+                state = _a2a_state(full.state)
                 saved_data = entry.get("data")
                 data = (
                     dict(saved_data)
@@ -4031,7 +4048,7 @@ class InkboxGateway:
                 )
                 if not data:
                     continue
-                if state in A2A_TERMINAL_STATES:
+                if state in A2A_STOPPED_STATES:
                     self._a2a_progress_fences.pop(task_id, None)
                     self._write_a2a_registry(key, data, "finalized")
                 else:
