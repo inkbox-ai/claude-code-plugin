@@ -51,8 +51,10 @@ def _gateway(tmp_path):
     gateway = object.__new__(InkboxGateway)
     gateway._a2a_registry_path = tmp_path / "a2a.json"
     gateway._a2a_jobs = {}
+    gateway._a2a_ack_tasks = {}
     gateway._a2a_progress_tasks = {}
     gateway._a2a_progress_stop_events = {}
+    gateway._a2a_progress_owners = {}
     gateway._a2a_ingest_lock = asyncio.Lock()
     gateway.cfg = BridgeConfig(project_dir=str(tmp_path))
     task = types.SimpleNamespace(state="submitted", messages=[])
@@ -63,7 +65,9 @@ def _gateway(tmp_path):
             task.state = "working"
         elif kwargs.get("intent") == "complete":
             task.state = "completed"
-        task.messages.append(types.SimpleNamespace(parts=[{"text": kwargs["text"]}]))
+        task.messages.append(
+            types.SimpleNamespace(role="agent", parts=[{"text": kwargs["text"]}])
+        )
 
     gateway._identity = types.SimpleNamespace(
         id="identity-1",
@@ -290,6 +294,107 @@ def test_a2a_acknowledgement_recovers_accepted_reply_without_duplicate(tmp_path)
     assert registry[key]["receipt"]["delivered_text"].startswith("Task task-1")
 
 
+def test_a2a_acknowledgement_ignores_caller_spoof(tmp_path):
+    gateway = _gateway(tmp_path)
+    key = "task-1:message-1"
+    data = _event()["data"]
+    receipt = gateway_mod._a2a_receipt_text(
+        "task-1",
+        gateway.cfg.a2a_progress_interval_seconds,
+    )
+    gateway._a2a_authoritative_task.messages.append(
+        types.SimpleNamespace(role="caller", parts=[{"text": receipt}])
+    )
+    gateway._write_a2a_registry(key, data, "queued")
+
+    asyncio.run(gateway._record_a2a_acknowledgement(key, data))
+
+    assert gateway.replies[-1][1]["text"] == receipt
+
+
+def test_failed_a2a_acknowledgement_keeps_referenced_background_retry(
+    tmp_path,
+    monkeypatch,
+):
+    gateway = _gateway(tmp_path)
+    monkeypatch.setattr(gateway_mod, "_A2A_RETRY_INTERVAL_SECONDS", 0)
+    attempts = 0
+    original_reply = gateway._identity.a2a_reply
+
+    def fail_once(task_id, **kwargs):
+        nonlocal attempts
+        if kwargs.get("intent") == "progress":
+            attempts += 1
+        if kwargs.get("intent") == "progress" and attempts == 1:
+            raise OSError("temporarily unavailable")
+        original_reply(task_id, **kwargs)
+
+    gateway._identity.a2a_reply = fail_once
+
+    async def scenario():
+        response = await gateway._on_a2a_event(_event())
+        assert response.status == 200
+        assert "task-1:message-1" in gateway._a2a_ack_tasks
+        pending = json.loads(gateway._a2a_registry_path.read_text())[
+            "task-1:message-1"
+        ]["receipt"]
+        assert pending["pending_text"].startswith("Task task-1")
+        for _ in range(20):
+            if "task-1:message-1" not in gateway._a2a_ack_tasks:
+                break
+            await asyncio.sleep(0)
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+
+    assert attempts == 2
+    receipt = json.loads(gateway._a2a_registry_path.read_text())[
+        "task-1:message-1"
+    ]["receipt"]
+    assert "pending_text" not in receipt
+    assert receipt["delivered_text"].startswith("Task task-1")
+
+
+def test_a2a_catch_up_recovers_pending_ack_without_rerunning_finalized_turn(
+    tmp_path,
+):
+    gateway = _gateway(tmp_path)
+    key = "task-1:message-1"
+    data = _event()["data"]
+    receipt = gateway_mod._a2a_receipt_text(
+        "task-1",
+        gateway.cfg.a2a_progress_interval_seconds,
+    )
+    gateway._write_a2a_registry(key, data, "queued", receipt_text=receipt)
+    gateway._write_a2a_registry(key, data, "finalized")
+    task = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="working",
+        caller=types.SimpleNamespace(
+            identity_id="caller-1",
+            organization_id="org-1",
+            handle="caller",
+        ),
+        messages=[
+            types.SimpleNamespace(
+                role="caller",
+                message_id="message-1",
+                parts=[{"text": "Investigate."}],
+            )
+        ],
+    )
+    gateway._identity.a2a_task = lambda _task_id: task
+    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter(())
+
+    asyncio.run(gateway._catch_up_a2a_tasks())
+
+    saved = json.loads(gateway._a2a_registry_path.read_text())[key]
+    assert saved["state"] == "finalized"
+    assert saved["receipt"]["delivered_text"] == receipt
+    assert gateway._a2a_jobs == {}
+
+
 def test_a2a_progress_summary_rejects_terminal_claim():
     terminal_updates = (
         "Done — the task is complete.",
@@ -424,7 +529,7 @@ def test_a2a_progress_retry_recovers_accepted_reply_without_duplicate(tmp_path):
     gateway._a2a_authoritative_task.state = "working"
     update = "I'm validating the work. (60s elapsed)"
     gateway._a2a_authoritative_task.messages.append(
-        types.SimpleNamespace(parts=[{"text": update}])
+        types.SimpleNamespace(role="agent", parts=[{"text": update}])
     )
     key = "task-1:message-1"
     data = _event()["data"]
@@ -444,6 +549,28 @@ def test_a2a_progress_retry_recovers_accepted_reply_without_duplicate(tmp_path):
     progress = json.loads(gateway._a2a_registry_path.read_text())[key]["progress"]
     assert progress["last_delivered_text"] == update
     assert "pending" not in progress
+
+
+def test_a2a_progress_retry_ignores_caller_spoof(tmp_path):
+    gateway = _gateway(tmp_path)
+    gateway._a2a_authoritative_task.state = "working"
+    update = "I'm validating the work. (60s elapsed)"
+    gateway._a2a_authoritative_task.messages.append(
+        types.SimpleNamespace(role="caller", parts=[{"text": update}])
+    )
+    key = "task-1:message-1"
+    data = _event()["data"]
+    gateway._write_a2a_registry(key, data, "running", progress_started=True)
+    gateway._write_a2a_registry(key, data, "running", progress_text=update)
+
+    asyncio.run(gateway._emit_a2a_progress_update(
+        task_id="task-1",
+        registry_key=key,
+        data=data,
+        task_text="Validate the work.",
+    ))
+
+    assert gateway.replies[-1][1]["text"] == update
 
 
 def test_a2a_progress_elapsed_time_continues_across_caller_follow_up(tmp_path):
@@ -469,6 +596,95 @@ def test_a2a_progress_elapsed_time_continues_across_caller_follow_up(tmp_path):
 
     registry = json.loads(gateway._a2a_registry_path.read_text())
     assert registry[second_key]["progress"]["started_at"] == started_at
+
+
+def test_a2a_progress_follow_up_preserves_near_boundary_cadence(
+    tmp_path,
+    monkeypatch,
+):
+    gateway = _gateway(tmp_path)
+    gateway.cfg.a2a_progress_interval_seconds = 180
+    now = [1_000.0]
+    monkeypatch.setattr(gateway_mod.time, "time", lambda: now[0])
+    first_key = "task-1:message-1"
+    gateway._write_a2a_registry(
+        first_key,
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
+    now[0] = 1_179.0
+    follow_up = _event()["data"] | {"message_id": "message-2"}
+    second_key = "task-1:message-2"
+    gateway._write_a2a_registry(
+        second_key,
+        follow_up,
+        "running",
+        progress_started=True,
+    )
+    sleeps = []
+
+    async def fake_wait_for(awaitable, timeout):
+        awaitable.close()
+        sleeps.append(timeout)
+        raise asyncio.TimeoutError
+
+    async def stop_after_one(**_kwargs):
+        return False
+
+    monkeypatch.setattr(gateway_mod.asyncio, "wait_for", fake_wait_for)
+    gateway._emit_a2a_progress_update = stop_after_one
+
+    asyncio.run(gateway._run_a2a_progress_updates(
+        task_id="task-1",
+        registry_key=second_key,
+        data=follow_up,
+        task_text="Calculate.",
+        stop_event=asyncio.Event(),
+    ))
+
+    assert sleeps == [1.0]
+    registry = json.loads(gateway._a2a_registry_path.read_text())
+    assert registry[second_key]["progress"]["next_due_at"] == 1_180.0
+
+
+def test_a2a_pending_progress_retries_immediately_after_restart(
+    tmp_path,
+    monkeypatch,
+):
+    gateway = _gateway(tmp_path)
+    gateway.cfg.a2a_progress_interval_seconds = 180
+    key = "task-1:message-1"
+    data = _event()["data"]
+    gateway._write_a2a_registry(key, data, "running", progress_started=True)
+    gateway._write_a2a_registry(
+        key,
+        data,
+        "running",
+        progress_text="I'm checking the calculation. (180s elapsed)",
+    )
+    sleeps = []
+
+    async def fake_wait_for(awaitable, timeout):
+        awaitable.close()
+        sleeps.append(timeout)
+        raise asyncio.TimeoutError
+
+    async def stop_after_one(**_kwargs):
+        return False
+
+    monkeypatch.setattr(gateway_mod.asyncio, "wait_for", fake_wait_for)
+    gateway._emit_a2a_progress_update = stop_after_one
+
+    asyncio.run(gateway._run_a2a_progress_updates(
+        task_id="task-1",
+        registry_key=key,
+        data=data,
+        task_text="Calculate.",
+        stop_event=asyncio.Event(),
+    ))
+
+    assert sleeps == [0]
 
 
 def test_a2a_progress_stops_for_terminal_task(tmp_path):
@@ -521,6 +737,13 @@ def test_a2a_progress_rechecks_state_after_summary(tmp_path, monkeypatch):
 def test_a2a_progress_runner_waits_configured_interval(monkeypatch, tmp_path):
     gateway = _gateway(tmp_path)
     gateway.cfg.a2a_progress_interval_seconds = 60
+    key = "task-1:message-1"
+    gateway._write_a2a_registry(
+        key,
+        _event()["data"],
+        "running",
+        progress_started=True,
+    )
     sleeps = []
     emissions = []
 
@@ -538,19 +761,57 @@ def test_a2a_progress_runner_waits_configured_interval(monkeypatch, tmp_path):
 
     asyncio.run(gateway._run_a2a_progress_updates(
         task_id="task-1",
-        registry_key="task-1:message-1",
+        registry_key=key,
         data=_event()["data"],
         task_text="Calculate.",
         stop_event=asyncio.Event(),
     ))
 
-    assert sleeps == [60]
+    assert sleeps == [pytest.approx(60, abs=0.1)]
     assert emissions == [{
         "task_id": "task-1",
         "registry_key": "task-1:message-1",
         "data": _event()["data"],
         "task_text": "Calculate.",
     }]
+
+
+def test_older_a2a_turn_cannot_stop_follow_up_progress_runner(tmp_path):
+    gateway = _gateway(tmp_path)
+    first = _event()["data"]
+    second = first | {"message_id": "message-2"}
+
+    async def scenario():
+        await gateway._start_a2a_progress_updates(
+            task_id="task-1",
+            registry_key="task-1:message-1",
+            data=first,
+            task_text="First turn.",
+        )
+        await gateway._start_a2a_progress_updates(
+            task_id="task-1",
+            registry_key="task-1:message-2",
+            data=second,
+            task_text="Follow up.",
+        )
+        replacement = gateway._a2a_progress_tasks["task-1"]
+
+        # The older worker turn reaches its finally block after the follow-up
+        # already owns the task's progress runner.
+        await gateway._stop_a2a_progress_updates(
+            "task-1",
+            owner="task-1:message-1",
+        )
+
+        assert gateway._a2a_progress_tasks["task-1"] is replacement
+        assert not replacement.done()
+        assert gateway._a2a_progress_owners["task-1"] == "task-1:message-2"
+        await gateway._stop_a2a_progress_updates(
+            "task-1",
+            owner="task-1:message-2",
+        )
+
+    asyncio.run(scenario())
 
 
 def test_a2a_completion_cancels_progress_timer(tmp_path):
@@ -577,9 +838,15 @@ def test_a2a_cancellation_drains_worker_and_progress_tasks(tmp_path):
             task_text="Calculate.",
             stop_event=stop_event,
         ))
+        acknowledgement_task = asyncio.create_task(asyncio.sleep(30))
         worker_task = asyncio.create_task(asyncio.sleep(30))
+        gateway._a2a_ack_tasks["task-1:message-1"] = (
+            "task-1",
+            acknowledgement_task,
+        )
         gateway._a2a_progress_tasks["task-1"] = progress_task
         gateway._a2a_progress_stop_events["task-1"] = stop_event
+        gateway._a2a_progress_owners["task-1"] = "task-1:message-1"
         gateway._a2a_jobs["task-1"] = {worker_task}
         canceled = _event()
         canceled["event_type"] = "a2a.task.canceled"
@@ -587,10 +854,35 @@ def test_a2a_cancellation_drains_worker_and_progress_tasks(tmp_path):
         await gateway._on_a2a_event(canceled)
 
         assert progress_task.done()
+        assert acknowledgement_task.cancelled()
         assert worker_task.cancelled()
+        assert gateway._a2a_ack_tasks == {}
         assert gateway._a2a_progress_tasks == {}
         assert gateway._a2a_progress_stop_events == {}
+        assert gateway._a2a_progress_owners == {}
         assert gateway._a2a_jobs == {}
         assert progress_mod.a2a_tool_snapshot("task-1") == []
+
+    asyncio.run(scenario())
+
+
+def test_a2a_cleanup_drains_acknowledgement_retry(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def scenario():
+        acknowledgement_task = asyncio.create_task(asyncio.sleep(30))
+        gateway._a2a_ack_tasks["task-1:message-1"] = (
+            "task-1",
+            acknowledgement_task,
+        )
+        gateway._hosted_call_jobs = {}
+        gateway.sessions = None
+        gateway._runner = None
+        gateway._tunnel = None
+
+        await gateway._cleanup()
+
+        assert acknowledgement_task.cancelled()
+        assert gateway._a2a_ack_tasks == {}
 
     asyncio.run(scenario())
