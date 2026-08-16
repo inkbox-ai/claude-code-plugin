@@ -91,7 +91,7 @@ try:
         open_inkbox_realtime_bridge,
     )
     from .sessions import CapturedTurnResult, SessionManager
-    from .tools import build_inkbox_mcp_server
+    from .tools import _to_thread_drained, build_inkbox_mcp_server
     from .webhook_providers import match_provider
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from a2a_delegations import find_by_task as find_a2a_delegation
@@ -127,7 +127,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         open_inkbox_realtime_bridge,
     )
     from sessions import CapturedTurnResult, SessionManager
-    from tools import build_inkbox_mcp_server
+    from tools import _to_thread_drained, build_inkbox_mcp_server
     from webhook_providers import match_provider
 
 logger = logging.getLogger(__name__)
@@ -814,6 +814,7 @@ class InkboxGateway:
         self._a2a_progress_owners: Dict[str, str] = {}
         self._a2a_progress_fences: Dict[str, str] = {}
         self._a2a_ingest_lock = asyncio.Lock()
+        self._closing = False
         state_root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
         state_root.mkdir(parents=True, exist_ok=True)
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
@@ -1582,6 +1583,9 @@ class InkboxGateway:
             logger.exception("[bridge] hosted call completion failed call_id=%s", call_id)
 
     async def _cleanup(self) -> None:
+        self._closing = True
+        async with self._a2a_ingest_lock:
+            pass
         for stop_event in self._a2a_progress_stop_events.values():
             stop_event.set()
         a2a_jobs = [
@@ -3294,6 +3298,7 @@ class InkboxGateway:
         *,
         receipt_text: Optional[str] = None,
         receipt_delivered: bool = False,
+        receipt_stopped: bool = False,
         progress_started: bool = False,
         progress_text: Optional[str] = None,
         progress_delivered: bool = False,
@@ -3320,6 +3325,8 @@ class InkboxGateway:
                 receipt.get("pending_text") or receipt.get("delivered_text") or ""
             )
             receipt["delivered_at"] = now
+            receipt.pop("pending_text", None)
+        if receipt_stopped:
             receipt.pop("pending_text", None)
         if receipt:
             entry["receipt"] = receipt
@@ -3498,7 +3505,8 @@ class InkboxGateway:
         self,
         key: str,
         data: Dict[str, Any],
-    ) -> bool:
+    ) -> Optional[str]:
+        """Reconcile the receipt, returning a canonical stopped state if found."""
         task_id = str(data.get("task_id") or "")
         receipt = _a2a_receipt_text(
             task_id,
@@ -3508,32 +3516,33 @@ class InkboxGateway:
         entry = entry if isinstance(entry, dict) else {}
         saved = entry.get("receipt")
         saved = saved if isinstance(saved, dict) else {}
-        if str(saved.get("delivered_text") or "") == receipt:
-            return True
-        self._write_a2a_registry(
-            key,
-            data,
-            str(entry.get("state") or "queued"),
-            receipt_text=receipt,
-        )
+        delivered = str(saved.get("delivered_text") or "") == receipt
+        if not delivered:
+            self._write_a2a_registry(
+                key,
+                data,
+                str(entry.get("state") or "queued"),
+                receipt_text=receipt,
+            )
         authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
         state = _a2a_state(authoritative.state)
         if state in A2A_STOPPED_STATES:
-            return True
-        if not self._a2a_task_has_text(authoritative, receipt):
-            reply = asyncio.create_task(
-                asyncio.to_thread(
-                    self._identity.a2a_reply,
-                    task_id,
-                    intent="progress",
-                    text=receipt,
-                )
+            self._write_a2a_registry(
+                key,
+                data,
+                "finalized",
+                receipt_stopped=True,
             )
-            try:
-                await asyncio.shield(reply)
-            except asyncio.CancelledError:
-                await asyncio.gather(reply, return_exceptions=True)
-                raise
+            return state
+        if delivered:
+            return None
+        if not self._a2a_task_has_text(authoritative, receipt):
+            await _to_thread_drained(
+                self._identity.a2a_reply,
+                task_id,
+                intent="progress",
+                text=receipt,
+            )
         entry = self._read_a2a_registry().get(key)
         entry = entry if isinstance(entry, dict) else {}
         self._write_a2a_registry(
@@ -3542,7 +3551,7 @@ class InkboxGateway:
             str(entry.get("state") or "queued"),
             receipt_delivered=True,
         )
-        return True
+        return None
 
     def _schedule_a2a_acknowledgement_retry(
         self,
@@ -3865,6 +3874,8 @@ class InkboxGateway:
         self,
         envelope: Dict[str, Any],
     ) -> "web.Response":
+        if self._closing:
+            return web.json_response({"ok": True, "ignored": "gateway-closing"})
         event_type = str(envelope.get("event_type") or "")
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
         task_id = str(data.get("task_id") or "")
@@ -3926,23 +3937,33 @@ class InkboxGateway:
 
         key = f"{task_id}:{message_id}"
         async with self._a2a_ingest_lock:
+            if self._closing:
+                return web.json_response({"ok": True, "ignored": "gateway-closing"})
             existing = self._read_a2a_registry().get(key)
             if isinstance(existing, dict):
                 if self._a2a_entry_is_fenced(existing):
                     self._a2a_progress_fences[task_id] = key
                     return web.json_response({"ok": True, "deduped": True})
                 try:
-                    await self._record_a2a_acknowledgement(key, data)
+                    stopped_state = await self._record_a2a_acknowledgement(
+                        key,
+                        data,
+                    )
                 except Exception:
                     logger.warning(
                         "[bridge] could not reconcile A2A acknowledgement for task %s",
                         task_id,
                     )
                     self._schedule_a2a_acknowledgement_retry(key, data)
+                else:
+                    if stopped_state is not None:
+                        return web.json_response(
+                            {"ok": True, "ignored": f"task-{stopped_state}"}
+                        )
                 return web.json_response({"ok": True, "deduped": True})
             self._write_a2a_registry(key, data, "queued")
             try:
-                await self._record_a2a_acknowledgement(key, data)
+                stopped_state = await self._record_a2a_acknowledgement(key, data)
             except Exception:
                 logger.warning(
                     "[bridge] could not send A2A acknowledgement for task %s; "
@@ -3950,6 +3971,11 @@ class InkboxGateway:
                     task_id,
                 )
                 self._schedule_a2a_acknowledgement_retry(key, data)
+            else:
+                if stopped_state is not None:
+                    return web.json_response(
+                        {"ok": True, "ignored": f"task-{stopped_state}"}
+                    )
             self._track_a2a_job(task_id, key, data)
         return web.json_response({"ok": True})
 
@@ -4020,7 +4046,7 @@ class InkboxGateway:
                 )
                 state = _a2a_state(authoritative.state)
                 if state not in A2A_STOPPED_STATES:
-                    await asyncio.to_thread(
+                    await _to_thread_drained(
                         self._identity.a2a_reply,
                         task_id,
                         intent="complete",
@@ -4075,8 +4101,12 @@ class InkboxGateway:
                     if self._a2a_entry_is_fenced(entry):
                         self._a2a_progress_fences[task_id] = key
                         continue
+                    stopped_state = None
                     try:
-                        await self._record_a2a_acknowledgement(key, data)
+                        stopped_state = await self._record_a2a_acknowledgement(
+                            key,
+                            data,
+                        )
                     except Exception:
                         logger.warning(
                             "[bridge] could not reconcile A2A acknowledgement "
@@ -4084,7 +4114,10 @@ class InkboxGateway:
                             task_id,
                         )
                         self._schedule_a2a_acknowledgement_retry(key, data)
-                    if entry.get("state") != "finalized":
+                    if (
+                        stopped_state is None
+                        and entry.get("state") != "finalized"
+                    ):
                         self._track_a2a_job(task_id, key, data)
 
             tasks = await asyncio.to_thread(

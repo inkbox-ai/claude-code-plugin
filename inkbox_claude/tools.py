@@ -55,6 +55,16 @@ IMESSAGE_MAX_LENGTH = 18995
 IMESSAGE_MAX_GROUP_RECIPIENTS = 8
 
 
+async def _to_thread_drained(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking side effect to completion even if its caller is canceled."""
+    call = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(call)
+    except asyncio.CancelledError:
+        await asyncio.gather(call, return_exceptions=True)
+        raise
+
+
 def _normalize_imessage_recipients(value: Any) -> Optional[List[str]]:
     """`to` as a list of E.164 strings, or None when the caller omitted it."""
     if value is None:
@@ -1109,7 +1119,7 @@ def build_inkbox_mcp_server(
         if callable(fence_progress):
             await fence_progress()
         context["reply_intent_committed"] = True
-        return await asyncio.to_thread(
+        return await _to_thread_drained(
             _identity().a2a_reply,
             context["task_id"],
             intent=intent,

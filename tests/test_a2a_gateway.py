@@ -58,6 +58,7 @@ def _gateway(tmp_path):
     gateway._a2a_progress_owners = {}
     gateway._a2a_progress_fences = {}
     gateway._a2a_ingest_lock = asyncio.Lock()
+    gateway._closing = False
     gateway.cfg = BridgeConfig(project_dir=str(tmp_path))
     task = types.SimpleNamespace(state="submitted", messages=[])
 
@@ -378,17 +379,63 @@ def test_a2a_acknowledgement_ignores_caller_spoof(tmp_path):
     assert gateway.replies[-1][1]["text"] == receipt
 
 
-@pytest.mark.parametrize("state", ["input_required", "TASK_STATE_AUTH_REQUIRED"])
-def test_a2a_acknowledgement_stops_for_waiting_state(tmp_path, state):
+@pytest.mark.parametrize(
+    ("state", "canonical"),
+    [
+        ("completed", "completed"),
+        ("TASK_STATE_FAILED", "failed"),
+        ("A2ATaskState.CANCELED", "canceled"),
+        ("rejected", "rejected"),
+        ("TASK_STATE_INPUT_REQUIRED", "input_required"),
+        ("auth_required", "auth_required"),
+    ],
+)
+def test_delayed_a2a_webhook_stops_before_worker_turn(
+    tmp_path,
+    state,
+    canonical,
+):
     gateway = _gateway(tmp_path)
     gateway._a2a_authoritative_task.state = state
+
+    response = asyncio.run(gateway._on_a2a_event(_event()))
+
+    assert json.loads(response.text)["ignored"] == f"task-{canonical}"
+    assert gateway.replies == []
+    assert gateway.sessions.keys == []
+    assert gateway.sessions.session.calls == []
+    assert gateway._a2a_jobs == {}
+    saved = json.loads(gateway._a2a_registry_path.read_text())[
+        "task-1:message-1"
+    ]
+    assert saved["state"] == "finalized"
+    assert not saved.get("receipt", {}).get("pending_text")
+
+
+def test_delayed_duplicate_webhook_finalizes_acknowledged_task(tmp_path):
+    gateway = _gateway(tmp_path)
     key = "task-1:message-1"
     data = _event()["data"]
-    gateway._write_a2a_registry(key, data, "queued")
+    receipt = gateway_mod._a2a_receipt_text(
+        "task-1",
+        gateway.cfg.a2a_progress_interval_seconds,
+    )
+    gateway._write_a2a_registry(
+        key,
+        data,
+        "running",
+        receipt_text=receipt,
+        receipt_delivered=True,
+    )
+    gateway._a2a_authoritative_task.state = "TASK_STATE_COMPLETED"
 
-    asyncio.run(gateway._record_a2a_acknowledgement(key, data))
+    response = asyncio.run(gateway._on_a2a_event(_event()))
 
-    assert gateway.replies == []
+    assert json.loads(response.text)["ignored"] == "task-completed"
+    assert gateway.sessions.keys == []
+    assert gateway._a2a_jobs == {}
+    saved = json.loads(gateway._a2a_registry_path.read_text())[key]
+    assert saved["state"] == "finalized"
 
 
 def test_a2a_acknowledgement_accepts_raw_agent_role(tmp_path):
@@ -1400,5 +1447,80 @@ def test_a2a_acknowledgement_send_is_drained_before_stop(
         assert was_pending
         assert completed_before_stop_returned
         assert gateway._a2a_ack_tasks == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stop_reason", ["cancel", "shutdown"])
+def test_implicit_completion_send_is_drained_before_stop(
+    tmp_path,
+    stop_reason,
+):
+    gateway = _gateway(tmp_path)
+    original_reply = gateway._identity.a2a_reply
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def paused_reply(task_id, **kwargs):
+        if kwargs.get("intent") != "complete":
+            return original_reply(task_id, **kwargs)
+        started.set()
+        assert release.wait(5)
+        original_reply(task_id, **kwargs)
+        completed.set()
+
+    gateway._identity.a2a_reply = paused_reply
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        assert await asyncio.to_thread(started.wait, 5)
+
+        if stop_reason == "cancel":
+            event = _event()
+            event["event_type"] = "a2a.task.canceled"
+            stopping = asyncio.create_task(gateway._on_a2a_event(event))
+        else:
+            gateway._hosted_call_jobs = {}
+            gateway.sessions = None
+            gateway._runner = None
+            gateway._tunnel = None
+            stopping = asyncio.create_task(gateway._cleanup())
+
+        await asyncio.sleep(0)
+        was_pending = not stopping.done()
+        release.set()
+        await stopping
+        completed_before_stop_returned = completed.is_set()
+        assert await asyncio.to_thread(completed.wait, 5)
+
+        assert was_pending
+        assert completed_before_stop_returned
+        assert gateway._a2a_jobs == {}
+
+    asyncio.run(scenario())
+
+
+def test_a2a_webhook_admission_is_closed_before_cleanup_drain(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def scenario():
+        gateway._hosted_call_jobs = {}
+        gateway.sessions = None
+        gateway._runner = None
+        gateway._tunnel = None
+        await gateway._a2a_ingest_lock.acquire()
+        webhook = asyncio.create_task(gateway._on_a2a_event(_event()))
+        await asyncio.sleep(0)
+        cleanup = asyncio.create_task(gateway._cleanup())
+        await asyncio.sleep(0)
+        assert gateway._closing is True
+        gateway._a2a_ingest_lock.release()
+
+        response = await webhook
+        assert json.loads(response.text)["ignored"] == "gateway-closing"
+        assert not gateway._a2a_registry_path.exists()
+        await cleanup
+        assert gateway._a2a_jobs == {}
 
     asyncio.run(scenario())

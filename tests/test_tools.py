@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -493,6 +494,69 @@ def test_failed_a2a_intent_reply_remains_committed_after_fence():
     assert events == ["fenced", "reply"]
     assert context["reply_intent_committed"] is True
     assert "response unavailable" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("inkbox_a2a_complete", {"text": "Done."}),
+        ("inkbox_a2a_ask_caller", {"text": "Which region?"}),
+        ("inkbox_a2a_fail", {"reason": "Unavailable."}),
+    ],
+)
+def test_a2a_intent_tools_drain_blocked_reply_on_cancel(
+    monkeypatch,
+    tool_name,
+    arguments,
+):
+    async def threaded(function, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: function(*args, **kwargs))
+
+    monkeypatch.setattr(tools_mod.asyncio, "to_thread", threaded)
+    client = _FakeClient()
+    registered, _ = _tool_map(client)
+    original_reply = client.identity.a2a_reply
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def paused_reply(task_id, **kwargs):
+        started.set()
+        assert release.wait(5)
+        result = original_reply(task_id, **kwargs)
+        completed.set()
+        return result
+
+    client.identity.a2a_reply = paused_reply
+    context = {
+        "task_id": "task-1",
+        "message_id": "message-1",
+        "context_id": "context-1",
+        "reply_intent_committed": False,
+    }
+
+    async def scenario():
+        token = tools_mod.A2A_TURN_CONTEXT.set(context)
+        try:
+            call = asyncio.create_task(registered[tool_name](arguments))
+            assert await threaded(started.wait, 5)
+            call.cancel()
+            await asyncio.sleep(0)
+            was_pending = not call.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            completed_before_cancel_returned = completed.is_set()
+            assert await threaded(completed.wait, 5)
+        finally:
+            tools_mod.A2A_TURN_CONTEXT.reset(token)
+
+        assert was_pending
+        assert completed_before_cancel_returned
+        assert len(client.identity.a2a_replies) == 1
+
+    asyncio.run(scenario())
 
 
 def test_place_call_writes_context_and_tags_websocket_url(tmp_path, monkeypatch):
