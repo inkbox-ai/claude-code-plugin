@@ -813,6 +813,7 @@ class InkboxGateway:
         self._a2a_progress_stop_events: Dict[str, asyncio.Event] = {}
         self._a2a_progress_owners: Dict[str, str] = {}
         self._a2a_progress_fences: Dict[str, str] = {}
+        self._a2a_canceled_tasks: Dict[str, set[str]] = {}
         self._a2a_ingest_lock = asyncio.Lock()
         self._closing = False
         state_root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
@@ -1605,6 +1606,7 @@ class InkboxGateway:
         self._a2a_progress_stop_events.clear()
         self._a2a_progress_owners.clear()
         self._a2a_progress_fences.clear()
+        self._a2a_canceled_tasks.clear()
         self._a2a_jobs.clear()
         jobs = list(self._hosted_call_jobs.values())
         for task in jobs:
@@ -3426,6 +3428,8 @@ class InkboxGateway:
         registry_key: str,
         data: Dict[str, Any],
     ) -> None:
+        if task_id in self._a2a_canceled_tasks:
+            return
         entry = self._read_a2a_registry().get(registry_key)
         if self._a2a_entry_is_fenced(entry):
             self._a2a_progress_fences[task_id] = registry_key
@@ -3552,6 +3556,29 @@ class InkboxGateway:
             receipt_delivered=True,
         )
         return None
+
+    async def _a2a_admission_stopped_state(
+        self,
+        task_id: str,
+        registry_key: str,
+        event_type: str,
+    ) -> Optional[str]:
+        """Fence canceled work unless a new active caller message follows it."""
+        authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
+        state = _a2a_state(authoritative.state)
+        if state in A2A_STOPPED_STATES:
+            return state
+        canceled_keys = self._a2a_canceled_tasks.get(task_id)
+        if canceled_keys is None:
+            return None
+        if (
+            canceled_keys
+            and registry_key not in canceled_keys
+            and event_type == "a2a.task.message"
+        ):
+            self._a2a_canceled_tasks.pop(task_id, None)
+            return None
+        return "canceled"
 
     def _schedule_a2a_acknowledgement_retry(
         self,
@@ -3885,15 +3912,34 @@ class InkboxGateway:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
 
         if event_type == "a2a.task.canceled":
-            await self._stop_a2a_acknowledgement_retry(task_id)
-            await self._stop_a2a_progress_updates(task_id)
-            self._a2a_progress_fences.pop(task_id, None)
-            jobs = list(self._a2a_jobs.get(task_id, set()))
-            for job in jobs:
-                job.cancel()
-            if jobs:
-                await asyncio.gather(*jobs, return_exceptions=True)
-            self._a2a_jobs.pop(task_id, None)
+            known_keys = {
+                key
+                for key, entry in self._read_a2a_registry().items()
+                if isinstance(entry, dict)
+                and str(entry.get("task_id") or "") == task_id
+            }
+            self._a2a_canceled_tasks.setdefault(task_id, set()).update(known_keys)
+            async with self._a2a_ingest_lock:
+                await self._stop_a2a_acknowledgement_retry(task_id)
+                await self._stop_a2a_progress_updates(task_id)
+                self._a2a_progress_fences.pop(task_id, None)
+                jobs = list(self._a2a_jobs.get(task_id, set()))
+                for job in jobs:
+                    job.cancel()
+                if jobs:
+                    await asyncio.gather(*jobs, return_exceptions=True)
+                self._a2a_jobs.pop(task_id, None)
+                registry = self._read_a2a_registry()
+                for key in known_keys:
+                    entry = registry.get(key)
+                    saved_data = entry.get("data") if isinstance(entry, dict) else None
+                    if isinstance(saved_data, dict):
+                        self._write_a2a_registry(
+                            key,
+                            saved_data,
+                            "finalized",
+                            receipt_stopped=True,
+                        )
             return web.json_response({"ok": True})
         if event_type == "a2a.sent_task.updated":
             state = _a2a_state(data.get("state"))
@@ -3973,6 +4019,29 @@ class InkboxGateway:
                 self._schedule_a2a_acknowledgement_retry(key, data)
             else:
                 if stopped_state is not None:
+                    return web.json_response(
+                        {"ok": True, "ignored": f"task-{stopped_state}"}
+                    )
+            try:
+                stopped_state = await self._a2a_admission_stopped_state(
+                    task_id,
+                    key,
+                    event_type,
+                )
+            except Exception:
+                logger.warning(
+                    "[bridge] could not recheck A2A admission state for task %s; "
+                    "the worker turn will continue",
+                    task_id,
+                )
+            else:
+                if stopped_state is not None:
+                    self._write_a2a_registry(
+                        key,
+                        data,
+                        "finalized",
+                        receipt_stopped=True,
+                    )
                     return web.json_response(
                         {"ok": True, "ignored": f"task-{stopped_state}"}
                     )

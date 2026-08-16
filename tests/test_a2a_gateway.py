@@ -57,6 +57,7 @@ def _gateway(tmp_path):
     gateway._a2a_progress_stop_events = {}
     gateway._a2a_progress_owners = {}
     gateway._a2a_progress_fences = {}
+    gateway._a2a_canceled_tasks = {}
     gateway._a2a_ingest_lock = asyncio.Lock()
     gateway._closing = False
     gateway.cfg = BridgeConfig(project_dir=str(tmp_path))
@@ -1372,6 +1373,62 @@ def test_a2a_cancellation_drains_worker_and_progress_tasks(tmp_path):
         assert gateway._a2a_progress_owners == {}
         assert gateway._a2a_jobs == {}
         assert progress_mod.a2a_tool_snapshot("task-1") == []
+
+    asyncio.run(scenario())
+
+
+def test_a2a_cancellation_fences_webhook_blocked_in_acknowledgement(tmp_path):
+    gateway = _gateway(tmp_path)
+    task = gateway._a2a_authoritative_task
+    original_reply = gateway._identity.a2a_reply
+    acknowledgement_started = threading.Event()
+    release_acknowledgement = threading.Event()
+
+    def paused_reply(task_id, **kwargs):
+        if kwargs.get("intent") == "progress":
+            acknowledgement_started.set()
+            assert release_acknowledgement.wait(5)
+        return original_reply(task_id, **kwargs)
+
+    gateway._identity.a2a_reply = paused_reply
+
+    async def scenario():
+        webhook = asyncio.create_task(gateway._on_a2a_event(_event()))
+        assert await asyncio.to_thread(acknowledgement_started.wait, 5)
+        task.state = "canceled"
+        canceled = _event()
+        canceled["event_type"] = "a2a.task.canceled"
+        cancellation = asyncio.create_task(gateway._on_a2a_event(canceled))
+        await asyncio.sleep(0)
+
+        assert not cancellation.done()
+        assert gateway.sessions.keys == []
+        release_acknowledgement.set()
+        response, _ = await asyncio.gather(webhook, cancellation)
+
+        assert json.loads(response.text)["ignored"] == "task-canceled"
+        assert gateway.sessions.keys == []
+        assert gateway.sessions.session.calls == []
+        assert gateway._a2a_jobs == {}
+        saved = json.loads(gateway._a2a_registry_path.read_text())[
+            "task-1:message-1"
+        ]
+        assert saved["state"] == "finalized"
+
+        task.state = "working"
+        follow_up = _event()
+        follow_up["event_type"] = "a2a.task.message"
+        follow_up["data"] = follow_up["data"] | {
+            "message_id": "message-2",
+            "parts": [{"text": "Use the west region."}],
+        }
+        await gateway._on_a2a_event(follow_up)
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+        assert len(gateway.sessions.session.calls) == 1
+        assert gateway.sessions.session.calls[0][0].endswith(
+            "Use the west region."
+        )
 
     asyncio.run(scenario())
 
