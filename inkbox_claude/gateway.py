@@ -3557,38 +3557,46 @@ class InkboxGateway:
         )
         return None
 
-    async def _a2a_admission_stopped_state(
+    async def _a2a_authoritative_admission(
         self,
         task_id: str,
         registry_key: str,
         event_type: str,
         data: Dict[str, Any],
-    ) -> Optional[str]:
-        """Fence canceled work unless a new active caller message follows it."""
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Validate and materialize a new worker turn from authoritative state."""
         authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
         state = _a2a_state(authoritative.state)
         if state in A2A_STOPPED_STATES:
-            return state
-        canceled_keys = self._a2a_canceled_tasks.get(task_id)
-        if canceled_keys is None:
-            return None
+            return None, f"task-{state}"
+        if state not in {"submitted", "working"}:
+            return None, "task-inactive"
         authoritative_data = self._a2a_event_data(authoritative)
         if not authoritative_data:
-            return "canceled"
+            return None, "stale-a2a-event"
         authoritative_key = (
             f"{authoritative_data['task_id']}:{authoritative_data['message_id']}"
         )
-        if (
-            canceled_keys
-            and registry_key not in canceled_keys
-            and event_type == "a2a.task.message"
-            and authoritative_key == registry_key
-            and str(authoritative_data.get("context_id") or "")
-            == str(data.get("context_id") or "")
-        ):
-            self._a2a_canceled_tasks.pop(task_id, None)
-            return None
-        return "canceled"
+        matches_authoritative = not (
+            str(authoritative_data.get("task_id") or "") != task_id
+            or str(authoritative_data.get("context_id") or "")
+            != str(data.get("context_id") or "")
+            or authoritative_key != registry_key
+        )
+        canceled_keys = self._a2a_canceled_tasks.get(task_id)
+        if canceled_keys is not None:
+            if (
+                matches_authoritative
+                and canceled_keys
+                and registry_key not in canceled_keys
+                and event_type == "a2a.task.message"
+            ):
+                self._a2a_canceled_tasks.pop(task_id, None)
+                return authoritative_data, None
+            return None, "task-canceled"
+        if not matches_authoritative:
+            return None, "stale-a2a-event"
+        return authoritative_data, None
 
     def _schedule_a2a_acknowledgement_retry(
         self,
@@ -3921,7 +3929,6 @@ class InkboxGateway:
         task_id = str(data.get("task_id") or "")
         context_id = str(data.get("context_id") or "")
         event_message_id = str(data.get("message_id") or "")
-        message_id = event_message_id or str(envelope.get("id") or "")
         if not task_id or not context_id:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
 
@@ -4019,7 +4026,12 @@ class InkboxGateway:
                 )
             return web.json_response({"ok": True})
 
-        key = f"{task_id}:{message_id}"
+        if event_type not in {"a2a.task.created", "a2a.task.message"}:
+            return web.json_response({"ok": True, "ignored": "unsupported-a2a-event"})
+        if not event_message_id:
+            return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
+
+        key = f"{task_id}:{event_message_id}"
         async with self._a2a_ingest_lock:
             if self._closing:
                 return web.json_response(
@@ -4048,6 +4060,31 @@ class InkboxGateway:
                             {"ok": True, "ignored": f"task-{stopped_state}"}
                         )
                 return web.json_response({"ok": True, "deduped": True})
+            try:
+                admitted_data, ignored = await self._a2a_authoritative_admission(
+                    task_id,
+                    key,
+                    event_type,
+                    data,
+                )
+            except Exception:
+                logger.warning(
+                    "[bridge] could not verify authoritative A2A admission for task %s",
+                    task_id,
+                )
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "a2a-task-unavailable",
+                        "retryable": True,
+                    },
+                    status=503,
+                )
+            if ignored is not None or admitted_data is None:
+                return web.json_response(
+                    {"ok": True, "ignored": ignored or "stale-a2a-event"}
+                )
+            data = admitted_data
             self._write_a2a_registry(key, data, "queued")
             try:
                 stopped_state = await self._record_a2a_acknowledgement(key, data)
@@ -4063,23 +4100,7 @@ class InkboxGateway:
                     return web.json_response(
                         {"ok": True, "ignored": f"task-{stopped_state}"}
                     )
-            stopped_state = None
-            try:
-                stopped_state = await self._a2a_admission_stopped_state(
-                    task_id,
-                    key,
-                    event_type,
-                    data,
-                )
-            except Exception:
-                logger.warning(
-                    "[bridge] could not recheck A2A admission state for task %s; "
-                    "canceled work will remain fenced",
-                    task_id,
-                )
-                if task_id in self._a2a_canceled_tasks:
-                    stopped_state = "canceled"
-            if stopped_state is not None:
+            if task_id in self._a2a_canceled_tasks:
                 self._write_a2a_registry(
                     key,
                     data,
@@ -4087,7 +4108,7 @@ class InkboxGateway:
                     receipt_stopped=True,
                 )
                 return web.json_response(
-                    {"ok": True, "ignored": f"task-{stopped_state}"}
+                    {"ok": True, "ignored": "task-canceled"}
                 )
             self._track_a2a_job(task_id, key, data)
         return web.json_response({"ok": True})

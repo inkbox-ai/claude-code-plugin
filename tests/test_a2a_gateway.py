@@ -70,7 +70,13 @@ def _gateway(tmp_path):
             organization_id="org-1",
             handle="caller",
         ),
-        messages=[],
+        messages=[
+            types.SimpleNamespace(
+                role="ROLE_CALLER",
+                message_id="message-1",
+                parts=[{"text": "Investigate."}],
+            )
+        ],
     )
 
     def reply(task_id, **kwargs):
@@ -416,11 +422,7 @@ def test_delayed_a2a_webhook_stops_before_worker_turn(
     assert gateway.sessions.keys == []
     assert gateway.sessions.session.calls == []
     assert gateway._a2a_jobs == {}
-    saved = json.loads(gateway._a2a_registry_path.read_text())[
-        "task-1:message-1"
-    ]
-    assert saved["state"] == "finalized"
-    assert not saved.get("receipt", {}).get("pending_text")
+    assert not gateway._a2a_registry_path.exists()
 
 
 def test_delayed_duplicate_webhook_finalizes_acknowledged_task(tmp_path):
@@ -1561,6 +1563,111 @@ def test_a2a_canceled_tombstone_requires_authoritative_caller(
     assert json.loads(response.text)["ignored"] == expected
     assert gateway.sessions.session.calls == []
     assert gateway._a2a_jobs == {}
+
+
+def test_a2a_restart_rejects_canceled_generation_and_admits_latest_caller(tmp_path):
+    original = _gateway(tmp_path)
+    canceled = _event()
+    canceled["event_type"] = "a2a.task.canceled"
+    asyncio.run(original._on_a2a_event(canceled))
+
+    restarted = _gateway(tmp_path)
+    task = restarted._a2a_authoritative_task
+    task.state = "working"
+    task.messages.append(types.SimpleNamespace(
+        role="ROLE_CALLER",
+        message_id="message-2",
+        parts=[{"text": "Use the authoritative request."}],
+    ))
+
+    async def scenario():
+        delayed = await restarted._on_a2a_event(_event())
+        assert json.loads(delayed.text)["ignored"] == "stale-a2a-event"
+        assert restarted.replies == []
+        assert restarted.sessions.session.calls == []
+
+        follow_up = _event()
+        follow_up["event_type"] = "a2a.task.message"
+        follow_up["data"] = follow_up["data"] | {
+            "message_id": "message-2",
+            "parts": [{"text": "Untrusted webhook text."}],
+        }
+        accepted = await restarted._on_a2a_event(follow_up)
+        await asyncio.gather(*restarted._a2a_jobs["task-1"])
+        duplicate = await restarted._on_a2a_event(follow_up)
+        return accepted, duplicate
+
+    accepted, duplicate = asyncio.run(scenario())
+
+    assert json.loads(accepted.text) == {"ok": True}
+    assert json.loads(duplicate.text)["deduped"] is True
+    assert len(restarted.sessions.session.calls) == 1
+    prompt, _context = restarted.sessions.session.calls[0]
+    assert prompt.endswith("Use the authoritative request.")
+    assert "Untrusted webhook text." not in prompt
+
+
+def test_a2a_admission_uses_authoritative_parts_and_caller_metadata(tmp_path):
+    gateway = _gateway(tmp_path)
+    task = gateway._a2a_authoritative_task
+    task.messages[0].parts = [{"text": "Authoritative instructions."}]
+    event = _event()
+    event["data"] = event["data"] | {
+        "caller": {
+            "identity_id": "spoofed-caller",
+            "organization_id": "spoofed-org",
+            "handle": "spoofed",
+        },
+        "parts": [{"text": "Spoofed instructions."}],
+    }
+
+    async def scenario():
+        await gateway._on_a2a_event(event)
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+
+    prompt, _context = gateway.sessions.session.calls[0]
+    assert prompt.endswith("Authoritative instructions.")
+    assert "Spoofed instructions." not in prompt
+    assert "caller=@caller caller_org=org-1" in prompt
+    assert "spoofed" not in prompt
+    saved = json.loads(gateway._a2a_registry_path.read_text())[
+        "task-1:message-1"
+    ]["data"]
+    assert saved["parts"] == [{"text": "Authoritative instructions."}]
+    assert saved["caller"]["identity_id"] == "caller-1"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("task-identity", "stale-a2a-event"),
+        ("context-identity", "stale-a2a-event"),
+        ("inactive-state", "task-inactive"),
+        ("non-caller-role", "stale-a2a-event"),
+    ],
+)
+def test_a2a_admission_rejects_non_authoritative_task(case, expected, tmp_path):
+    gateway = _gateway(tmp_path)
+    task = gateway._a2a_authoritative_task
+    if case == "task-identity":
+        task.id = "task-2"
+    elif case == "context-identity":
+        task.context_id = "context-2"
+    elif case == "inactive-state":
+        task.state = "queued"
+    elif case == "non-caller-role":
+        task.messages[0].role = "ROLE_AGENT"
+
+    response = asyncio.run(gateway._on_a2a_event(_event()))
+
+    assert json.loads(response.text)["ignored"] == expected
+    assert gateway.replies == []
+    assert gateway.sessions.keys == []
+    assert gateway.sessions.session.calls == []
+    assert gateway._a2a_jobs == {}
+    assert not gateway._a2a_registry_path.exists()
 
 
 def test_a2a_cleanup_drains_acknowledgement_retry(tmp_path):
