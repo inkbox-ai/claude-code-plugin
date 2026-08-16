@@ -61,7 +61,17 @@ def _gateway(tmp_path):
     gateway._a2a_ingest_lock = asyncio.Lock()
     gateway._closing = False
     gateway.cfg = BridgeConfig(project_dir=str(tmp_path))
-    task = types.SimpleNamespace(state="submitted", messages=[])
+    task = types.SimpleNamespace(
+        id="task-1",
+        context_id="context-1",
+        state="submitted",
+        caller=types.SimpleNamespace(
+            identity_id="caller-1",
+            organization_id="org-1",
+            handle="caller",
+        ),
+        messages=[],
+    )
 
     def reply(task_id, **kwargs):
         gateway.replies.append((task_id, kwargs))
@@ -1416,6 +1426,11 @@ def test_a2a_cancellation_fences_webhook_blocked_in_acknowledgement(tmp_path):
         assert saved["state"] == "finalized"
 
         task.state = "working"
+        task.messages.append(types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-2",
+            parts=[{"text": "Use the west region."}],
+        ))
         follow_up = _event()
         follow_up["event_type"] = "a2a.task.message"
         follow_up["data"] = follow_up["data"] | {
@@ -1452,6 +1467,11 @@ def test_a2a_cancel_before_admission_blocks_current_generation(tmp_path):
             return "[SILENT]"
 
         gateway.sessions.session.run_consult = stay_active
+        gateway._a2a_authoritative_task.messages.append(types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-2",
+            parts=[{"text": "Use the west region."}],
+        ))
         follow_up = _event()
         follow_up["event_type"] = "a2a.task.message"
         follow_up["data"] = follow_up["data"] | {
@@ -1467,6 +1487,80 @@ def test_a2a_cancel_before_admission_blocks_current_generation(tmp_path):
         assert "task-1" not in gateway._a2a_canceled_tasks
 
     asyncio.run(scenario())
+
+
+def test_a2a_cancel_without_message_id_uses_authoritative_caller(tmp_path):
+    gateway = _gateway(tmp_path)
+    task = gateway._a2a_authoritative_task
+    task.messages.append(types.SimpleNamespace(
+        role="ROLE_CALLER",
+        message_id="message-1",
+        parts=[{"text": "Investigate."}],
+    ))
+    canceled = _event()
+    canceled["event_type"] = "a2a.task.canceled"
+    canceled["data"] = dict(canceled["data"])
+    canceled["data"].pop("message_id")
+
+    asyncio.run(gateway._on_a2a_event(canceled))
+
+    assert gateway._a2a_canceled_tasks["task-1"] == {"task-1:message-1"}
+    task.state = "working"
+    response = asyncio.run(gateway._on_a2a_event(_event()))
+    assert json.loads(response.text)["ignored"] == "task-canceled"
+    assert gateway.sessions.session.calls == []
+    assert gateway._a2a_jobs == {}
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("spoof-distinct", "task-canceled"),
+        ("non-caller", "task-canceled"),
+        ("wrong-context", "task-canceled"),
+        ("stopped", "task-completed"),
+    ],
+)
+def test_a2a_canceled_tombstone_requires_authoritative_caller(
+    tmp_path,
+    case,
+    expected,
+):
+    gateway = _gateway(tmp_path)
+    task = gateway._a2a_authoritative_task
+    gateway._a2a_canceled_tasks["task-1"] = {"task-1:message-1"}
+    task.messages.append(types.SimpleNamespace(
+        role="ROLE_CALLER",
+        message_id="message-1",
+        parts=[{"text": "Investigate."}],
+    ))
+    if case in {"wrong-context", "stopped"}:
+        task.messages.append(types.SimpleNamespace(
+            role="ROLE_CALLER",
+            message_id="message-2",
+            parts=[{"text": "Use the west region."}],
+        ))
+    elif case == "non-caller":
+        task.messages.append(types.SimpleNamespace(
+            role="ROLE_AGENT",
+            message_id="message-2",
+            parts=[{"text": "Worker progress."}],
+        ))
+    if case == "stopped":
+        task.state = "completed"
+
+    event = _event()
+    event["event_type"] = "a2a.task.message"
+    event["data"] = event["data"] | {
+        "context_id": "context-2" if case == "wrong-context" else "context-1",
+        "message_id": "message-2",
+        "parts": [{"text": "Use the west region."}],
+    }
+    response = asyncio.run(gateway._on_a2a_event(event))
+
+    assert json.loads(response.text)["ignored"] == expected
+    assert gateway.sessions.session.calls == []
+    assert gateway._a2a_jobs == {}
 
 
 def test_a2a_cleanup_drains_acknowledgement_retry(tmp_path):

@@ -3562,6 +3562,7 @@ class InkboxGateway:
         task_id: str,
         registry_key: str,
         event_type: str,
+        data: Dict[str, Any],
     ) -> Optional[str]:
         """Fence canceled work unless a new active caller message follows it."""
         authoritative = await asyncio.to_thread(self._identity.a2a_task, task_id)
@@ -3571,10 +3572,19 @@ class InkboxGateway:
         canceled_keys = self._a2a_canceled_tasks.get(task_id)
         if canceled_keys is None:
             return None
+        authoritative_data = self._a2a_event_data(authoritative)
+        if not authoritative_data:
+            return "canceled"
+        authoritative_key = (
+            f"{authoritative_data['task_id']}:{authoritative_data['message_id']}"
+        )
         if (
             canceled_keys
             and registry_key not in canceled_keys
             and event_type == "a2a.task.message"
+            and authoritative_key == registry_key
+            and str(authoritative_data.get("context_id") or "")
+            == str(data.get("context_id") or "")
         ):
             self._a2a_canceled_tasks.pop(task_id, None)
             return None
@@ -3910,7 +3920,8 @@ class InkboxGateway:
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
         task_id = str(data.get("task_id") or "")
         context_id = str(data.get("context_id") or "")
-        message_id = str(data.get("message_id") or envelope.get("id") or "")
+        event_message_id = str(data.get("message_id") or "")
+        message_id = event_message_id or str(envelope.get("id") or "")
         if not task_id or not context_id:
             return web.json_response({"ok": True, "ignored": "invalid-a2a-event"})
 
@@ -3921,8 +3932,31 @@ class InkboxGateway:
                 if isinstance(entry, dict)
                 and str(entry.get("task_id") or "") == task_id
             }
-            known_keys.add(f"{task_id}:{message_id}")
+            if event_message_id:
+                known_keys.add(f"{task_id}:{event_message_id}")
             self._a2a_canceled_tasks.setdefault(task_id, set()).update(known_keys)
+            if not event_message_id:
+                try:
+                    authoritative = await asyncio.to_thread(
+                        self._identity.a2a_task,
+                        task_id,
+                    )
+                    authoritative_data = self._a2a_event_data(authoritative)
+                except Exception:
+                    logger.warning(
+                        "[bridge] could not resolve the canceled A2A generation "
+                        "for task %s",
+                        task_id,
+                    )
+                else:
+                    if (
+                        str(authoritative_data.get("task_id") or "") == task_id
+                        and str(authoritative_data.get("context_id") or "")
+                        == context_id
+                    ):
+                        self._a2a_canceled_tasks[task_id].add(
+                            f"{task_id}:{authoritative_data['message_id']}"
+                        )
             async with self._a2a_ingest_lock:
                 await self._stop_a2a_acknowledgement_retry(task_id)
                 await self._stop_a2a_progress_updates(task_id)
@@ -4029,29 +4063,32 @@ class InkboxGateway:
                     return web.json_response(
                         {"ok": True, "ignored": f"task-{stopped_state}"}
                     )
+            stopped_state = None
             try:
                 stopped_state = await self._a2a_admission_stopped_state(
                     task_id,
                     key,
                     event_type,
+                    data,
                 )
             except Exception:
                 logger.warning(
                     "[bridge] could not recheck A2A admission state for task %s; "
-                    "the worker turn will continue",
+                    "canceled work will remain fenced",
                     task_id,
                 )
-            else:
-                if stopped_state is not None:
-                    self._write_a2a_registry(
-                        key,
-                        data,
-                        "finalized",
-                        receipt_stopped=True,
-                    )
-                    return web.json_response(
-                        {"ok": True, "ignored": f"task-{stopped_state}"}
-                    )
+                if task_id in self._a2a_canceled_tasks:
+                    stopped_state = "canceled"
+            if stopped_state is not None:
+                self._write_a2a_registry(
+                    key,
+                    data,
+                    "finalized",
+                    receipt_stopped=True,
+                )
+                return web.json_response(
+                    {"ok": True, "ignored": f"task-{stopped_state}"}
+                )
             self._track_a2a_job(task_id, key, data)
         return web.json_response({"ok": True})
 
