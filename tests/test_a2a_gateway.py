@@ -263,7 +263,13 @@ def test_a2a_catch_up_resumes_persisted_caller_data_not_worker_history(tmp_path)
         ],
     )
     gateway._identity.a2a_task = lambda _task_id: task
-    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter([task])
+    queried_states = []
+
+    def iter_a2a_tasks(*, state):
+        queried_states.append(state)
+        return iter([task] if state == "working" else [])
+
+    gateway._identity.iter_a2a_tasks = iter_a2a_tasks
 
     async def scenario():
         await gateway._catch_up_a2a_tasks()
@@ -279,6 +285,7 @@ def test_a2a_catch_up_resumes_persisted_caller_data_not_worker_history(tmp_path)
     registry = json.loads(gateway._a2a_registry_path.read_text())
     assert list(registry) == [key]
     assert registry[key]["data"] == data | {"state": "working"}
+    assert queried_states == ["submitted", "working"]
 
 
 def test_a2a_sent_update_returns_to_the_delegating_session(
@@ -1226,13 +1233,20 @@ def test_implicit_completion_failure_does_not_rerun_fenced_turn(tmp_path):
         ],
     )
     restarted._identity.a2a_task = lambda _task_id: task
-    restarted._identity.iter_a2a_tasks = lambda **_kwargs: iter((task,))
+    queried_states = []
+
+    def iter_a2a_tasks(*, state):
+        queried_states.append(state)
+        return iter((task,)) if state == "working" else iter(())
+
+    restarted._identity.iter_a2a_tasks = iter_a2a_tasks
 
     asyncio.run(restarted._catch_up_a2a_tasks())
 
     assert restarted.sessions.session.calls == []
     assert restarted.replies == []
     assert restarted._a2a_jobs == {}
+    assert queried_states == ["submitted", "working"]
 
     async def follow_up():
         task.messages.append(types.SimpleNamespace(
@@ -1786,7 +1800,13 @@ def test_a2a_catch_up_rejects_persisted_stale_generation_and_runs_current(tmp_pa
         message_id="message-2",
         parts=[{"text": "Current caller request."}],
     ))
-    gateway._identity.iter_a2a_tasks = lambda **_kwargs: iter([task])
+    queried_states = []
+
+    def iter_a2a_tasks(*, state):
+        queried_states.append(state)
+        return iter([task] if state == "working" else [])
+
+    gateway._identity.iter_a2a_tasks = iter_a2a_tasks
 
     async def stay_active(prompt, *, a2a_context=None):
         gateway.sessions.session.calls.append((prompt, a2a_context))
@@ -1818,6 +1838,7 @@ def test_a2a_catch_up_rejects_persisted_stale_generation_and_runs_current(tmp_pa
     assert registry["task-1:message-2"]["data"]["parts"] == [
         {"text": "Current caller request."}
     ]
+    assert queried_states == ["submitted", "working"]
 
 
 def test_a2a_cleanup_drains_acknowledgement_retry(tmp_path):
