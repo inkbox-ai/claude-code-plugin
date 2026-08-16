@@ -3902,7 +3902,10 @@ class InkboxGateway:
         envelope: Dict[str, Any],
     ) -> "web.Response":
         if self._closing:
-            return web.json_response({"ok": True, "ignored": "gateway-closing"})
+            return web.json_response(
+                {"ok": False, "error": "gateway-closing", "retryable": True},
+                status=503,
+            )
         event_type = str(envelope.get("event_type") or "")
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
         task_id = str(data.get("task_id") or "")
@@ -3918,6 +3921,7 @@ class InkboxGateway:
                 if isinstance(entry, dict)
                 and str(entry.get("task_id") or "") == task_id
             }
+            known_keys.add(f"{task_id}:{message_id}")
             self._a2a_canceled_tasks.setdefault(task_id, set()).update(known_keys)
             async with self._a2a_ingest_lock:
                 await self._stop_a2a_acknowledgement_retry(task_id)
@@ -3984,7 +3988,10 @@ class InkboxGateway:
         key = f"{task_id}:{message_id}"
         async with self._a2a_ingest_lock:
             if self._closing:
-                return web.json_response({"ok": True, "ignored": "gateway-closing"})
+                return web.json_response(
+                    {"ok": False, "error": "gateway-closing", "retryable": True},
+                    status=503,
+                )
             existing = self._read_a2a_registry().get(key)
             if isinstance(existing, dict):
                 if self._a2a_entry_is_fenced(existing):

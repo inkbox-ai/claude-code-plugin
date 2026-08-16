@@ -17,8 +17,8 @@ def fake_web(monkeypatch):
         gateway_mod,
         "web",
         types.SimpleNamespace(
-            json_response=lambda payload: types.SimpleNamespace(
-                status=200,
+            json_response=lambda payload, status=200: types.SimpleNamespace(
+                status=status,
                 text=json.dumps(payload),
             )
         ),
@@ -1433,6 +1433,42 @@ def test_a2a_cancellation_fences_webhook_blocked_in_acknowledgement(tmp_path):
     asyncio.run(scenario())
 
 
+def test_a2a_cancel_before_admission_blocks_current_generation(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def scenario():
+        canceled = _event()
+        canceled["event_type"] = "a2a.task.canceled"
+        await gateway._on_a2a_event(canceled)
+
+        gateway._a2a_authoritative_task.state = "working"
+        current = await gateway._on_a2a_event(_event())
+        assert json.loads(current.text)["ignored"] == "task-canceled"
+        assert gateway.sessions.session.calls == []
+        assert gateway._a2a_jobs == {}
+
+        async def stay_active(prompt, *, a2a_context=None):
+            gateway.sessions.session.calls.append((prompt, a2a_context))
+            return "[SILENT]"
+
+        gateway.sessions.session.run_consult = stay_active
+        follow_up = _event()
+        follow_up["event_type"] = "a2a.task.message"
+        follow_up["data"] = follow_up["data"] | {
+            "message_id": "message-2",
+            "parts": [{"text": "Use the west region."}],
+        }
+        await gateway._on_a2a_event(follow_up)
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+        duplicate = await gateway._on_a2a_event(follow_up)
+
+        assert len(gateway.sessions.session.calls) == 1
+        assert json.loads(duplicate.text)["deduped"] is True
+        assert "task-1" not in gateway._a2a_canceled_tasks
+
+    asyncio.run(scenario())
+
+
 def test_a2a_cleanup_drains_acknowledgement_retry(tmp_path):
     gateway = _gateway(tmp_path)
 
@@ -1575,9 +1611,25 @@ def test_a2a_webhook_admission_is_closed_before_cleanup_drain(tmp_path):
         gateway._a2a_ingest_lock.release()
 
         response = await webhook
-        assert json.loads(response.text)["ignored"] == "gateway-closing"
+        assert response.status == 503
+        assert json.loads(response.text)["retryable"] is True
         assert not gateway._a2a_registry_path.exists()
         await cleanup
         assert gateway._a2a_jobs == {}
 
     asyncio.run(scenario())
+
+
+def test_a2a_webhook_before_ingest_returns_retryable_when_closing(tmp_path):
+    gateway = _gateway(tmp_path)
+    gateway._closing = True
+
+    response = asyncio.run(gateway._on_a2a_event(_event()))
+
+    assert response.status == 503
+    assert json.loads(response.text) == {
+        "ok": False,
+        "error": "gateway-closing",
+        "retryable": True,
+    }
+    assert not gateway._a2a_registry_path.exists()
