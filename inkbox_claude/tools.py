@@ -55,6 +55,16 @@ IMESSAGE_MAX_LENGTH = 18995
 IMESSAGE_MAX_GROUP_RECIPIENTS = 8
 
 
+async def _to_thread_drained(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking side effect to completion even if its caller is canceled."""
+    call = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(call)
+    except asyncio.CancelledError:
+        await asyncio.gather(call, return_exceptions=True)
+        raise
+
+
 def _normalize_imessage_recipients(value: Any) -> Optional[List[str]]:
     """`to` as a list of E.164 strings, or None when the caller omitted it."""
     if value is None:
@@ -1101,17 +1111,20 @@ def build_inkbox_mcp_server(
         except Exception as exc:
             return _error(str(exc))
 
-    def _a2a_intent(intent: str, text: str) -> Any:
+    async def _a2a_intent(intent: str, text: str) -> Any:
         context = A2A_TURN_CONTEXT.get()
         if context is None:
             raise RuntimeError("This tool is only available during an inbound A2A task")
-        result = _identity().a2a_reply(
+        fence_progress = context.get("fence_progress")
+        if callable(fence_progress):
+            await fence_progress()
+        context["reply_intent_committed"] = True
+        return await _to_thread_drained(
+            _identity().a2a_reply,
             context["task_id"],
             intent=intent,
             text=text,
         )
-        context["reply_intent_committed"] = True
-        return result
 
     @tool(
         "inkbox_a2a_complete",
@@ -1120,11 +1133,7 @@ def build_inkbox_mcp_server(
     )
     async def inkbox_a2a_complete(args: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            return _result(
-                await asyncio.to_thread(
-                    _a2a_intent, "complete", str(args["text"])
-                )
-            )
+            return _result(await _a2a_intent("complete", str(args["text"])))
         except Exception as exc:
             return _error(str(exc))
 
@@ -1135,11 +1144,7 @@ def build_inkbox_mcp_server(
     )
     async def inkbox_a2a_ask_caller(args: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            return _result(
-                await asyncio.to_thread(
-                    _a2a_intent, "ask_caller", str(args["text"])
-                )
-            )
+            return _result(await _a2a_intent("ask_caller", str(args["text"])))
         except Exception as exc:
             return _error(str(exc))
 
@@ -1150,11 +1155,7 @@ def build_inkbox_mcp_server(
     )
     async def inkbox_a2a_fail(args: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            return _result(
-                await asyncio.to_thread(
-                    _a2a_intent, "fail", str(args["reason"])
-                )
-            )
+            return _result(await _a2a_intent("fail", str(args["reason"])))
         except Exception as exc:
             return _error(str(exc))
 

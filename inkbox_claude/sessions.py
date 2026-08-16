@@ -38,6 +38,7 @@ try:
         AssistantMessage,
         ClaudeAgentOptions,
         ClaudeSDKClient,
+        HookMatcher,
         PermissionResultAllow,
         PermissionResultDeny,
         ResultMessage,
@@ -46,11 +47,12 @@ try:
 
     CLAUDE_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover - doctor reports this cleanly
-    AssistantMessage = ClaudeAgentOptions = ClaudeSDKClient = None  # type: ignore
+    AssistantMessage = ClaudeAgentOptions = ClaudeSDKClient = HookMatcher = None  # type: ignore
     PermissionResultAllow = PermissionResultDeny = ResultMessage = TextBlock = None  # type: ignore
     CLAUDE_SDK_AVAILABLE = False
 
 try:
+    from .a2a_progress import observe_a2a_tool_start
     from .config import BridgeConfig
     from .escalation import (
         PendingInteraction,
@@ -61,6 +63,7 @@ try:
     )
     from .prompts import build_channel_prompt, frame_inbound
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    from a2a_progress import observe_a2a_tool_start
     from config import BridgeConfig
     from escalation import (
         PendingInteraction,
@@ -696,6 +699,22 @@ class ContactSession:
                 self.mode,
             )
 
+    async def _observe_a2a_tool_start(
+        self,
+        hook_input: Dict[str, Any],
+        _tool_use_id: Optional[str],
+        _context: Any,
+    ) -> Dict[str, Any]:
+        """Capture only a normalized tool name for an active A2A worker turn."""
+        turn = self._current_turn
+        a2a_context = turn.a2a_context if turn is not None else None
+        if isinstance(a2a_context, dict):
+            observe_a2a_tool_start(
+                str(a2a_context.get("task_id") or ""),
+                str(hook_input.get("tool_name") or ""),
+            )
+        return {}
+
     def mark_tool_failure(self, mode: str, target: str, error: Any) -> None:
         """Record a failed host-native tool attempt without retaining its payload."""
         if not self._turn_active:
@@ -1040,6 +1059,11 @@ class ContactSession:
             allowed_tools=list(self.cfg.auto_allowed_tools) + list(self.mcp_tool_names),
             mcp_servers={"inkbox": self.mcp_server},
             can_use_tool=self._can_use_tool,
+            hooks={
+                "PreToolUse": [
+                    HookMatcher(hooks=[self._observe_a2a_tool_start]),
+                ],
+            },
             resume=self.resume_session_id or None,
         )
         self._client = ClaudeSDKClient(options=options)

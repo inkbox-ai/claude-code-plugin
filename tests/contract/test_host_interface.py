@@ -22,6 +22,7 @@ def test_sdk_exports_every_symbol_the_bridge_imports():
         AssistantMessage,
         ClaudeAgentOptions,
         ClaudeSDKClient,
+        HookMatcher,
         PermissionResultAllow,
         PermissionResultDeny,
         ResultMessage,
@@ -34,10 +35,13 @@ def test_sdk_exports_every_symbol_the_bridge_imports():
 def test_options_accept_the_kwargs_the_bridge_passes():
     """Constructing ClaudeAgentOptions with the exact kwargs sessions.py uses
     fails loudly if the SDK renames or drops any of them."""
-    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
     async def _can_use_tool(tool_name, input_data, context):  # signature stand-in
         raise NotImplementedError
+
+    async def _pre_tool_use(hook_input, tool_use_id, context):
+        return {}
 
     options = ClaudeAgentOptions(
         cwd="/tmp",
@@ -47,6 +51,7 @@ def test_options_accept_the_kwargs_the_bridge_passes():
         allowed_tools=["Read", "mcp__inkbox__inkbox_whoami"],
         mcp_servers={},
         can_use_tool=_can_use_tool,
+        hooks={"PreToolUse": [HookMatcher(hooks=[_pre_tool_use])]},
         resume=None,
     )
     # The client must construct from those options without connecting.

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from inkbox_claude import sessions as sessions_mod
+from inkbox_claude import a2a_progress as progress_mod
 from inkbox_claude.config import BridgeConfig
 from inkbox_claude.delivery_policy import (
     sms_delivery_failure_policy,
@@ -371,6 +372,33 @@ def test_current_channel_tool_delivery_suppresses_redundant_reply(monkeypatch):
 
         assert sent == []
         assert session._current_channel_tool_delivery is True
+
+    asyncio.run(scenario())
+
+
+def test_pre_tool_hook_retains_only_normalized_tool_name():
+    async def scenario():
+        session = make_session([])
+        session._current_turn = _Turn(
+            text="work",
+            a2a_context={"task_id": "task-1"},
+        )
+        progress_mod.start_a2a_progress("task-1")
+
+        result = await session._observe_a2a_tool_start(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "private-value"},
+            },
+            "tool-use-1",
+            None,
+        )
+
+        snapshot = progress_mod.a2a_tool_snapshot("task-1")
+        progress_mod.stop_a2a_progress("task-1")
+        assert result == {}
+        assert snapshot == ["bash"]
+        assert "private-value" not in json.dumps(snapshot)
 
     asyncio.run(scenario())
 

@@ -8,7 +8,7 @@
 
 ### Agent2Agent suite
 
-**Proves:** All four Agent2Agent scenarios complete successfully. **Flow:** 1. Run the scenarios serially. 2. Require success before continuing.
+**Proves:** All five Agent2Agent scenarios complete successfully. **Flow:** 1. Run the scenarios serially. 2. Require success before continuing.
 
 ### Voice suite
 
@@ -31,6 +31,10 @@
 ### Inbound multi-turn
 
 **Proves:** The agent requests caller input before completing the task. **Flow:** 1. Open a task. 2. Answer its input request. 3. Check the final history and result.
+
+### Inbound progress
+
+**Proves:** A long-running task promptly acknowledges pickup, reports periodic nonterminal progress at the configured cadence, and then returns the requested result. **Flow:** 1. Open a task with two timed waits. 2. Check the acknowledgement and progress ordering. 3. Check the final calculation and unique result marker.
 
 ### Outbound single-turn
 

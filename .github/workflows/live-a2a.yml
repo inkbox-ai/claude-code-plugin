@@ -1,8 +1,8 @@
 name: Live — Agent2Agent
 
-# Four real protocol legs cover both roles and conversation lengths:
-# inbound/outbound × single-turn/multi-turn. The plugin and remote identities
-# are preconfigured to allow one another in both directions.
+# Five real protocol scenarios cover both roles, conversation lengths, and a
+# long-running worker turn. The plugin and remote identities are preconfigured
+# to allow one another in both directions.
 on:
   workflow_call:
     inputs:
@@ -44,12 +44,15 @@ jobs:
           - inbound-multi
           - outbound-single
           - outbound-multi
+          - inbound-progress
     env:
       INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
       INKBOX_VOICEMAIL_DETECTION: "disabled"
       INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
       CLAUDE_PROJECT_DIR: ${{ github.workspace }}
       INKBOX_PERMISSION_TIMEOUT_S: "30"
+      INKBOX_A2A_PROGRESS_INTERVAL_SECONDS: ${{ matrix.scenario == 'inbound-progress' && '60' || '180' }}
+      INKBOX_AUTO_ALLOWED_TOOLS: ${{ matrix.scenario == 'inbound-progress' && 'Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookRead,Bash' || 'Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookRead' }}
       DISABLE_AUTOUPDATER: "1"
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
 
@@ -104,7 +107,7 @@ jobs:
       - name: Run ${{ matrix.scenario }}
         env:
           A2A_SCENARIO: ${{ matrix.scenario }}
-          A2A_TIMEOUT_S: ${{ inputs.timeout_s || '300' }}
+          A2A_TIMEOUT_S: ${{ matrix.scenario == 'inbound-progress' && '210' || (inputs.timeout_s || '300') }}
           AUT_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
         run: python3 tests/live/a2a_driver.py
