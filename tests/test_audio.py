@@ -89,7 +89,8 @@ class Socket:
             yield types.SimpleNamespace(type=realtime.aiohttp.WSMsgType.TEXT, data=json.dumps(frame))
 
 
-def test_start_negotiates_hd_and_pump_converts_inbound_bytes():
+def test_start_negotiates_hd_and_pump_converts_inbound_bytes(caplog):
+    caplog.set_level("INFO", logger=realtime.logger.name)
     raw = struct.pack("<3h", 0, 12000, 0)
     state = realtime._BridgeState()
     caller = Socket([
@@ -104,6 +105,7 @@ def test_start_negotiates_hd_and_pump_converts_inbound_bytes():
     assert len(audio_frames) == 1
     assert base64.b64decode(audio_frames[0]["audio"]) == converted(AudioConverter(16000, 24000), raw)
     assert state.stream_id == "s1"
+    assert "call_id=c1 audio_format=pcm_s16le sample_rate=16000" in caplog.text
 
 
 @pytest.mark.parametrize("boundary", ["response.output_audio.done", "input_audio_buffer.speech_started"])
