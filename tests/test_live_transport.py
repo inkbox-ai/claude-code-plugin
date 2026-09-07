@@ -11,7 +11,7 @@ def test_live_transport_retries_only_connection_establishment(monkeypatch, failu
 
     monkeypatch.setattr(conftest, "REMOTE_KEY", "test-remote")
     monkeypatch.setattr(conftest, "AUT_KEY", "test-aut")
-    conftest.retry_connection_setup.__wrapped__(monkeypatch)
+    conftest._enable_connection_retries(monkeypatch)
     attempts = []
 
     def fail_connect(*args, **kwargs):

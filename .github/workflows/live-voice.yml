@@ -98,6 +98,7 @@ jobs:
             # Keep the media peer alive while the test waits for Voice AI to
             # persist the open post-call action, then let the test hang up.
             echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_NUDGE=Please verify the one queued SMS body is exactly: $marker. Correct the existing action if needed; if none is queued, register it once. Do not create a duplicate action or send it yet." >> "$GITHUB_ENV"
           else
             echo "INKBOX_VOICE_STACK=inkbox_tts_stt" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"

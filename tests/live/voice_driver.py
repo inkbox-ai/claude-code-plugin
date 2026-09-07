@@ -29,6 +29,8 @@ import threading
 import time
 from pathlib import Path
 
+from voice_followup import listen_with_followups
+
 import uvicorn
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
@@ -61,6 +63,7 @@ SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
+NUDGE = os.environ.get("VOICE_DRIVER_NUDGE", "")
 
 app = FastAPI()
 
@@ -81,6 +84,7 @@ async def phone_media_ws(ws: WebSocket) -> None:
         (b"x-use-inkbox-speech-to-text", b"true"),
     ])
     log.info("call WS accepted")
+    last_heard = [time.monotonic()]
     spoke = asyncio.Event()
     convo: asyncio.Task | None = None
 
@@ -100,7 +104,9 @@ async def phone_media_ws(ws: WebSocket) -> None:
         await _say(GREETING)
         await asyncio.sleep(SPEAK_AFTER_S)
         await _speak(LINE)
-        await asyncio.sleep(LISTEN_S)
+        await listen_with_followups(
+            _say, seconds=LISTEN_S, nudge=NUDGE, last_heard=lambda: last_heard[0],
+        )
         try:
             await ws.send_text(json.dumps({"event": "stop"}))
             log.info("sent stop (hangup)")
@@ -116,6 +122,7 @@ async def phone_media_ws(ws: WebSocket) -> None:
                 log.info("call start: %s", ev.get("stream_id"))
                 convo = asyncio.create_task(_run_turn())
             elif kind == "transcript" and ev.get("is_final"):
+                last_heard[0] = time.monotonic()
                 log.info("heard (final): %s", ev.get("text"))
                 await _speak(LINE)  # speak now if the greeting beat our timer
             elif kind == "stop":
