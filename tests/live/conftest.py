@@ -301,3 +301,19 @@ def _reset_conversation_health(request, _reset_channel):
 def _sync_body() -> str:
     # Unique + benign: never trips duplicate_body or the content filter.
     return f"[test-sync] conversation reset {uuid.uuid4().hex[:8]}"
+
+
+@pytest.fixture(autouse=True)
+def retry_connection_setup(monkeypatch):
+    """Retry failed connections, never a request whose delivery is uncertain."""
+    if not (REMOTE_KEY and AUT_KEY):
+        return
+    import httpx
+
+    original = httpx.HTTPTransport.__init__
+
+    def initialize(self, *args, **kwargs):
+        kwargs.setdefault("retries", 2)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "__init__", initialize)

@@ -408,6 +408,7 @@ def test_call_ws_realtime_path_sets_rawmedia_headers_and_runs_bridge(monkeypatch
 
     asyncio.run(gw._handle_call_ws(_FakeRequest()))
 
+    assert fake_ws.headers.get("x-inkbox-audio-format") == "pcm_s16le_16000"
     assert fake_ws.headers.get("x-use-inkbox-speech-to-text") == "false"
     assert fake_ws.headers.get("x-use-inkbox-text-to-speech") == "false"
     assert bridge.ran is True and bridge.closed is True

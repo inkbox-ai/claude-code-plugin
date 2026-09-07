@@ -4532,6 +4532,7 @@ class InkboxGateway:
             if bridge is not None:
                 # Raw-media mode: Inkbox must NOT run its own STT/TTS — the
                 # OpenAI model handles both ends of the audio.
+                ws.headers["x-inkbox-audio-format"] = "pcm_s16le_16000"
                 ws.headers["x-use-inkbox-speech-to-text"] = "false"
                 ws.headers["x-use-inkbox-text-to-speech"] = "false"
                 await ws.prepare(request)

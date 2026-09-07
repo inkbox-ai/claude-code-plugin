@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v7
@@ -23,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test deps
-        run: tests/ci/retry_install.sh pip install pytest aiohttp segno claude-agent-sdk
+        run: tests/ci/retry_install.sh pip install pytest httpx aiohttp segno "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk
 
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.

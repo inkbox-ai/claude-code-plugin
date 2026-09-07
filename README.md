@@ -353,3 +353,11 @@ python -m pytest
 - **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Claude Agent SDK**: each session is one `ClaudeSDKClient` (its own Claude Code subprocess) with the `claude_code` system-prompt preset plus a messaging channel prompt appended, `can_use_tool` for escalation, and an in-process MCP server for the Inkbox tools.
+
+### HD realtime voice
+
+Realtime calls request 16 kHz mono PCM16 call audio. The bridge continuously
+resamples to and from the realtime session's 24 kHz PCM format, preserving audio
+across WebSocket frame boundaries. Older call streams that advertise 8 kHz μ-law
+(or omit their audio descriptor) remain supported. Call audio quality also depends
+on the remote connection. Hosted voice and managed speech modes are unchanged.
