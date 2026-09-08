@@ -624,6 +624,11 @@ def test_outbound_call_realtime():
             aut, "unused", aut_call.id, deadline=deadline
         )
         assert agent_said, "agent produced no speech on the outbound call"
+        negotiated_hd = (
+            f"call_id={aut_call.id} audio_format=pcm_s16le sample_rate=16000"
+            in _gateway_log_since(0)
+        )
+        assert negotiated_hd, "realtime call did not negotiate 16 kHz PCM audio"
 
         tts, stt = _aut_speech_mode(aut, aut_call.id)
         assert tts is False and stt is False, \

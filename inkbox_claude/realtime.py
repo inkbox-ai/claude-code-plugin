@@ -4,7 +4,7 @@ When Realtime is configured, the gateway pre-opens an OpenAI Realtime
 WebSocket *before* accepting the Inkbox call in raw-media mode, then runs
 two pumps for the call's duration:
 
-* caller audio (Inkbox ``media`` frames, base64 μ-law) → OpenAI
+* caller audio (Inkbox ``media`` frames, base64 call audio) → OpenAI
   ``input_audio_buffer.append``; server-side VAD handles turn-taking.
 * OpenAI ``response.output_audio.delta`` → Inkbox ``media`` frames, so the
   model's own voice is what the caller hears.
@@ -30,6 +30,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 try:
+    from .audio import CallAudio
+except ImportError:  # pragma: no cover - direct local import
+    from audio import CallAudio
+
+try:
     from .prompts import _escape_contact_memory_tags, contact_memories_block
 except ImportError:  # pragma: no cover - direct local import/test fallback
     from prompts import _escape_contact_memory_tags, contact_memories_block
@@ -49,8 +54,8 @@ logger = logging.getLogger("inkbox_claude.realtime")
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
 DEFAULT_MODEL = "gpt-realtime-2"
 DEFAULT_VOICE = "cedar"
-# μ-law telephony audio, matching the codec Inkbox bridges from the carrier.
-AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
+# Realtime PCM runs at 24 kHz; call media is negotiated independently.
+AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcm", "rate": 24000}
 INPUT_TRANSCRIPTION_MODEL = "whisper-1"
 
 CONSULT_TOOL_NAME = "consult_agent"
@@ -140,6 +145,7 @@ class RealtimeCallMeta:
 
 @dataclass
 class _BridgeState:
+    audio: CallAudio = field(default_factory=CallAudio)
     transcript: List[Tuple[str, str]] = field(default_factory=list)
     # Work the model asked to run after the call: [{"action", "details"}].
     post_call_actions: List[Dict[str, str]] = field(default_factory=list)
@@ -729,15 +735,25 @@ async def _inkbox_to_openai_pump(
             event = (frame.get("event") or "").lower()
             if event == "start":
                 state.stream_id = frame.get("stream_id") or state.stream_id
+                state.audio.configure((frame.get("start") or {}).get("media_format"))
+                logger.info(
+                    "[realtime] call_id=%s audio_format=%s sample_rate=%d",
+                    meta.call_id,
+                    "pcmu" if state.audio.inbound.decode_ulaw else "pcm_s16le",
+                    state.audio.inbound.source_rate,
+                )
                 await _maybe_send_greeting(openai_ws, state, meta)
             elif event == "media":
                 if not state.greeting_triggered:
                     await _maybe_send_greeting(openai_ws, state, meta)
                 payload_b64 = (frame.get("media") or {}).get("payload")
                 if payload_b64:
+                    converted = state.audio.inbound.convert(payload_b64)
+                    if not converted:
+                        continue
                     await openai_ws.send_str(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": payload_b64,
+                        "audio": converted,
                     }))
             elif event in {"stop", "closed", "hangup"}:
                 logger.info("[realtime] Inkbox WS signaled %s", event)
@@ -837,9 +853,12 @@ async def _openai_to_inkbox_pump(
         if ftype in ("response.output_audio.delta", "response.audio.delta"):
             delta_b64 = frame.get("delta") or ""
             if delta_b64:
+                converted = state.audio.outbound.convert(delta_b64)
+                if not converted:
+                    continue
                 out: Dict[str, Any] = {
                     "event": "media",
-                    "media": {"payload": delta_b64, "track": "outbound"},
+                    "media": {"payload": converted, "track": "outbound"},
                 }
                 if state.stream_id:
                     out["stream_id"] = state.stream_id
@@ -851,6 +870,7 @@ async def _openai_to_inkbox_pump(
 
         # A response's audio finished — tell Inkbox to flush/play.
         elif ftype in ("response.output_audio.done", "response.audio.done"):
+            state.audio.outbound.reset()
             done: Dict[str, Any] = {"event": "audio_done"}
             if state.stream_id:
                 done["stream_id"] = state.stream_id
@@ -863,6 +883,7 @@ async def _openai_to_inkbox_pump(
 
         # Caller started speaking (barge-in) — drop queued outbound audio.
         elif ftype == "input_audio_buffer.speech_started":
+            state.audio.outbound.reset()
             with suppress(Exception):
                 await inkbox_ws.send_str(json.dumps({"event": "clear"}))
 

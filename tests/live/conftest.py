@@ -132,7 +132,7 @@ def _finish_new_calls(client, local_phone: str, baseline: set[str]) -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _clean_up_calls_created_by_live_session():
+def _clean_up_calls_created_by_live_session(retry_connection_setup):
     """Own all calls created by this live process and never leak a carrier leg.
 
     Non-voice suites run a watchdog because a model can unexpectedly choose the
@@ -190,7 +190,7 @@ def _digits(s: str) -> str:
 
 
 @pytest.fixture(scope="session")
-def _reset_channel():
+def _reset_channel(retry_connection_setup):
     """Session-cached reset endpoints, or None when the suite can't run.
 
     Returns ``(aut, aut_pid, aut_phone, remote, remote_pid, driver_phone)``:
@@ -301,3 +301,25 @@ def _reset_conversation_health(request, _reset_channel):
 def _sync_body() -> str:
     # Unique + benign: never trips duplicate_body or the content filter.
     return f"[test-sync] conversation reset {uuid.uuid4().hex[:8]}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def retry_connection_setup():
+    with pytest.MonkeyPatch.context() as patch:
+        _enable_connection_retries(patch)
+        yield
+
+
+def _enable_connection_retries(monkeypatch):
+    """Retry failed connections, never a request whose delivery is uncertain."""
+    if not (REMOTE_KEY and AUT_KEY):
+        return
+    import httpx
+
+    original = httpx.HTTPTransport.__init__
+
+    def initialize(self, *args, **kwargs):
+        kwargs.setdefault("retries", 2)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "__init__", initialize)

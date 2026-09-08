@@ -99,9 +99,9 @@ def test_session_update_configures_telephony_audio_vad_and_all_tools():
     sess = ws.sent[0]["session"]
     assert ws.sent[0]["type"] == "session.update"
     assert sess["output_modalities"] == ["audio"]
-    # μ-law telephony on both legs.
-    assert sess["audio"]["input"]["format"] == {"type": "audio/pcmu"}
-    assert sess["audio"]["output"]["format"] == {"type": "audio/pcmu"}
+    # Realtime PCM on both legs.
+    assert sess["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert sess["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
     # Server-side VAD drives turns + barge-in.
     assert sess["audio"]["input"]["turn_detection"]["type"] == "server_vad"
     assert sess["audio"]["input"]["turn_detection"]["interrupt_response"] is True

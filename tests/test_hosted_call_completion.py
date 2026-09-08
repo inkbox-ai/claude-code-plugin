@@ -738,3 +738,26 @@ def test_non_hosted_call_does_not_start_completion_turn(tmp_path):
         assert not gateway._hosted_call_registry_path.exists()
 
     asyncio.run(scenario())
+
+
+def test_exact_sms_body_survives_post_call_prompt_without_accepted_send_replay(tmp_path):
+    async def scenario():
+        gateway, prompts = _gateway(tmp_path)
+        payload = _payload()
+        body = "Blue  lantern, meadow!"
+        payload["data"]["transcript"]["entries"] = [{
+            "party": "remote", "text": f'After we hang up, send one SMS with this exact body: "{body}".',
+        }]
+        payload["data"]["post_call_action_items"][0]["details"] = f'Exact SMS body: "{body}"'
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+        assert len(prompts) == 1
+        assert f'Exact SMS body: "{body}"' in prompts[0]
+        assert "copy it verbatim" in prompts[0]
+        assert "Do not replace it with a summary or an acknowledgment" in prompts[0]
+        assert "After a send is accepted, do not send another message" in prompts[0]
+        await gateway._on_hosted_call_ended(payload)
+        await _drain(gateway)
+        assert len(prompts) == 1
+
+    asyncio.run(scenario())
