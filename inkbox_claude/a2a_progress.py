@@ -107,7 +107,7 @@ def _clean_update(value: Any, tool_names: list[str]) -> str:
         return _fallback_update()
     normalized_text = _normalize_identifier_text(text)
     if any(
-        re.search(rf"(?:^|_){re.escape(tool_name)}(?:_|$)", normalized_text)
+        re.search(rf"(?<![a-z0-9]){re.escape(tool_name)}(?![a-z0-9])", normalized_text)
         for tool_name in tool_names
         if tool_name
     ):
