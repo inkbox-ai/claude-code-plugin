@@ -38,9 +38,11 @@ _CALL_ME_PHRASINGS = (
 )
 
 
-def _call_me_text() -> str:
+def _call_me_text(*, hosted: bool = False) -> str:
     """A fresh call-request body each send (rotating phrasing + unique ref)."""
     phrasing = _CALL_ME_PHRASINGS[uuid.uuid4().int % len(_CALL_ME_PHRASINGS)]
+    if hosted:
+        phrasing += " Use Voice AI to complete my spoken request and record its post-call action."
     return f"{phrasing} (ref {uuid.uuid4().hex[:6]})"
 
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
@@ -333,39 +335,58 @@ def _wait_for_persisted_hosted_request(
     """Wait for both caller intent and the AUT's durable open action item."""
     marker_key = _spoken_key(marker)
     assert marker_key
-    transcript_ready = False
+    driver_transcript_ready = False
+    aut_transcript_ready = False
     action_ready = False
-    transcript_diagnostic: dict[str, int | bool | str] = {}
+    driver_transcript_diagnostic: dict[str, int | bool | str] = {}
+    aut_transcript_diagnostic: dict[str, int | bool | str] = {}
     action_diagnostic: dict[str, int | bool | str] = {}
     while time.monotonic() < deadline:
         try:
             _all, _rem, local = _segments(remote, number_id, call_id)
             text = " ".join(segment.text.strip() for segment in local)
-            transcript_ready = (
+            driver_transcript_ready = (
                 marker_key in _spoken_key(text)
                 and _has_after_call_sms_intent(text)
             )
-            transcript_diagnostic = {
+            driver_transcript_diagnostic = {
                 "segment_count": len(local),
                 "marker_present": marker_key in _spoken_key(text),
                 "after_call_sms_intent": _has_after_call_sms_intent(text),
             }
         except Exception as exc:  # transcripts may trail call teardown briefly
-            transcript_diagnostic = {"error_type": type(exc).__name__}
+            driver_transcript_diagnostic = {"error_type": type(exc).__name__}
+        try:
+            _all, caller, _local = _segments(aut, "unused", aut_call_id)
+            text = " ".join(segment.text.strip() for segment in caller)
+            aut_transcript_ready = (
+                marker_key in _spoken_key(text)
+                and _has_after_call_sms_intent(text)
+            )
+            aut_transcript_diagnostic = {
+                "segment_count": len(caller),
+                "marker_present": marker_key in _spoken_key(text),
+                "after_call_sms_intent": _has_after_call_sms_intent(text),
+            }
+        except Exception as exc:  # noqa: BLE001 - transcript rows may lag call state
+            aut_transcript_diagnostic = {"error_type": type(exc).__name__}
         try:
             aut_call = aut.calls.get(aut_call_id)
             action_ready = _matching_post_call_action(aut_call, marker) is not None
             action_diagnostic = _post_call_action_diagnostic(aut_call, marker)
         except Exception as exc:
             action_diagnostic = {"error_type": type(exc).__name__}
-        if transcript_ready and action_ready:
+        if driver_transcript_ready and aut_transcript_ready and action_ready:
             return
         time.sleep(POLL_EVERY_S)
     pytest.fail(
-        "hosted call did not persist both current caller intent and its open "
+        "hosted call did not persist current caller intent on both legs and its open "
         "post-call SMS action before the shared deadline "
-        f"(transcript_ready={transcript_ready}, action_ready={action_ready}, "
-        f"transcript_gate={transcript_diagnostic}, action_gate={action_diagnostic})"
+        f"(driver_transcript_ready={driver_transcript_ready}, "
+        f"aut_transcript_ready={aut_transcript_ready}, action_ready={action_ready}, "
+        f"driver_transcript_gate={driver_transcript_diagnostic}, "
+        f"aut_transcript_gate={aut_transcript_diagnostic}, "
+        f"action_gate={action_diagnostic})"
     )
 
 
@@ -700,7 +721,7 @@ def test_outbound_call_hosted_and_post_call_wakeup():
         - POLL_EVERY_S
     )
     not_before = datetime.now(UTC) - timedelta(seconds=10)
-    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text())
+    remote.texts.send(st["number_id"], to=aut_phone, text=_call_me_text(hosted=True))
 
     call_id = None
     placed = None

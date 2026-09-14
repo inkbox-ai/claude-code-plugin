@@ -98,7 +98,7 @@ def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unava
     assert "status='failed'" in str(exc.value)
 
 
-def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
+def test_wait_for_persisted_hosted_request_requires_both_transcripts_and_action():
     voice = _load_live_voice_module()
     marker = "victor echo juliet"
     remote = SimpleNamespace(calls=_Calls(
@@ -117,7 +117,10 @@ def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
             "action": "send_sms",
             "details": f"Send {marker} to the caller.",
         }]),
-        transcripts=[],
+        transcripts=[SimpleNamespace(
+            party="remote",
+            text=f"After this call ends, send one SMS containing {marker}.",
+        )],
     ))
 
     assert voice._wait_for_persisted_hosted_request(
@@ -129,3 +132,33 @@ def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
         marker,
         deadline=time.monotonic() + 1,
     ) is None
+
+
+def test_wait_for_persisted_hosted_request_requires_aut_transcript(monkeypatch):
+    voice = _load_live_voice_module()
+    marker = "victor echo juliet"
+    transcript = [SimpleNamespace(
+        party="local",
+        text=f"After this call ends, send one SMS containing {marker}.",
+    )]
+    remote = SimpleNamespace(calls=_Calls(call=SimpleNamespace(), transcripts=transcript))
+    aut = SimpleNamespace(calls=_Calls(
+        call=SimpleNamespace(post_call_action_items=[{
+            "status": "open",
+            "action": "send_sms",
+            "details": f"Send {marker} to the caller.",
+        }]),
+        transcripts=[],
+    ))
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+
+    with pytest.raises(pytest.fail.Exception, match="aut_transcript_ready=False"):
+        voice._wait_for_persisted_hosted_request(
+            remote,
+            "unused-number-id",
+            "driver-call-id",
+            aut,
+            "aut-call-id",
+            marker,
+            deadline=time.monotonic() + 0.01,
+        )
