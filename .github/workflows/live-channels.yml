@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   live:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 25
     strategy:
       max-parallel: 1
