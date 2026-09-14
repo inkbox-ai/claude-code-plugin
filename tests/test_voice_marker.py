@@ -40,7 +40,7 @@ def test_hosted_workflow_uses_three_word_full_run_marker():
 
     assert 'RUN_TOKEN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in workflow
     assert 'python3 tests/live/voice_marker.py "$RUN_TOKEN"' in workflow
-    assert "exact three-word body" in workflow
+    assert "SMS containing only $marker" in workflow
     assert "HOSTED_POST_CALL_MARKER=$marker" not in workflow
     assert "VOICE_DRIVER_LINE=" not in workflow
     assert "HOSTED_POST_CALL_MARKER_FILE=$marker_file" in workflow

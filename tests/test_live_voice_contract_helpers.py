@@ -23,13 +23,12 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
-def test_workflow_requires_three_word_action_body_and_readback():
+def test_workflow_uses_one_short_hosted_action_utterance():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "After we hang up, send me one SMS with this exact three-word body: $marker. "
-        "Record that post-call SMS action now. Once the action tool succeeds, read the "
-        "exact three words back to me. Do not send the SMS during the call."
+        "Record one post-call action now to send me exactly one SMS containing only "
+        "$marker after we hang up, then say $marker."
         in workflow
     )
     assert "Upload logs on failure" not in workflow
@@ -42,6 +41,13 @@ def test_workflow_requires_three_word_action_body_and_readback():
 def test_spoken_marker_normalizes_punctuation_and_case():
     assert voice._spoken_key("Victor-Echo, JULIET!") == "victorechojuliet"
     assert voice._spoken_key("cloudpapa") == voice._spoken_key("Claude Papa")
+
+
+def test_hosted_call_request_primes_spoken_post_call_work():
+    assert "complete my spoken request and record its post-call action" in (
+        voice._call_me_text(hosted=True)
+    )
+    assert "post-call action" not in voice._call_me_text()
 
 
 def test_after_call_sms_intent_requires_after_call_language():
