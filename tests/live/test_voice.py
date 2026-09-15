@@ -42,7 +42,13 @@ def _call_me_text(*, hosted: bool = False) -> str:
     """A fresh call-request body each send (rotating phrasing + unique ref)."""
     phrasing = _CALL_ME_PHRASINGS[uuid.uuid4().int % len(_CALL_ME_PHRASINGS)]
     if hosted:
-        phrasing += " Use Voice AI to complete my spoken request and record its post-call action."
+        # Name the purpose concretely. "Complete my spoken request" forward-refers
+        # to something only said later on the call, and the agent answers by
+        # asking what the call is about instead of dialing.
+        phrasing += (
+            " Use Voice AI for the call: I will say what I need out loud, and it"
+            " must record the post-call action I ask for before we hang up."
+        )
     return f"{phrasing} (ref {uuid.uuid4().hex[:6]})"
 
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")

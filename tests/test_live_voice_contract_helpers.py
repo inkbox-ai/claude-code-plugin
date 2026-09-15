@@ -44,9 +44,11 @@ def test_spoken_marker_normalizes_punctuation_and_case():
 
 
 def test_hosted_call_request_primes_spoken_post_call_work():
-    assert "complete my spoken request and record its post-call action" in (
-        voice._call_me_text(hosted=True)
-    )
+    hosted = voice._call_me_text(hosted=True)
+    # The purpose has to be concrete. A forward reference to a request only made
+    # later on the call gets answered with a question instead of a dialled call.
+    assert "I will say what I need out loud" in hosted
+    assert "record the post-call action I ask for" in hosted
     assert "post-call action" not in voice._call_me_text()
 
 
