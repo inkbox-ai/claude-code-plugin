@@ -80,6 +80,47 @@ def test_maybe_load_env_file_falls_back_to_state_dir(tmp_path, monkeypatch):
     assert os.environ["INKBOX_API_KEY"] == "ApiKey_global"
 
 
+def test_maybe_load_env_file_merges_state_dir_under_an_unrelated_cwd_env(tmp_path, monkeypatch):
+    # A ./.env that knows nothing about Inkbox (a project's own secrets, or a
+    # stray one in $HOME) must not hide the install's config in the state dir.
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("INKBOX_API_KEY=ApiKey_global\nINKBOX_IDENTITY=agent\n")
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    (cwd / ".env").write_text("SLACK_BOT_TOKEN=xoxb-unrelated\n")
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(home))
+    monkeypatch.delenv("INKBOX_API_KEY", raising=False)
+    monkeypatch.delenv("INKBOX_IDENTITY", raising=False)
+
+    daemon._maybe_load_env_file()
+
+    assert os.environ["INKBOX_API_KEY"] == "ApiKey_global"
+    assert os.environ["INKBOX_IDENTITY"] == "agent"
+    assert os.environ["SLACK_BOT_TOKEN"] == "xoxb-unrelated"  # cwd file still applies
+
+
+def test_maybe_load_env_file_earlier_candidate_wins_per_key(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("INKBOX_API_KEY=ApiKey_global\nINKBOX_IDENTITY=global-agent\n")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    (cwd / ".env").write_text("INKBOX_IDENTITY=project-agent\n")
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("INKBOX_CLAUDE_ENV_FILE", raising=False)
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(home))
+    monkeypatch.delenv("INKBOX_API_KEY", raising=False)
+    monkeypatch.delenv("INKBOX_IDENTITY", raising=False)
+
+    daemon._maybe_load_env_file()
+
+    assert os.environ["INKBOX_IDENTITY"] == "project-agent"  # ./.env beats state dir
+    assert os.environ["INKBOX_API_KEY"] == "ApiKey_global"   # ...but does not hide it
+
+
 def test_launcher_path_is_a_string():
     assert isinstance(daemon._launcher_path(), str)
 
