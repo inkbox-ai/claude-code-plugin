@@ -646,6 +646,22 @@ def test_a2a_progress_summary_rejects_echoed_tool_identifier():
         )
 
 
+def test_a2a_progress_summary_rejects_tool_identifier_across_separators():
+    # The leak guard must suppress an echoed tool name regardless of the
+    # surrounding punctuation, not only underscores. The remote agent controls
+    # the task text (an untrusted prompt-injection surface), and the update is
+    # sent on to that untrusted agent, so a tool name bordered by '-', '.', or
+    # ':' must not slip through to them.
+    for update in (
+        "Running bash-based checks now",
+        "Inspecting the bash.exe helper",
+        "Using bash:mode for this step",
+    ):
+        assert progress_mod._clean_update(update, ["bash"]) == (
+            "I'm continuing the requested work."
+        )
+
+
 def test_a2a_progress_tool_names_are_bounded_and_do_not_retain_inputs():
     progress_mod.start_a2a_progress("task-1")
 
