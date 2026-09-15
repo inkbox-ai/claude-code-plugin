@@ -68,7 +68,7 @@ jobs:
       - name: Install bridge
         run: |
           tests/ci/retry_install.sh pip install \
-            "inkbox==0.5.9" \
+            "inkbox==0.6.12" \
             -e . pytest
 
       - name: Install Claude Code CLI

@@ -115,7 +115,7 @@ inkbox-claude run
 
 `inkbox-claude setup` walks you through everything and writes `.env`: create a fresh Inkbox agent via self-signup (or bring an existing API key), pick or create the identity, attach the Claude Code avatar to the agent's contact card (auto for a new self-signup agent; offered for an existing one with no avatar), provision a phone number, wait for your `START` opt-in, optionally enable OpenAI Realtime voice (validating your key), connect iMessage, mint a webhook signing key, choose the project directory, and set up autostart. Rerun it anytime to reconfigure. Prefer to wire `.env` by hand? Copy `.env.example` to `.env` and fill in `INKBOX_API_KEY`, `INKBOX_IDENTITY`, `INKBOX_SIGNING_KEY`, and `CLAUDE_PROJECT_DIR` yourself.
 
-On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook subscriptions and the incoming-call channel to it, and routes everything into Claude Code sessions.
+On startup the bridge opens an Inkbox tunnel, reconciles an identity-owned webhook subscription and configures the incoming-call channel to it, and routes everything into Claude Code sessions.
 
 ### Running it
 
@@ -286,7 +286,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
 
-The bridge requires Inkbox SDK 0.5.9 or newer.
+The bridge requires Inkbox SDK 0.6.12 or newer.
 
 ### Phone call voice stack
 
@@ -349,7 +349,7 @@ python -m pytest
 
 ## Architecture notes
 
-- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles mail/text/iMessage webhook subscriptions, and sets the identity's incoming-call action (`auto_accept` + call WebSocket) covering both calling lines.
+- **Tunnel-first inbound**: with a signing key, the gateway opens an Inkbox tunnel, reconciles an identity-owned subscription for its supported notification events, and sets the identity's incoming-call action (`auto_accept` + call WebSocket) covering both calling lines.
 - **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Claude Agent SDK**: each session is one `ClaudeSDKClient` (its own Claude Code subprocess) with the `claude_code` system-prompt preset plus a messaging channel prompt appended, `can_use_tool` for escalation, and an in-process MCP server for the Inkbox tools.
@@ -361,3 +361,11 @@ resamples to and from the realtime session's 24 kHz PCM format, preserving audio
 across WebSocket frame boundaries. Older call streams that advertise 8 kHz μ-law
 (or omit their audio descriptor) remain supported. Call audio quality also depends
 on the remote connection. Hosted voice and managed speech modes are unchanged.
+
+### Notification subscription upgrades
+
+New receivers use one identity-owned subscription for the notification events consumed by this gateway,
+including channels that are not enabled yet. Incoming-call control is configured separately.
+On upgrade, compatible existing subscriptions retain their IDs, event selections, and context;
+missing events are added with revision-checked updates. Other destination URLs are untouched.
+Conflicting delivery authentication or context settings require review instead of replacement.

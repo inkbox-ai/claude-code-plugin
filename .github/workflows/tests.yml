@@ -55,7 +55,7 @@ jobs:
       - name: Install bridge + latest SDK
         run: |
           tests/ci/retry_install.sh uv pip install --system \
-            "inkbox==0.5.9" \
+            "inkbox==0.6.12" \
             -e . pytest
           tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 

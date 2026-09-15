@@ -422,7 +422,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'", specifier = ">=0.2.1" },
     { name = "claude-agent-sdk", specifier = ">=0.1.0" },
-    { name = "inkbox", specifier = ">=0.5.9,<1.0.0" },
+    { name = "inkbox", git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=9f54e8dbb4a540c5f721c26a296d47f7b1978b0f" },
     { name = "segno", specifier = ">=1.5" },
 ]
 
@@ -696,8 +696,8 @@ wheels = [
 
 [[package]]
 name = "inkbox"
-version = "0.5.14"
-source = { registry = "https://pypi.org/simple" }
+version = "0.6.12"
+source = { git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=9f54e8dbb4a540c5f721c26a296d47f7b1978b0f#9f54e8dbb4a540c5f721c26a296d47f7b1978b0f" }
 dependencies = [
     { name = "argon2-cffi" },
     { name = "certifi" },
@@ -705,10 +705,6 @@ dependencies = [
     { name = "h11" },
     { name = "h2" },
     { name = "httpx" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/04/0599f9ded121fdb5cba955bdb3908a75d401f447a56b2550e15f837bc7da/inkbox-0.5.14.tar.gz", hash = "sha256:92c3a706e8e289a362f0a7a42090b6fae251bbac6ff9d9989afabb583d20758a", size = 392084, upload-time = "2026-08-07T18:14:00.652Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/f1/ef2d2fe3b5e004aac375796268dc438a8900e45abf1669c591d640b8d3b8/inkbox-0.5.14-py3-none-any.whl", hash = "sha256:bf256f2091a76dfcf56e896f8aaf54199efb60d693074f6ea5b2ac57d9b4313d", size = 266404, upload-time = "2026-08-07T18:13:59.309Z" },
 ]
 
 [[package]]

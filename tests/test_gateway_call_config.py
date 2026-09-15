@@ -27,20 +27,6 @@ class _FakeSubscriptions:
         self.deleted.append(sub_id)
 
 
-class _UnsupportedA2ASubscriptions(_FakeSubscriptions):
-    def __init__(self):
-        super().__init__()
-        self.attempted = []
-
-    def create(self, **kwargs):
-        self.attempted.append(kwargs)
-        if any(event.startswith("a2a.") for event in kwargs["event_types"]):
-            raise ValueError(
-                "event_type 'a2a.task.created' does not belong to any known channel"
-            )
-        return super().create(**kwargs)
-
-
 class _FakePhoneNumbers:
     def __init__(self):
         self.updated = []
@@ -168,59 +154,27 @@ def test_legacy_sdk_cannot_configure_imessage_only_identity():
     assert gw._inkbox.phone_numbers.updated == []
 
 
-def test_a2a_subscription_falls_back_to_imessage_on_older_api():
-    subscriptions = _UnsupportedA2ASubscriptions()
-    _patched_gateway(
-        _Identity(phone=None, imessage_enabled=True),
-        subscriptions=subscriptions,
-    )
-
-    assert subscriptions.created[-1]["event_types"] == gateway.IMESSAGE_EVENTS
-
-
-def test_a2a_and_imessage_use_channel_coherent_subscriptions():
+def test_one_mixed_subscription_is_created_without_channels():
     subscriptions = _FakeSubscriptions()
-    _patched_gateway(
-        _Identity(phone=None, imessage_enabled=True),
-        subscriptions=subscriptions,
+    _patched_gateway(_Identity(), subscriptions=subscriptions)
+    assert len(subscriptions.created) == 1
+    assert subscriptions.created[0]["agent_identity_id"] == "identity-1"
+    assert set(subscriptions.created[0]["event_types"]) == set(
+        gateway.MAIL_EVENTS + gateway.TEXT_EVENTS + gateway.IMESSAGE_EVENTS + gateway.CALL_EVENTS + gateway.A2A_EVENTS
     )
-
-    assert [created["event_types"] for created in subscriptions.created] == [
-        gateway.A2A_EVENTS,
-        gateway.CALL_EVENTS,
-        gateway.IMESSAGE_EVENTS,
-    ]
-    assert [created["url"] for created in subscriptions.created] == [
-        "https://agent.example/webhook",
-        "https://agent.example/webhook",
-        "https://agent.example/webhook",
-    ]
-
-
-def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
-    a2a = types.SimpleNamespace(
-        id="sub-a2a",
-        url="https://agent.example/webhook",
-        event_types=gateway.A2A_EVENTS,
-    )
-    subscriptions = _FakeSubscriptions([a2a])
-    _patched_gateway(
-        _Identity(phone=None, imessage_enabled=True),
-        subscriptions=subscriptions,
-    )
-
     assert subscriptions.deleted == []
-    assert [created["event_types"] for created in subscriptions.created] == [
-        gateway.CALL_EVENTS,
-        gateway.IMESSAGE_EVENTS,
-    ]
 
 
-def test_a2a_only_subscription_is_skipped_on_older_api():
-    subscriptions = _UnsupportedA2ASubscriptions()
-    _patched_gateway(
-        _Identity(phone=None, imessage_enabled=False),
-        subscriptions=subscriptions,
-    )
+def test_persists_first_created_signing_key_without_rotating_existing_key(monkeypatch):
+    from unittest.mock import Mock
+    from inkbox_claude import setup_wizard
 
-    assert [created["event_types"] for created in subscriptions.created] == [gateway.CALL_EVENTS]
+    save = Mock()
+    monkeypatch.setattr(setup_wizard, "_save", save)
+    subscriptions = _FakeSubscriptions()
+    subscriptions.create = Mock(return_value=types.SimpleNamespace(signing_key="synthetic-first-key"))
+    gw = _patched_gateway(_Identity(), subscriptions=subscriptions)
+    assert gw.cfg.signing_key == "synthetic-first-key"
+    save.assert_called_once_with("INKBOX_SIGNING_KEY", "synthetic-first-key")
+    gw._patch_identity_objects()
+    assert save.call_count == 1

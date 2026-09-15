@@ -4,12 +4,9 @@ The bridge's runtime core:
 
 1. On startup, bring up the identity's Inkbox tunnel (or use
    ``INKBOX_PUBLIC_URL``), reconcile webhook subscriptions for the
-   identity's mailbox (``message.received``), phone number
-   (``text.received``), and - when iMessage-enabled - the identity
-   itself (``imessage.received`` and ``imessage.reaction_received``),
-   and set the identity's incoming-call action to auto-accept onto our
-   call WebSocket (covers the dedicated number AND the shared iMessage
-   line).
+   identity using one mixed-event receiver, independently of optional
+   channels. Incoming-call routing is configured separately when a line
+   can receive calls.
 2. Serve ``POST /webhook`` (signature-verified per source) and
    ``WS /phone/media/ws``.
 3. Map every inbound event to a contact-keyed Claude Code session:
@@ -65,6 +62,7 @@ try:
         start_a2a_progress,
         stop_a2a_progress,
     )
+    from .webhook_subscriptions import reconcile_identity_subscription
     from .config import (
         DEFAULT_WEBHOOK_PATH,
         INKBOX_WS_PATH,
@@ -101,6 +99,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
         start_a2a_progress,
         stop_a2a_progress,
     )
+    from webhook_subscriptions import reconcile_identity_subscription
     from config import (
         DEFAULT_WEBHOOK_PATH,
         INKBOX_WS_PATH,
@@ -686,15 +685,6 @@ _A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 _A2A_RETRY_INTERVAL_SECONDS = 5.0
 
 
-def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
-    detail = str(getattr(exc, "detail", exc))
-    return (
-        any(event_type in detail for event_type in A2A_EVENTS)
-        and (
-            getattr(exc, "status_code", None) == 422
-            or "does not belong to any known channel" in detail
-        )
-    )
 
 
 def _a2a_receipt_text(task_id: str, progress_interval_seconds: float) -> str:
@@ -835,7 +825,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.5.9,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.6.12,<1.0.0'")
         if self.cfg.voice_stack_invalid_value:
             raise RuntimeError(
                 f"invalid INKBOX_VOICE_STACK={self.cfg.voice_stack_invalid_value!r}; rerun setup"
@@ -953,7 +943,7 @@ class InkboxGateway:
         logger.info("[bridge] tunnel ready: %s → 127.0.0.1:%d", self._public_url, self.cfg.port)
 
     def _patch_identity_objects(self) -> None:
-        """Point the identity's mailbox/phone/iMessage events at this server."""
+        """Register identity notifications independently of channel availability."""
         if self.cfg.skip_webhook_reconcile:
             logger.info(
                 "[bridge] leaving webhook subscriptions alone; expecting them "
@@ -966,42 +956,16 @@ class InkboxGateway:
         ws_url = f"wss://{self._public_host}{INKBOX_WS_PATH}"
         identity = self._inkbox.get_identity(self.cfg.identity)
 
-        def _reconcile(
-            owner_kw: Dict[str, Any],
-            event_types: List[str],
-            *,
-            subscription_url: str = webhook_url,
-        ) -> None:
-            existing = self._inkbox.webhooks.subscriptions.list(**owner_kw)
-            desired_families = {
-                event_type.split(".", 1)[0] for event_type in event_types
-            }
-            for sub in existing:
-                if (
-                    sub.url == subscription_url
-                    and set(sub.event_types) == set(event_types)
-                ):
-                    return  # already wired
-                existing_families = {
-                    event_type.split(".", 1)[0] for event_type in sub.event_types
-                }
-                if (
-                    sub.url.split("?", 1)[0].endswith(DEFAULT_WEBHOOK_PATH)
-                    and desired_families & existing_families
-                ):
-                    # Replace only this event channel. One identity may have
-                    # separate iMessage and A2A subscriptions at the same URL.
-                    self._inkbox.webhooks.subscriptions.delete(sub.id)
-            self._inkbox.webhooks.subscriptions.create(
-                url=subscription_url, event_types=event_types, **owner_kw
-            )
+        subscription = reconcile_identity_subscription(
+            self._inkbox, identity.id, webhook_url,
+            MAIL_EVENTS + TEXT_EVENTS + IMESSAGE_EVENTS + CALL_EVENTS + A2A_EVENTS,
+        )
+        signing_key = getattr(subscription, "signing_key", None)
+        if signing_key and not self.cfg.signing_key:
+            from .setup_wizard import _save
 
-        if identity.mailbox is not None:
-            _reconcile({"mailbox_id": identity.mailbox.id}, MAIL_EVENTS)
-            logger.info("[bridge] mailbox %s → %s", identity.mailbox.email_address, webhook_url)
-        if identity.phone_number is not None:
-            _reconcile({"phone_number_id": identity.phone_number.id}, TEXT_EVENTS)
-            logger.info("[bridge] phone %s texts → %s", identity.phone_number.number, webhook_url)
+            _save("INKBOX_SIGNING_KEY", signing_key)
+            self.cfg.signing_key = signing_key
 
         # Inbound-call config is identity-scoped (SDK 0.4.15+): one row covers
         # the dedicated number AND any shared iMessage line. auto_accept skips
@@ -1038,21 +1002,6 @@ class InkboxGateway:
                 "[bridge] incoming-call action for %s → %s + %s",
                 self.cfg.identity, webhook_url, ws_url,
             )
-        try:
-            _reconcile(
-                {"agent_identity_id": identity.id},
-                A2A_EVENTS,
-            )
-        except Exception as exc:
-            if not _is_unsupported_a2a_event_types(exc):
-                raise
-            logger.warning(
-                "[bridge] Inkbox API does not support A2A webhook events yet; "
-                "continuing without A2A delivery until the backend is upgraded"
-            )
-        _reconcile({"agent_identity_id": identity.id}, CALL_EVENTS)
-        if getattr(identity, "imessage_enabled", False):
-            _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     def _read_hosted_call_registry(self) -> Dict[str, Any]:
