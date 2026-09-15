@@ -95,6 +95,7 @@ jobs:
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER_FILE=$marker_file" >> "$GITHUB_ENV"
             echo "VOICE_DRIVER_LINE_FILE=$driver_line_file" >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_ANSWER_CONTAINS=$marker" >> "$GITHUB_ENV"
             # Keep the media peer alive while the test waits for Voice AI to
             # persist the open post-call action, then let the test hang up.
             echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"
