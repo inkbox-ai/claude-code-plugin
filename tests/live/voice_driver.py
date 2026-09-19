@@ -134,6 +134,10 @@ async def phone_media_ws(ws: WebSocket) -> None:
             return
         await _say(LINE)
         asked_at = loop.time()
+        # text.done acknowledges submission, not completed audio playback. Give
+        # long requests 100 spoken words/minute plus the quiet gap before a
+        # retry can enqueue another copy; short asks retain the configured floor.
+        reask_after = max(REASK_EVERY_S, len(LINE.split()) * 0.6 + QUIET_GAP_S)
         state["last_heard"] = asked_at
         # Re-ask if the agent never got the question: the greeting routinely runs
         # several seconds past our first ask, and a lost ask leaves the agent
@@ -148,7 +152,7 @@ async def phone_media_ws(ws: WebSocket) -> None:
                 REASK_EVERY_S > 0
                 and not answered.is_set()
                 and reasks < MAX_REASKS
-                and loop.time() - asked_at >= REASK_EVERY_S
+                and loop.time() - asked_at >= reask_after
                 and loop.time() - state["last_heard"] >= QUIET_GAP_S
             ):
                 await _say(LINE)

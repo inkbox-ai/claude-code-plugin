@@ -162,3 +162,20 @@ def test_wait_for_persisted_hosted_request_requires_aut_transcript(monkeypatch):
             marker,
             deadline=time.monotonic() + 0.01,
         )
+
+
+def test_action_diagnostic_counts_missing_words_without_accepting_partial_marker():
+    voice = _load_live_voice_module()
+    call = SimpleNamespace(post_call_action_items=[{
+        "status": "open", "action": "Send SMS", "details": "private recipient: banana umbrella",
+    }])
+    marker = "banana umbrella calendar"
+    diagnostic = voice._post_call_action_diagnostic(call, marker)
+    assert diagnostic == {
+        "item_count": 1, "inspected_count": 1, "open_count": 1,
+        "marker_count": 0, "sms_count": 1, "max_marker_words": 2,
+        "matching_action": False,
+    }
+    assert voice._matching_post_call_action(call, marker) is None
+    assert "private recipient" not in str(diagnostic)
+    assert "banana" not in str(diagnostic)

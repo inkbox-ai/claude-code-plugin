@@ -27,8 +27,10 @@ def test_workflow_uses_one_short_hosted_action_utterance():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "Record one post-call action now to send me exactly one SMS containing only "
-        "$marker after we hang up, then say $marker."
+        "After we hang up, send me one SMS containing exactly: $marker. "
+        "Save one post-call action now, with both title and details exactly: Send SMS $marker. "
+        "After the tool succeeds, read back the exact three-word SMS body. "
+        "Do not text during this call."
         in workflow
     )
     assert "Upload logs on failure" not in workflow
@@ -244,6 +246,7 @@ def test_action_gate_diagnostic_is_bounded_and_content_redacted():
         "open_count": 1,
         "marker_count": 1,
         "sms_count": 1,
+        "max_marker_words": 3,
         "matching_action": True,
     }
     assert "customer-secret" not in repr(diagnostic)

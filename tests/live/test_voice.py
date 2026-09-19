@@ -262,6 +262,7 @@ def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
     open_count = 0
     marker_count = 0
     sms_count = 0
+    max_marker_words = 0
     matching_action = False
     marker_key = _spoken_key(marker)
     for item in items[:10]:
@@ -277,6 +278,9 @@ def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
         is_open = str(status).casefold() == "open"
         has_marker = bool(marker_key) and marker_key in _spoken_key(value)
         has_sms_intent = _has_sms_action_intent(value)
+        max_marker_words = max(max_marker_words, sum(
+            _spoken_key(word) in _spoken_key(value) for word in _spoken_tokens(marker)
+        ))
         open_count += int(is_open)
         marker_count += int(has_marker)
         sms_count += int(has_sms_intent)
@@ -289,6 +293,7 @@ def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
         "open_count": open_count,
         "marker_count": marker_count,
         "sms_count": sms_count,
+        "max_marker_words": max_marker_words,
         "matching_action": matching_action,
     }
 
