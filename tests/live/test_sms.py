@@ -200,7 +200,7 @@ def test_sms_reachability(sms):
 @real_only
 def test_sms_basic_reply(sms):
     body = _ask_sms(sms, "Please reply OK to confirm you got this text.")
-    assert len(body.strip()) > 0, "empty reply"
+    assert re.search(r"\bok\b", body), "reply did not contain the requested acknowledgement"
 
 
 @real_only
