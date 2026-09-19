@@ -29,7 +29,7 @@ import os
 import re
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -170,8 +170,12 @@ def test_sms_request_gets_email_response(xc):
     remote, remote_email, aut_email = xc["remote"], xc["remote_email"], xc["aut_email"]
     token = _token()
 
+    since = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+
     def _email_from_aut():
-        return [m for m in remote.messages.list(remote_email, direction=MessageDirection.INBOUND)
+        return [m for m in remote.messages.list(
+            remote_email, direction=MessageDirection.INBOUND, start_datetime=since,
+        )
                 if aut_email.lower() in (getattr(m, "from_address", "") or "").lower()]
 
     before = {m.id for m in _email_from_aut()}

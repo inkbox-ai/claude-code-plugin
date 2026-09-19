@@ -22,6 +22,7 @@ import os
 import re
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -103,8 +104,14 @@ def _ask(
     """
     from inkbox.mail.types import MessageDirection
 
+    # Freeze before the baseline/send, allowing clock skew without rescanning
+    # lifetime history. Keep every page and all equal-timestamp rows.
+    since = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+
     def _inbound():
-        return list(remote.messages.list(remote_email, direction=MessageDirection.INBOUND))
+        return list(remote.messages.list(
+            remote_email, direction=MessageDirection.INBOUND, start_datetime=since,
+        ))
 
     before = {str(msg.id) for msg in _inbound()}
     nonce = f"smoke-{uuid.uuid4().hex[:8]}"

@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -57,6 +58,7 @@ def test_email_reachability():
     identities_differ = remote_email.lower() != aut_email.lower()
     assert identities_differ, "remote and AUT must be different identities"
 
+    since = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
     nonce = f"smoke-{uuid.uuid4().hex[:8]}"
     subject = f"[{nonce}] are you there?"
     sent = remote.messages.send(
@@ -79,7 +81,9 @@ def test_email_reachability():
     deadline = time.monotonic() + TIMEOUT_S
     reply = None
     while time.monotonic() < deadline and reply is None:
-        for msg in remote.messages.list(remote_email, direction=MessageDirection.INBOUND):
+        for msg in remote.messages.list(
+            remote_email, direction=MessageDirection.INBOUND, start_datetime=since,
+        ):
             if _is_reply(msg):
                 reply = msg
                 break
