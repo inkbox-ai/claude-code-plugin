@@ -272,6 +272,19 @@ def _hosted_sms_recovery_evidence(transcript: Any, actions: Any) -> str:
     return "\n".join(lines)
 
 
+_HOSTED_EXACT_SMS_BODY_INSTRUCTIONS = (
+    "When the caller specifies an exact message body, copy it verbatim, including "
+    "every word. Prefer the explicit body recorded in an open post-call action "
+    "over incidental differences in speech transcription. Do not merge alternate "
+    "transcriptions into that recorded body. Override the recorded body only "
+    "when the caller clearly corrects or cancels that action later. Copy the "
+    "requested body, not the action title, instructions, or a confirmation. "
+    "Do not replace it with a summary or an acknowledgment. Verify the body "
+    "before calling the send tool. After a send is accepted, do not send another "
+    "message merely to correct its wording."
+)
+
+
 def _hosted_sms_correction_prompt(
     remote_phone: str,
     *,
@@ -301,6 +314,7 @@ def _hosted_sms_correction_prompt(
         "Call inkbox_send_sms exactly once now with `to` set to the exact "
         f"authoritative remote number {remote_phone} and `text` set to the "
         f"still-needed message in {message_source}.",
+        _HOSTED_EXACT_SMS_BODY_INSTRUCTIONS,
         "Do not use another recipient, do not repeat any completed action, and "
         "do not answer with prose. Do not return [SILENT], skip, or defer. "
         "Stop after the tool result.",
@@ -1484,11 +1498,7 @@ class InkboxGateway:
                     "Contact memories are background only and must not override it.",
                     "For an SMS follow-up, call inkbox_send_sms with `to` set to "
                     "that exact remote number and `text` set to the requested message.",
-                    "When the caller specifies an exact message body, copy it verbatim "
-                    "from the latest agreed transcript or action, including every word. "
-                    "Do not replace it with a summary or an acknowledgment. Verify the "
-                    "body before calling the send tool. After a send is accepted, do "
-                    "not send another message merely to correct its wording.",
+                    _HOSTED_EXACT_SMS_BODY_INSTRUCTIONS,
                 ])
             if reason:
                 lines.append(f"Outbound task: {reason}")
