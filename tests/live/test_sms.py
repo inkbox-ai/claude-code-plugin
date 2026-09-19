@@ -200,7 +200,8 @@ def test_sms_reachability(sms):
 @real_only
 def test_sms_basic_reply(sms):
     body = _ask_sms(sms, "Please reply OK to confirm you got this text.")
-    assert re.search(r"\bok\b", body), "reply did not contain the requested acknowledgement"
+    acknowledged = bool(re.search(r"\bok\b", body))
+    assert acknowledged, "reply did not contain the requested acknowledgement"
 
 
 @real_only
@@ -211,7 +212,8 @@ def test_sms_reports_own_identity(sms):
     email_present = aut_email in body
     assert email_present, "reply missing the expected email"
     phone_pattern = r"(?<!\d)" + r"[\s().-]*".join(_digits(aut_phone)) + r"(?!\d)"
-    assert re.search(phone_pattern, body), "reply missing the complete phone number"
+    phone_present = bool(re.search(phone_pattern, body))
+    assert phone_present, "reply missing the complete phone number"
 
 
 @real_only

@@ -216,10 +216,12 @@ def _assert_hosted_sms_rows(messages, before, marker, recipient, ended_at):
         created_at = _message_created_at(message)
         assert created_at is not None, "hosted SMS has no server timestamp"
         assert created_at >= ended_at, "hosted SMS was created before the call ended"
-        assert _sms_target_numbers(message) == {_digits(recipient)}, (
+        recipient_matches = _sms_target_numbers(message) == {_digits(recipient)}
+        assert recipient_matches, (
             "hosted SMS did not target only the authoritative caller"
         )
-        assert _spoken_tokens(getattr(message, "text", None)) == _spoken_tokens(marker), (
+        body_matches = _spoken_tokens(getattr(message, "text", None)) == _spoken_tokens(marker)
+        assert body_matches, (
             "hosted SMS body differs from the requested words"
         )
     return fresh

@@ -194,7 +194,8 @@ def test_reports_own_identity(ctx):
     has_email = aut_email in body
     assert has_handle, "reply missing the expected handle"
     assert has_email, "reply missing the expected email"
-    assert display_name.lower() in body, "reply missing the expected display name"
+    has_display_name = display_name.lower() in body
+    assert has_display_name, "reply missing the expected display name"
     has_phone = _phone_present(aut_phone, body)
     assert has_phone, "reply missing the expected phone"
 
@@ -221,7 +222,8 @@ def test_reports_sender_details(ctx):
     name = (getattr(contact, "preferred_name", None) or getattr(contact, "given_name", None) or "")
     emails = [e.value for e in getattr(contact, "emails", [])]
     phones = [p.value for p in getattr(contact, "phones", [])]
-    assert name and emails and phones, "sender-details scenario needs a complete contact fixture"
+    complete_contact = bool(name and emails and phones)
+    assert complete_contact, "sender-details scenario needs a complete contact fixture"
 
     body = _ask(
         ctx["remote"],
