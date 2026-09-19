@@ -103,3 +103,40 @@ def test_claude_cli_installed_and_answers_version():
     out = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, f"claude --version failed: {out.stderr[:300]}"
     assert out.stdout.strip(), "claude --version printed nothing"
+
+
+def test_contact_patch_preserves_omitted_identifiers_through_mcp():
+    """Validate real host schemas and dispatch, not a mocked tool decorator."""
+    import anyio
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    from inkbox_claude.tools import build_inkbox_mcp_server
+
+    client = MagicMock()
+    client.contacts.update.return_value = {"id": "contact-1", "notes": "updated"}
+    config, _ = build_inkbox_mcp_server(client, "contract-test")
+    server = config["instance"]
+
+    async def exercise():
+        async with create_client_server_memory_streams() as (client_streams, server_streams):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(server.run, *server_streams, server.create_initialization_options())
+                async with ClientSession(*client_streams) as session:
+                    await session.initialize()
+                    for patch in ({"notes": "updated"}, {"emails": []}, {"phones": []}):
+                        client.contacts.update.reset_mock()
+                        result = await session.call_tool(
+                            "inkbox_update_contact", {"contact_id": "contact-1", **patch},
+                        )
+                        assert not result.model_dump(by_alias=True)["isError"], result.content
+                        client.contacts.update.assert_called_once_with("contact-1", **patch)
+
+                    for invalid in ({"notes": "updated"}, {"contact_id": "contact-1", "emails": ""}):
+                        client.contacts.update.reset_mock()
+                        result = await session.call_tool("inkbox_update_contact", invalid)
+                        assert result.model_dump(by_alias=True)["isError"]
+                        client.contacts.update.assert_not_called()
+                tasks.cancel_scope.cancel()
+
+    anyio.run(exercise)
