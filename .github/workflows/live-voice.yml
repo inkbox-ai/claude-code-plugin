@@ -91,7 +91,7 @@ jobs:
             marker_file="$RUNNER_TEMP/hosted_marker.txt"
             driver_line_file="$RUNNER_TEMP/voice_driver_line.txt"
             printf '%s' "$marker" > "$marker_file"
-            printf '%s' "Do not text during this call. After we hang up, send one SMS with exactly these words: $spoken_marker. Create one post-call action titled Send SMS, with details exactly $spoken_marker. After the tool succeeds, read back the SMS body." > "$driver_line_file"
+            printf '%s' "Do not text during this call, but after we hang up send me exactly one SMS with body exactly $spoken_marker, and create one post-call action now titled Send SMS with details exactly $spoken_marker, then after the tool succeeds read back the three-word body." > "$driver_line_file"
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER_FILE=$marker_file" >> "$GITHUB_ENV"

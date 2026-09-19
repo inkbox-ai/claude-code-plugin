@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,12 +27,14 @@ voice = _load_voice_module()
 def test_workflow_uses_one_short_hosted_action_utterance():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
-    assert (
-        "Do not text during this call. After we hang up, send one SMS with exactly these words: $spoken_marker. "
-        "Create one post-call action titled Send SMS, with details exactly $spoken_marker. "
-        "After the tool succeeds, read back the SMS body."
-        in workflow
-    )
+    line = re.search(r'''printf '%s' "([^"]+)" > "\$driver_line_file"''', workflow).group(1)
+    assert line.endswith(".")
+    assert not re.search(r"[.!?]", line[:-1]), "One complete request must precede a sentence-ending pause"
+    assert line.startswith("Do not text during this call,")
+    assert "create one post-call action now titled Send SMS with details exactly $spoken_marker" in line
+    assert "after the tool succeeds read back the three-word body" in line
+    assert voice._has_after_call_sms_intent(line)
+    assert not voice._has_after_call_sms_intent("Do not text during this call")
     assert "Upload logs on failure" not in workflow
     assert "Dump logs on failure" not in workflow
     assert "candidates={current_candidates" not in (
