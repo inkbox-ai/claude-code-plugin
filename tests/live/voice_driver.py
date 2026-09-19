@@ -18,6 +18,7 @@ Env:
   VOICE_DRIVER_PORT       local port the tunnel forwards to (default 8090)
   VOICE_DRIVER_STATE      path to write the JSON state file
   VOICE_DRIVER_LINE       the one line the driver speaks (default below)
+  VOICE_DRIVER_WAIT_FOR_PEER  require initial peer speech before the quiet gate
 """
 
 from __future__ import annotations
@@ -61,6 +62,9 @@ GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
 # Wait through the initial greeting before asking: speaking on a fixed timer
 # can clip the request or its marker while the other party is still talking.
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
+# Hosted scenarios can require an observed greeting rather than treating the
+# absence of transcript frames as silence while the peer is still starting.
+WAIT_FOR_PEER = os.environ.get("VOICE_DRIVER_WAIT_FOR_PEER", "0") == "1"
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
@@ -90,11 +94,11 @@ async def _wait_for_greeting(state: dict[str, float]) -> bool:
     while True:
         now = loop.time()
         quiet_in = QUIET_GAP_S - (now - state["last_heard"])
-        if quiet_in <= 0:
+        if quiet_in <= 0 and (not WAIT_FOR_PEER or state["last_heard"] > 0):
             return True
         if now >= deadline:
             return False
-        await asyncio.sleep(min(quiet_in, deadline - now))
+        await asyncio.sleep(min(quiet_in if quiet_in > 0 else 1.0, deadline - now))
 
 
 app = FastAPI()

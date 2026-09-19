@@ -22,6 +22,7 @@ def driver(monkeypatch):
     with monkeypatch.context() as imports:
         imports.setenv("REMOTE_INKBOX_API_KEY", "synthetic-driver-key")
         imports.delenv("VOICE_DRIVER_LINE_FILE", raising=False)
+        imports.delenv("VOICE_DRIVER_WAIT_FOR_PEER", raising=False)
         imports.setitem(sys.modules, "uvicorn", SimpleNamespace())
         imports.setitem(sys.modules, "fastapi", SimpleNamespace(FastAPI=App, WebSocket=object))
         imports.setitem(sys.modules, "starlette.websockets", SimpleNamespace(
@@ -215,3 +216,87 @@ def test_long_request_does_not_requeue_before_playback_and_peer_quiet(
         (105.0, driver.LINE),
         (expected_retry, driver.LINE),
     ]
+
+
+@pytest.mark.parametrize(
+    "require_peer, speech, expected_request, expected_stop",
+    [
+        (False, False, 105.0, 107.0),
+        (True, True, 116.0, 118.0),
+        (True, False, None, 130.0),
+    ],
+)
+@pytest.mark.parametrize("empty_text", ["", None, "   "])
+def test_initial_peer_requirement_through_actual_websocket(
+    driver, monkeypatch, require_peer, speech, expected_request, expected_stop, empty_text,
+):
+    """Delayed speech must precede the hosted request; blank frames aren't speech."""
+    now = 100.0
+    pending = [
+        (104, {"event": "transcript", "text": empty_text, "is_final": False}),
+        (115, {"event": "transcript", "text": empty_text, "is_final": True}),
+    ]
+    if speech:
+        pending.extend([
+            (107, {"event": "transcript", "text": "Hi", "is_final": False}),
+            (110, {"event": "transcript", "text": "Hi, caller", "is_final": True}),
+        ])
+    pending.sort(key=lambda item: item[0])
+    incoming = None
+
+    async def advance(delay):
+        nonlocal now
+        target = now + delay
+        while pending and pending[0][0] <= target:
+            now, event = pending.pop(0)
+            incoming.put_nowait(json.dumps(event))
+            await asyncio.sleep(0)
+        now = target
+        await asyncio.sleep(0)
+
+    loop = SimpleNamespace(time=lambda: now)
+    monkeypatch.setattr(driver, "asyncio", SimpleNamespace(
+        get_event_loop=lambda: loop, get_running_loop=lambda: loop,
+        sleep=advance, Event=asyncio.Event, create_task=asyncio.create_task,
+        CancelledError=asyncio.CancelledError,
+    ))
+    monkeypatch.setattr(driver, "WAIT_FOR_PEER", require_peer, raising=False)
+    monkeypatch.setattr(driver, "SPEAK_AFTER_S", 5)
+    monkeypatch.setattr(driver, "QUIET_GAP_S", 6)
+    monkeypatch.setattr(driver, "LISTEN_S", 2)
+    monkeypatch.setattr(driver, "REASK_EVERY_S", 0)
+
+    async def run():
+        nonlocal incoming
+        incoming = asyncio.Queue()
+        incoming.put_nowait(json.dumps({"event": "start"}))
+
+        class Socket:
+            client_state = "disconnected"
+
+            def __init__(self):
+                self.sent = []
+
+            async def accept(self, **_kwargs):
+                pass
+
+            async def send_text(self, raw):
+                event = json.loads(raw)
+                self.sent.append((now, event))
+                if event["event"] == "stop":
+                    incoming.put_nowait(json.dumps({"event": "stop"}))
+
+            async def receive_text(self):
+                return await incoming.get()
+
+        socket = Socket()
+        await driver.phone_media_ws(socket)
+        return socket.sent
+
+    sent = asyncio.run(run())
+    spoken = [(when, event["delta"]) for when, event in sent if "delta" in event]
+    expected_spoken = [(100.0, driver.GREETING)]
+    if expected_request is not None:
+        expected_spoken.append((expected_request, driver.LINE))
+    assert spoken == expected_spoken
+    assert [when for when, event in sent if event["event"] == "stop"] == [expected_stop]

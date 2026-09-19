@@ -24,17 +24,18 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
-def test_workflow_uses_one_short_hosted_action_utterance():
+def test_workflow_frontloads_complete_hosted_action_request():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     line = re.search(r'''printf '%s' "([^"]+)" > "\$driver_line_file"''', workflow).group(1)
-    assert line.endswith(".")
-    assert not re.search(r"[.!?]", line[:-1]), "One complete request must precede a sentence-ending pause"
-    assert line.startswith("Do not text during this call,")
-    assert "create one post-call action now titled Send SMS with details exactly $spoken_marker" in line
-    assert "after the tool succeeds read back the three-word body" in line
-    assert voice._has_after_call_sms_intent(line)
-    assert not voice._has_after_call_sms_intent("Do not text during this call")
+    action_request = line.split(".", 1)[0]
+    assert action_request.startswith("Create one post-call action")
+    assert "titled Send SMS, details exactly $spoken_marker" in action_request
+    assert voice._has_after_call_sms_intent(action_request)
+    assert "Read back the body after saving" in line
+    assert "Do not text now" in line
+    assert not voice._has_after_call_sms_intent("Do not text now")
+    assert "VOICE_DRIVER_WAIT_FOR_PEER=1" in workflow
     assert "Upload logs on failure" not in workflow
     assert "Dump logs on failure" not in workflow
     assert "candidates={current_candidates" not in (

@@ -91,12 +91,13 @@ jobs:
             marker_file="$RUNNER_TEMP/hosted_marker.txt"
             driver_line_file="$RUNNER_TEMP/voice_driver_line.txt"
             printf '%s' "$marker" > "$marker_file"
-            printf '%s' "Do not text during this call, but after we hang up send me exactly one SMS with body exactly $spoken_marker, and create one post-call action now titled Send SMS with details exactly $spoken_marker, then after the tool succeeds read back the three-word body." > "$driver_line_file"
+            printf '%s' "Create one post-call action titled Send SMS, details exactly $spoken_marker, to send me only after we hang up. Read back the body after saving. Do not text now." > "$driver_line_file"
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER_FILE=$marker_file" >> "$GITHUB_ENV"
             echo "VOICE_DRIVER_LINE_FILE=$driver_line_file" >> "$GITHUB_ENV"
             echo "VOICE_DRIVER_ANSWER_CONTAINS=$marker" >> "$GITHUB_ENV"
+            echo "VOICE_DRIVER_WAIT_FOR_PEER=1" >> "$GITHUB_ENV"
             # Keep the media peer alive while the test waits for Voice AI to
             # persist the open post-call action, then let the test hang up.
             echo "VOICE_DRIVER_LISTEN=180" >> "$GITHUB_ENV"
