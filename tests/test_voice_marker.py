@@ -40,11 +40,10 @@ def test_hosted_workflow_uses_three_word_full_run_marker():
 
     assert 'RUN_TOKEN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in workflow
     assert 'python3 tests/live/voice_marker.py "$RUN_TOKEN"' in workflow
-    assert 'spoken_marker="${marker// /, }"' in workflow
-    assert "post-call action titled Send SMS, details exactly $spoken_marker" in workflow
+    assert 'python3 tests/live/hosted_voice_script.py "$marker_file" "$driver_stages_file"' in workflow
     assert "HOSTED_POST_CALL_MARKER=$marker" not in workflow
     assert "VOICE_DRIVER_LINE=" not in workflow
     assert "HOSTED_POST_CALL_MARKER_FILE=$marker_file" in workflow
-    assert "VOICE_DRIVER_LINE_FILE=$driver_line_file" in workflow
-    assert 'os.environ.get("VOICE_DRIVER_LINE_FILE", "")' in driver
+    assert "VOICE_DRIVER_STAGES_FILE=$driver_stages_file" in workflow
+    assert 'os.environ.get("VOICE_DRIVER_STAGES_FILE", "")' in driver
     assert 'os.environ.get("HOSTED_POST_CALL_MARKER_FILE", "")' in live_test

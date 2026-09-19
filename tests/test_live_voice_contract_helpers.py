@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,23 +23,52 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
-def test_workflow_frontloads_complete_hosted_action_request():
-    workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
+def _load_hosted_script():
+    path = Path(__file__).parent / "live" / "hosted_voice_script.py"
+    spec = importlib.util.spec_from_file_location("hosted_voice_script", path)
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    return script
 
-    line = re.search(r'''printf '%s' "([^"]+)" > "\$driver_line_file"''', workflow).group(1)
-    action_request = line.split(".", 1)[0]
-    assert action_request.startswith("Create one post-call action")
-    assert "titled Send SMS, details exactly $spoken_marker" in action_request
-    assert voice._has_after_call_sms_intent(action_request)
-    assert "Read back the body after saving" in line
-    assert "Do not text now" in line
-    assert not voice._has_after_call_sms_intent("Do not text now")
+
+def test_workflow_uses_short_staged_hosted_action_request():
+    workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
+    script = _load_hosted_script()
+    marker = "victor echo juliet"
+    stages = script.hosted_sms_stages(marker)
+
+    assert len(stages) == 3
+    assert not voice._has_after_call_sms_intent(stages[0]["text"])
+    assert voice._has_after_call_sms_intent(stages[1]["text"])
+    assert voice._spoken_key(marker) in voice._spoken_key(stages[1]["text"])
+    assert stages[1]["expected_reply"] == marker
+    assert stages[2]["text"].startswith("If not already saved,")
+    assert "record that one request as a post-call action" in stages[2]["text"]
+    assert 'python3 tests/live/hosted_voice_script.py "$marker_file" "$driver_stages_file"' in workflow
+    assert "VOICE_DRIVER_STAGES_FILE=$driver_stages_file" in workflow
     assert "VOICE_DRIVER_WAIT_FOR_PEER=1" in workflow
     assert "Upload logs on failure" not in workflow
     assert "Dump logs on failure" not in workflow
     assert "candidates={current_candidates" not in (
         Path(__file__).parent / "live" / "test_voice.py"
     ).read_text()
+
+
+def test_stage_diagnostics_are_bounded_and_exclude_content():
+    script = _load_hosted_script()
+    log = "\n".join([
+        "INFO driver identity private-handle number private-number",
+        "INFO driver heard (final): private-message",
+        "INFO driver spoke stage=1 chars=42 private-tail",
+        *["INFO driver heard final chars=12 active_stage=True"] * 80,
+        "INFO driver reask stage=1 total_reasks=2",
+        "INFO driver peer interrupted tts=True",
+    ])
+    lines = script.driver_diagnostic_lines(log)
+    assert len(lines) == 60
+    assert lines[-2:] == ["reask stage=1 total_reasks=2", "peer interrupted tts=True"]
+    assert "private" not in repr(lines)
 
 
 def test_spoken_marker_normalizes_punctuation_and_case():

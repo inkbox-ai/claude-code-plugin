@@ -22,6 +22,7 @@ def driver(monkeypatch):
     with monkeypatch.context() as imports:
         imports.setenv("REMOTE_INKBOX_API_KEY", "synthetic-driver-key")
         imports.delenv("VOICE_DRIVER_LINE_FILE", raising=False)
+        imports.delenv("VOICE_DRIVER_STAGES_FILE", raising=False)
         imports.delenv("VOICE_DRIVER_WAIT_FOR_PEER", raising=False)
         imports.setitem(sys.modules, "uvicorn", SimpleNamespace())
         imports.setitem(sys.modules, "fastapi", SimpleNamespace(FastAPI=App, WebSocket=object))
@@ -300,3 +301,163 @@ def test_initial_peer_requirement_through_actual_websocket(
         expected_spoken.append((expected_request, driver.LINE))
     assert spoken == expected_spoken
     assert [when for when, event in sent if event["event"] == "stop"] == [expected_stop]
+
+
+def _run_staged_socket(driver, monkeypatch, stages, events, *, listen=30, reasks=0):
+    """Exercise the real handler with only peer frames and a virtual clock."""
+    now = 100.0
+    pending = sorted([(100.0 + offset, event) for offset, event in events])
+    incoming = None
+
+    async def advance(delay):
+        nonlocal now
+        target = now + delay
+        while pending and pending[0][0] <= target:
+            now, event = pending.pop(0)
+            incoming.put_nowait(json.dumps(event))
+            await asyncio.sleep(0)
+        now = target
+        await asyncio.sleep(0)
+
+    loop = SimpleNamespace(time=lambda: now)
+    monkeypatch.setattr(driver, "asyncio", SimpleNamespace(
+        get_event_loop=lambda: loop, get_running_loop=lambda: loop,
+        sleep=advance, Event=asyncio.Event, create_task=asyncio.create_task,
+        CancelledError=asyncio.CancelledError,
+    ))
+    monkeypatch.setattr(driver, "STAGES", stages, raising=False)
+    monkeypatch.setattr(driver, "SPEAK_AFTER_S", 0)
+    monkeypatch.setattr(driver, "WAIT_FOR_PEER", False)
+    monkeypatch.setattr(driver, "QUIET_GAP_S", 2)
+    monkeypatch.setattr(driver, "LISTEN_S", listen)
+    monkeypatch.setattr(driver, "REASK_EVERY_S", 10)
+    monkeypatch.setattr(driver, "MAX_REASKS", reasks)
+
+    async def run():
+        nonlocal incoming
+        incoming = asyncio.Queue()
+        incoming.put_nowait(json.dumps({"event": "start"}))
+
+        class Socket:
+            client_state = "disconnected"
+
+            def __init__(self):
+                self.sent = []
+
+            async def accept(self, **_kwargs):
+                pass
+
+            async def send_text(self, raw):
+                event = json.loads(raw)
+                self.sent.append((now, event))
+                if event["event"] == "stop":
+                    incoming.put_nowait(json.dumps({"event": "stop"}))
+
+            async def receive_text(self):
+                return await incoming.get()
+
+        socket = Socket()
+        await driver.phone_media_ws(socket)
+        return socket.sent
+
+    return asyncio.run(run())
+
+
+def _peer(text, *, final=True):
+    return {"event": "transcript", "text": text, "is_final": final}
+
+
+def _scripted_speech(sent, driver):
+    return [(when, event["delta"]) for when, event in sent
+            if "delta" in event and event["delta"] != driver.GREETING]
+
+
+def test_stages_advance_on_new_final_replies_and_accumulate_current_phase_fragments(driver, monkeypatch):
+    stages = [{"text": "intro"}, {"text": "request", "expected_reply": "alpha beta"}, {"text": "confirm"}]
+    sent = _run_staged_socket(driver, monkeypatch, stages, [
+        (1, _peer("ready")), (4, _peer("alpha")),
+        (5, _peer("beta", final=False)), (6, _peer("beta")), (9, _peer("saved")),
+    ])
+    assert _scripted_speech(sent, driver) == [(100.0, "intro"), (103.0, "request"), (108.0, "confirm")]
+    assert [when for when, event in sent if event["event"] == "stop"] == [130.0]
+    assert all(event["event"] in {"text", "stop"} for _when, event in sent)
+
+
+def test_stages_do_not_reuse_previous_stage_reply(driver, monkeypatch):
+    sent = _run_staged_socket(driver, monkeypatch, [
+        {"text": "intro"}, {"text": "request", "expected_reply": "alpha beta"}, {"text": "confirm"},
+    ], [(1, _peer("alpha beta"))])
+    assert _scripted_speech(sent, driver) == [(100.0, "intro"), (103.0, "request")]
+
+
+def test_stages_ignore_partial_blank_and_text_done_as_reply(driver, monkeypatch):
+    sent = _run_staged_socket(driver, monkeypatch, [{"text": "intro"}, {"text": "request"}], [
+        (1, _peer("")), (2, _peer("ready", final=False)), (3, _peer(None)),
+        (4, _peer("  ")), (5, {"event": "text", "done": True}), (8, _peer("ready")),
+    ], listen=15)
+    assert _scripted_speech(sent, driver) == [(100.0, "intro"), (110.0, "request")]
+
+
+def test_stages_share_retry_budget_and_retry_only_current_stage(driver, monkeypatch):
+    sent = _run_staged_socket(driver, monkeypatch, [{"text": "intro"}, {"text": "request"}], [
+        (15, _peer("ready")),
+        (22, {"event": "barge_in", "tts_interrupted": True}),
+    ], listen=40, reasks=2)
+    assert _scripted_speech(sent, driver) == [
+        (100.0, "intro"), (110.0, "intro"), (117.0, "request"), (127.0, "request"),
+    ]
+    assert [when for when, event in sent if event["event"] == "stop"] == [140.0]
+
+
+def test_stages_respect_spoken_length_before_advancing(driver, monkeypatch):
+    long_text = " ".join(["word"] * 20)
+    sent = _run_staged_socket(driver, monkeypatch, [{"text": long_text}, {"text": "request"}], [
+        (1, _peer("ready")),
+    ])
+    assert _scripted_speech(sent, driver) == [(100.0, long_text), (112.0, "request")]
+
+
+def test_stages_do_not_reset_deadline_or_send_at_deadline(driver, monkeypatch):
+    sent = _run_staged_socket(driver, monkeypatch, [{"text": "intro"}, {"text": "request"}], [
+        (28, _peer("ready")),
+    ])
+    assert _scripted_speech(sent, driver) == [(100.0, "intro")]
+    assert [when for when, event in sent if event["event"] == "stop"] == [130.0]
+
+
+def test_stages_stop_cancels_future_speech(driver, monkeypatch):
+    sent = _run_staged_socket(driver, monkeypatch, [{"text": "intro"}, {"text": "request"}], [
+        (1, _peer("ready")), (5, {"event": "stop"}),
+    ], reasks=2)
+    assert _scripted_speech(sent, driver) == [(100.0, "intro"), (103.0, "request")]
+    assert not any(event["event"] == "stop" for _when, event in sent)
+
+
+def test_stage_loader_accepts_bounded_text_and_optional_reply(driver, tmp_path):
+    path = tmp_path / "stages.json"
+    path.write_text(json.dumps([
+        {"text": "  intro  "}, {"text": "request", "expected_reply": "  alpha beta  "},
+    ]))
+    assert driver._load_stages(str(path)) == [
+        {"text": "intro"}, {"text": "request", "expected_reply": "alpha beta"},
+    ]
+
+
+@pytest.mark.parametrize("value", [
+    {}, [], [{"text": "x"}] * 4, [None], [{}], [{"text": "   "}],
+    [{"text": 3}], [{"text": "x", "expected_reply": None}],
+    [{"text": "x", "expected_reply": "..."}], [{"text": "x", "expected_repy": "yes"}],
+])
+def test_stage_loader_rejects_invalid_shape_without_echoing_content(driver, tmp_path, value):
+    path = tmp_path / "stages.json"
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError):
+        driver._load_stages(str(path))
+
+
+def test_stage_loader_does_not_echo_malformed_json(driver, tmp_path):
+    path = tmp_path / "stages.json"
+    path.write_text('private-request-body {')
+    with pytest.raises(ValueError, match="must contain valid JSON") as error:
+        driver._load_stages(str(path))
+    assert "private-request-body" not in str(error.value)
