@@ -28,7 +28,7 @@ def test_workflow_uses_one_short_hosted_action_utterance():
 
     assert (
         "Do not text during this call. After we hang up, send one SMS with exactly these words: $spoken_marker. "
-        "Save one post-call action titled Send SMS, with details exactly $spoken_marker. "
+        "Create one post-call action titled Send SMS, with details exactly $spoken_marker. "
         "After the tool succeeds, read back the SMS body."
         in workflow
     )
