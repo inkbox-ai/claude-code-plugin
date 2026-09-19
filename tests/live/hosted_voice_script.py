@@ -31,19 +31,13 @@ def hosted_sms_stages(marker: str) -> list[dict[str, str]]:
         raise ValueError("hosted SMS scenario requires a three-word marker")
     spoken_marker = ", ".join(marker.split())
     return [
-        {"text": "Please wait while I dictate a post-call SMS request."},
+        {"text": "I'd like you to text me something after our call."},
         {
             "text": (
                 f"After we hang up send me exactly {spoken_marker} by SMS. "
                 "Repeat the body."
             ),
             "expected_reply": marker,
-        },
-        {
-            "text": (
-                "If not already saved, record that one request as a post-call "
-                "action. Read back its body."
-            ),
         },
     ]
 

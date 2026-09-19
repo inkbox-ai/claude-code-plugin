@@ -32,19 +32,19 @@ def _load_hosted_script():
     return script
 
 
-def test_workflow_uses_short_staged_hosted_action_request():
+def test_hosted_caller_requests_outcome_without_prescribing_tools():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
     script = _load_hosted_script()
     marker = "victor echo juliet"
     stages = script.hosted_sms_stages(marker)
 
-    assert len(stages) == 3
-    assert not voice._has_after_call_sms_intent(stages[0]["text"])
+    assert len(stages) == 2
     assert voice._has_after_call_sms_intent(stages[1]["text"])
     assert voice._spoken_key(marker) in voice._spoken_key(stages[1]["text"])
     assert stages[1]["expected_reply"] == marker
-    assert stages[2]["text"].startswith("If not already saved,")
-    assert "record that one request as a post-call action" in stages[2]["text"]
+    caller_text = " ".join(stage["text"] for stage in stages).lower()
+    for internal in ("post-call action", "tool", "title", "details", "register", "save"):
+        assert internal not in caller_text
     assert 'python3 tests/live/hosted_voice_script.py "$marker_file" "$driver_stages_file"' in workflow
     assert "VOICE_DRIVER_STAGES_FILE=$driver_stages_file" in workflow
     assert "VOICE_DRIVER_WAIT_FOR_PEER=1" in workflow
@@ -76,13 +76,12 @@ def test_spoken_marker_normalizes_punctuation_and_case():
     assert voice._spoken_key("cloudpapa") == voice._spoken_key("Claude Papa")
 
 
-def test_hosted_call_request_primes_spoken_post_call_work():
+def test_hosted_call_request_does_not_supply_the_spoken_task_or_solution():
     hosted = voice._call_me_text(hosted=True)
-    # The purpose has to be concrete. A forward reference to a request only made
-    # later on the call gets answered with a question instead of a dialled call.
-    assert "I will say what I need out loud" in hosted
-    assert "record the post-call action I ask for" in hosted
-    assert "post-call action" not in voice._call_me_text()
+    assert "over the phone" in hosted
+    for text in (hosted, voice._call_me_text()):
+        for internal in ("post-call action", "tool", "voicemail_detection", "SMS"):
+            assert internal not in text
 
 
 def test_after_call_sms_intent_requires_after_call_language():
@@ -100,6 +99,56 @@ def test_sms_targets_include_recipient_rows():
         recipients=[SimpleNamespace(recipient_phone_number="+1 (516) 555-0101")],
     )
     assert voice._sms_target_numbers(message) == {"15165550101"}
+
+
+def _hosted_sms_row(**changes):
+    fields = {
+        "id": "new", "text": "victor echo juliet",
+        "remote_phone_number": "+15165550101", "recipients": [],
+        "created_at": datetime(2026, 9, 19, 12, 0, 1, tzinfo=UTC),
+    }
+    fields.update(changes)
+    return SimpleNamespace(**fields)
+
+
+def _check_hosted_rows(rows, ended_at=datetime(2026, 9, 19, 12, tzinfo=UTC)):
+    return voice._assert_hosted_sms_rows(
+        rows, {"baseline"}, "victor echo juliet", "+15165550101", ended_at,
+    )
+
+
+@pytest.mark.parametrize("changes", [
+    {"text": "Here is victor echo juliet"},
+    {"text": "victorechojuliet"},
+    {"text": "victor echo"},
+    {"remote_phone_number": "+15165550102"},
+    {"recipients": [SimpleNamespace(recipient_phone_number="+15165550102")]},
+    {"created_at": None},
+    {"created_at": datetime(2026, 9, 19, 11, 59, 59, tzinfo=UTC)},
+])
+def test_hosted_sms_rejects_wrong_content_target_or_timing(changes):
+    with pytest.raises(AssertionError):
+        _check_hosted_rows([_hosted_sms_row(**changes)])
+
+
+def test_hosted_sms_rejects_non_marker_duplicate():
+    with pytest.raises(AssertionError, match="duplicate"):
+        _check_hosted_rows([
+            _hosted_sms_row(), _hosted_sms_row(id="extra", text="All done"),
+        ])
+
+
+def test_hosted_sms_rejects_any_send_before_recorded_hangup():
+    with pytest.raises(AssertionError, match="before a recorded call end"):
+        _check_hosted_rows([_hosted_sms_row()], ended_at=None)
+
+
+def test_hosted_sms_accepts_one_exact_post_call_row_but_not_old_baseline():
+    message = _hosted_sms_row()
+    assert _check_hosted_rows([
+        _hosted_sms_row(id="baseline", text="old unrelated body"), message,
+    ]) == [message]
+    assert _check_hosted_rows([], ended_at=None) == []
 
 
 def test_record_timestamp_accepts_datetime_and_iso_z():
