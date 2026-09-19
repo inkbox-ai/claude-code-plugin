@@ -103,3 +103,93 @@ def test_claude_cli_installed_and_answers_version():
     out = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, f"claude --version failed: {out.stderr[:300]}"
     assert out.stdout.strip(), "claude --version printed nothing"
+
+
+def test_contact_patch_preserves_omitted_identifiers_through_mcp():
+    """Validate real host schemas and dispatch, not a mocked tool decorator."""
+    import anyio
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    from inkbox_claude.tools import build_inkbox_mcp_server
+
+    client = MagicMock()
+    client.contacts.update.return_value = {"id": "contact-1", "notes": "updated"}
+    config, _ = build_inkbox_mcp_server(client, "contract-test")
+    server = config["instance"]
+
+    async def exercise():
+        async with create_client_server_memory_streams() as (client_streams, server_streams):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(server.run, *server_streams, server.create_initialization_options())
+                async with ClientSession(*client_streams) as session:
+                    await session.initialize()
+                    for patch in ({"notes": "updated"}, {"emails": []}, {"phones": []}):
+                        client.contacts.update.reset_mock()
+                        result = await session.call_tool(
+                            "inkbox_update_contact", {"contact_id": "contact-1", **patch},
+                        )
+                        assert not result.model_dump(by_alias=True)["isError"], result.content
+                        client.contacts.update.assert_called_once_with("contact-1", **patch)
+
+                    for invalid in ({"notes": "updated"}, {"contact_id": "contact-1", "emails": ""}):
+                        client.contacts.update.reset_mock()
+                        result = await session.call_tool("inkbox_update_contact", invalid)
+                        assert result.model_dump(by_alias=True)["isError"]
+                        client.contacts.update.assert_not_called()
+                tasks.cancel_scope.cancel()
+
+    anyio.run(exercise)
+
+
+def test_call_optional_settings_preserve_configured_defaults_through_mcp():
+    from types import SimpleNamespace
+
+    import anyio
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    from inkbox_claude import __version__
+    from inkbox_claude.config import BridgeConfig, VoiceStack
+    from inkbox_claude.tools import build_inkbox_mcp_server
+
+    place_call = MagicMock(return_value=SimpleNamespace(
+        id="call-1", status="queued", mode="hosted_agent",
+        hosted_agent_authority_mode="contact_scoped",
+    ))
+    client = MagicMock()
+    client.get_identity.return_value = SimpleNamespace(
+        phone_number=SimpleNamespace(number="+15551112222"),
+        imessage_enabled=False, place_call=place_call,
+    )
+    config, _ = build_inkbox_mcp_server(client, "contract-test", BridgeConfig(
+        voice_stack=VoiceStack.INKBOX_VOICE_AI, voicemail_detection="disabled",
+    ))
+    server = config["instance"]
+
+    async def exercise():
+        async with (
+            create_client_server_memory_streams() as (client_streams, server_streams),
+            anyio.create_task_group() as tasks,
+        ):
+            tasks.start_soon(server.run, *server_streams, server.create_initialization_options())
+            async with ClientSession(*client_streams) as session:
+                initialized = await session.initialize()
+                assert initialized.model_dump(by_alias=True)["serverInfo"]["version"] == __version__
+                minimal = {"to_number": "+15553334444", "purpose": "Discuss the report"}
+                for override, expected in (({}, "disabled"), ({"voicemail_detection": "enabled"}, "enabled")):
+                    place_call.reset_mock()
+                    result = await session.call_tool("inkbox_place_call", {**minimal, **override})
+                    assert not result.model_dump(by_alias=True)["isError"], result.content
+                    place_call.assert_called_once_with(
+                        to_number=minimal["to_number"], origination="dedicated_number",
+                        mode="hosted_agent", reason=minimal["purpose"],
+                        voicemail_detection=expected,
+                    )
+                place_call.reset_mock()
+                invalid = await session.call_tool("inkbox_place_call", {"to_number": "+15553334444"})
+                assert invalid.model_dump(by_alias=True)["isError"]
+                place_call.assert_not_called()
+            tasks.cancel_scope.cancel()
+
+    anyio.run(exercise)

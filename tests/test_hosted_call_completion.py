@@ -253,6 +253,7 @@ def test_restart_resumes_only_recoverable_sms_correction(tmp_path, monkeypatch):
 
         assert len(prompts) == 1
         assert "[hosted_post_call_sms_correction]" in prompts[0]
+        assert "Prefer the explicit body recorded in an open post-call action" in prompts[0]
         assert "Review the outcome, transcript" not in prompts[0]
         assert "Send the summary" in prompts[0]
         assert "Update the release checklist" not in prompts[0]
@@ -279,6 +280,8 @@ def test_hosted_sms_recoverable_failure_gets_one_correction(tmp_path):
 
         assert len(prompts) == 2
         assert "only correction attempt" in prompts[1]
+        assert "Prefer the explicit body recorded in an open post-call action" in prompts[1]
+        assert "Override the recorded body only when the caller clearly corrects or cancels" in prompts[1]
         assert "Do not return [SILENT], skip, or defer" in prompts[1]
         assert "+15551112222" in prompts[1]
         entry = json.loads(gateway._hosted_call_registry_path.read_text())["call-1"]
@@ -745,15 +748,19 @@ def test_exact_sms_body_survives_post_call_prompt_without_accepted_send_replay(t
         gateway, prompts = _gateway(tmp_path)
         payload = _payload()
         body = "Blue  lantern, meadow!"
+        noisy_body = "Blue extra lantern meadow"
         payload["data"]["transcript"]["entries"] = [{
-            "party": "remote", "text": f'After we hang up, send one SMS with this exact body: "{body}".',
+            "party": "remote", "text": f'After we hang up, send one SMS with this exact body: "{noisy_body}".',
         }]
         payload["data"]["post_call_action_items"][0]["details"] = f'Exact SMS body: "{body}"'
         await gateway._on_hosted_call_ended(payload)
         await _drain(gateway)
         assert len(prompts) == 1
         assert f'Exact SMS body: "{body}"' in prompts[0]
+        assert noisy_body in prompts[0]  # Do not hide conflicting transcript evidence.
         assert "copy it verbatim" in prompts[0]
+        assert "Prefer the explicit body recorded in an open post-call action" in prompts[0]
+        assert "Override the recorded body only when the caller clearly corrects or cancels" in prompts[0]
         assert "Do not replace it with a summary or an acknowledgment" in prompts[0]
         assert "After a send is accepted, do not send another message" in prompts[0]
         await gateway._on_hosted_call_ended(payload)

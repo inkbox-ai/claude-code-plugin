@@ -2,8 +2,8 @@
 
 Opens an Inkbox tunnel for the driver identity, serves the call-media WebSocket
 behind it, and bridges audio in Inkbox STT/TTS mode (text frames only — no local
-model). It speaks one scripted line so the agent under test gets a turn, and the
-call transcript (read separately by the test) proves the agent replied.
+model). It speaks a scripted line or a bounded sequence of conversational turns;
+the call transcript (read separately by the test) proves the agent replied.
 
 Run as a standalone process alongside the gateway. On startup it writes a small
 JSON state file (its public WS URL + phone-number id) that the test reads to place
@@ -18,13 +18,17 @@ Env:
   VOICE_DRIVER_PORT       local port the tunnel forwards to (default 8090)
   VOICE_DRIVER_STATE      path to write the JSON state file
   VOICE_DRIVER_LINE       the one line the driver speaks (default below)
+  VOICE_DRIVER_STAGES_FILE  optional JSON list of text/expected_reply stages
+  VOICE_DRIVER_WAIT_FOR_PEER  require initial peer speech before the quiet gate
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -44,6 +48,7 @@ BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 PORT = int(os.environ.get("VOICE_DRIVER_PORT", "8090"))
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
 LINE_FILE = os.environ.get("VOICE_DRIVER_LINE_FILE", "")
+STAGES_FILE = os.environ.get("VOICE_DRIVER_STAGES_FILE", "")
 LINE = (
     Path(LINE_FILE).read_text(encoding="utf-8").strip()
     if LINE_FILE
@@ -57,11 +62,12 @@ LINE = (
 # and the call is hung up before the agent ever speaks. Answer the way a person
 # does - one word, then silence - and hold the prompt until that window closes.
 GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
-# Delay before the first ask. A greeting arrives as several final transcripts
-# 1.5-5s apart, so no silence threshold tells "between greeting sentences" from
-# "greeting over" — the first ask is simply allowed to land wherever it lands, and
-# _run_turn re-asks once the agent is actually idle.
+# Wait through the initial greeting before asking: speaking on a fixed timer
+# can clip the request or its marker while the other party is still talking.
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
+# Hosted scenarios can require an observed greeting rather than treating the
+# absence of transcript frames as silence while the peer is still starting.
+WAIT_FOR_PEER = os.environ.get("VOICE_DRIVER_WAIT_FOR_PEER", "0") == "1"
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
@@ -79,8 +85,53 @@ ANSWER_CONTAINS = os.environ.get("VOICE_DRIVER_ANSWER_CONTAINS", "")
 
 
 def _speech_key(text: str) -> str:
-    """Compare speech ignoring ASR casing, spacing and punctuation."""
-    return "".join(char for char in text.casefold() if char.isalnum())
+    """Compare whole words, ignoring only casing and punctuation."""
+    tokens = re.findall(r"[a-z0-9]+", text.casefold())
+    return f" {' '.join(tokens)} " if tokens else ""
+
+
+def _load_stages(path: str) -> list[dict[str, str]]:
+    """Validate an optional bounded conversation without exposing its content."""
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("VOICE_DRIVER_STAGES_FILE must contain valid JSON") from None
+    if not isinstance(value, list) or not 1 <= len(value) <= 3:
+        raise ValueError("VOICE_DRIVER_STAGES_FILE must contain one to three stages")
+    stages = []
+    for index, stage in enumerate(value):
+        if not isinstance(stage, dict) or set(stage) - {"text", "expected_reply"}:
+            raise ValueError(f"Invalid voice stage fields at index {index}")
+        text = stage.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"Voice stage {index} requires nonempty text")
+        parsed = {"text": text.strip()}
+        if "expected_reply" in stage:
+            reply = stage["expected_reply"]
+            if not isinstance(reply, str) or not _speech_key(reply):
+                raise ValueError(f"Voice stage {index} requires a nonempty expected reply")
+            parsed["expected_reply"] = reply.strip()
+        stages.append(parsed)
+    return stages
+
+
+STAGES = _load_stages(STAGES_FILE) if STAGES_FILE else None
+
+
+async def _wait_for_greeting(state: dict[str, float]) -> bool:
+    """Wait for a quiet peer, without leaving a continuously talking call open."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(30.0, SPEAK_AFTER_S + QUIET_GAP_S)
+    await asyncio.sleep(SPEAK_AFTER_S)
+    while True:
+        now = loop.time()
+        quiet_in = QUIET_GAP_S - (now - state["last_heard"])
+        if quiet_in <= 0 and (not WAIT_FOR_PEER or state["last_heard"] > 0):
+            return True
+        if now >= deadline:
+            return False
+        await asyncio.sleep(min(quiet_in if quiet_in > 0 else 1.0, deadline - now))
+
 
 app = FastAPI()
 
@@ -93,8 +144,6 @@ async def health() -> dict:
 @app.websocket("/phone/media/ws")
 async def phone_media_ws(ws: WebSocket) -> None:
     """Accept the call-media WS in Inkbox STT/TTS mode and run one scripted turn."""
-    import asyncio
-
     # Opt into Inkbox-managed speech both ways → we exchange text, not audio.
     await ws.accept(headers=[
         (b"x-use-inkbox-text-to-speech", b"true"),
@@ -105,19 +154,83 @@ async def phone_media_ws(ws: WebSocket) -> None:
     answered = asyncio.Event()        # agent said the expected answer back
     state = {"last_heard": 0.0}       # monotonic ts of the agent's most recent turn
     answer_key = _speech_key(ANSWER_CONTAINS)
+    stage_active = False
+    stage_replies: list[str] = []
     convo: asyncio.Task | None = None
 
-    async def _say(text: str) -> None:
+    async def _say(text: str, *, stage_index: int | None = None) -> None:
         await ws.send_text(json.dumps({"event": "text", "delta": text}))
         await ws.send_text(json.dumps({"event": "text", "done": True}))
-        log.info("spoke: %s", text)
+        if STAGES is None:
+            log.info("spoke: %s", text)
+        else:
+            log.info("spoke stage=%s chars=%d", stage_index, len(text))
+
+    async def _run_stages() -> None:
+        nonlocal stage_active
+        assert STAGES
+        deadline = loop.time() + LISTEN_S
+        index = 0
+        reasks = 0
+        complete = False
+
+        async def ask() -> float:
+            await _say(STAGES[index]["text"], stage_index=index)
+            return loop.time()
+
+        asked_at = await ask()
+        stage_active = True
+        while loop.time() < deadline:
+            await asyncio.sleep(min(1.0, deadline - loop.time()))
+            now = loop.time()
+            if now >= deadline or complete:
+                continue
+            stage = STAGES[index]
+            expected = _speech_key(stage.get("expected_reply", ""))
+            reply_ready = bool(stage_replies) and (
+                not expected or expected in _speech_key(" ".join(stage_replies))
+            )
+            quiet = now - state["last_heard"] >= QUIET_GAP_S
+            spoken_floor = len(stage["text"].split()) * 0.6
+            if reply_ready and quiet and now - asked_at >= spoken_floor:
+                stage_active = False
+                stage_replies.clear()
+                if index + 1 == len(STAGES):
+                    complete = True
+                    continue
+                index += 1
+                asked_at = await ask()
+                stage_active = True
+            elif (
+                REASK_EVERY_S > 0
+                and not reply_ready
+                and reasks < MAX_REASKS
+                and now - asked_at >= max(REASK_EVERY_S, spoken_floor + QUIET_GAP_S)
+                and quiet
+            ):
+                reasks += 1
+                log.info("reask stage=%d total_reasks=%d", index, reasks)
+                asked_at = await ask()
+        stage_active = False
 
     async def _run_turn() -> None:
         # Speak one line, give the agent a turn, then hang up so the call ends fast.
         await _say(GREETING)
-        await asyncio.sleep(SPEAK_AFTER_S)
+        if not await _wait_for_greeting(state):
+            log.info("peer did not pause before the greeting deadline")
+            await ws.send_text(json.dumps({"event": "stop"}))
+            return
+        if STAGES is not None:
+            await _run_stages()
+            await ws.send_text(json.dumps({"event": "stop"}))
+            log.info("sent stop (hangup)")
+            return
         await _say(LINE)
         asked_at = loop.time()
+        # text.done acknowledges submission, not completed audio playback. Give
+        # long requests 100 spoken words/minute plus the quiet gap before a
+        # retry can enqueue another copy; short asks retain the configured floor.
+        reask_after = max(REASK_EVERY_S, len(LINE.split()) * 0.6 + QUIET_GAP_S)
         state["last_heard"] = asked_at
         # Re-ask if the agent never got the question: the greeting routinely runs
         # several seconds past our first ask, and a lost ask leaves the agent
@@ -132,7 +245,7 @@ async def phone_media_ws(ws: WebSocket) -> None:
                 REASK_EVERY_S > 0
                 and not answered.is_set()
                 and reasks < MAX_REASKS
-                and loop.time() - asked_at >= REASK_EVERY_S
+                and loop.time() - asked_at >= reask_after
                 and loop.time() - state["last_heard"] >= QUIET_GAP_S
             ):
                 await _say(LINE)
@@ -152,12 +265,22 @@ async def phone_media_ws(ws: WebSocket) -> None:
             if kind == "start":
                 log.info("call start: %s", ev.get("stream_id"))
                 convo = asyncio.create_task(_run_turn())
-            elif kind == "transcript" and ev.get("is_final"):
+            elif kind == "transcript":
                 text = ev.get("text") or ""
-                log.info("heard (final): %s", text)
-                state["last_heard"] = loop.time()  # agent is actively talking
+                if text.strip():
+                    state["last_heard"] = loop.time()
+                if not ev.get("is_final"):
+                    continue
+                if STAGES is None:
+                    log.info("heard (final): %s", text)
+                else:
+                    log.info("heard final chars=%d active_stage=%s", len(text), stage_active)
+                if stage_active and text.strip():
+                    stage_replies.append(text.strip())
                 if answer_key and answer_key in _speech_key(text):
                     answered.set()
+            elif kind == "barge_in" and STAGES is not None:
+                log.info("peer interrupted tts=%s", bool(ev.get("tts_interrupted")))
             elif kind == "stop":
                 log.info("call stop: %s", ev.get("reason"))
                 break
@@ -166,6 +289,10 @@ async def phone_media_ws(ws: WebSocket) -> None:
     finally:
         if convo:
             convo.cancel()
+            try:
+                await convo
+            except asyncio.CancelledError:
+                pass
         if ws.client_state != WebSocketState.DISCONNECTED:
             try:
                 await ws.close()

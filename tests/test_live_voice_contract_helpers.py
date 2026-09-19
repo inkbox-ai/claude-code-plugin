@@ -23,14 +23,31 @@ def _load_voice_module():
 voice = _load_voice_module()
 
 
-def test_workflow_uses_one_short_hosted_action_utterance():
-    workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
+def _load_hosted_script():
+    path = Path(__file__).parent / "live" / "hosted_voice_script.py"
+    spec = importlib.util.spec_from_file_location("hosted_voice_script", path)
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    return script
 
-    assert (
-        "Record one post-call action now to send me exactly one SMS containing only "
-        "$marker after we hang up, then say $marker."
-        in workflow
-    )
+
+def test_hosted_caller_requests_outcome_without_prescribing_tools():
+    workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
+    script = _load_hosted_script()
+    marker = "victor echo juliet"
+    stages = script.hosted_sms_stages(marker)
+
+    assert len(stages) == 2
+    assert voice._has_after_call_sms_intent(stages[1]["text"])
+    assert voice._spoken_key(marker) in voice._spoken_key(stages[1]["text"])
+    assert stages[1]["expected_reply"] == marker
+    caller_text = " ".join(stage["text"] for stage in stages).lower()
+    for internal in ("post-call action", "tool", "title", "details", "register", "save"):
+        assert internal not in caller_text
+    assert 'python3 tests/live/hosted_voice_script.py "$marker_file" "$driver_stages_file"' in workflow
+    assert "VOICE_DRIVER_STAGES_FILE=$driver_stages_file" in workflow
+    assert "VOICE_DRIVER_WAIT_FOR_PEER=1" in workflow
     assert "Upload logs on failure" not in workflow
     assert "Dump logs on failure" not in workflow
     assert "candidates={current_candidates" not in (
@@ -38,18 +55,45 @@ def test_workflow_uses_one_short_hosted_action_utterance():
     ).read_text()
 
 
+def test_stage_diagnostics_are_bounded_and_exclude_content():
+    script = _load_hosted_script()
+    log = "\n".join([
+        "INFO driver identity private-handle number private-number",
+        "INFO driver heard (final): private-message",
+        "INFO driver spoke stage=1 chars=42 private-tail",
+        *["INFO driver heard final chars=12 active_stage=True"] * 80,
+        "INFO driver reask stage=1 total_reasks=2",
+        "INFO driver peer interrupted tts=True",
+    ])
+    lines = script.driver_diagnostic_lines(log)
+    assert len(lines) == 60
+    assert lines[-2:] == ["reask stage=1 total_reasks=2", "peer interrupted tts=True"]
+    assert "private" not in repr(lines)
+
+
 def test_spoken_marker_normalizes_punctuation_and_case():
-    assert voice._spoken_key("Victor-Echo, JULIET!") == "victorechojuliet"
-    assert voice._spoken_key("cloudpapa") == voice._spoken_key("Claude Papa")
+    assert voice._spoken_key("Victor-Echo, JULIET!") == " victor echo juliet "
+    assert voice._spoken_key(None) == ""
 
 
-def test_hosted_call_request_primes_spoken_post_call_work():
+@pytest.mark.parametrize("observed", [
+    "victorechojuliet", "unvictor echo juliet", "victor echo julietextra",
+    "victor juliet echo", "victor another echo juliet",
+])
+def test_spoken_marker_rejects_merged_partial_or_changed_words(observed):
+    assert voice._spoken_key("victor echo juliet") not in voice._spoken_key(observed)
+
+
+def test_spoken_marker_does_not_alias_different_words():
+    assert voice._spoken_key("cloud papa") != voice._spoken_key("Claude Papa")
+
+
+def test_hosted_call_request_does_not_supply_the_spoken_task_or_solution():
     hosted = voice._call_me_text(hosted=True)
-    # The purpose has to be concrete. A forward reference to a request only made
-    # later on the call gets answered with a question instead of a dialled call.
-    assert "I will say what I need out loud" in hosted
-    assert "record the post-call action I ask for" in hosted
-    assert "post-call action" not in voice._call_me_text()
+    assert "over the phone" in hosted
+    for text in (hosted, voice._call_me_text()):
+        for internal in ("post-call action", "tool", "voicemail_detection", "SMS"):
+            assert internal not in text
 
 
 def test_after_call_sms_intent_requires_after_call_language():
@@ -67,6 +111,56 @@ def test_sms_targets_include_recipient_rows():
         recipients=[SimpleNamespace(recipient_phone_number="+1 (516) 555-0101")],
     )
     assert voice._sms_target_numbers(message) == {"15165550101"}
+
+
+def _hosted_sms_row(**changes):
+    fields = {
+        "id": "new", "text": "victor echo juliet",
+        "remote_phone_number": "+15165550101", "recipients": [],
+        "created_at": datetime(2026, 9, 19, 12, 0, 1, tzinfo=UTC),
+    }
+    fields.update(changes)
+    return SimpleNamespace(**fields)
+
+
+def _check_hosted_rows(rows, ended_at=datetime(2026, 9, 19, 12, tzinfo=UTC)):
+    return voice._assert_hosted_sms_rows(
+        rows, {"baseline"}, "victor echo juliet", "+15165550101", ended_at,
+    )
+
+
+@pytest.mark.parametrize("changes", [
+    {"text": "Here is victor echo juliet"},
+    {"text": "victorechojuliet"},
+    {"text": "victor echo"},
+    {"remote_phone_number": "+15165550102"},
+    {"recipients": [SimpleNamespace(recipient_phone_number="+15165550102")]},
+    {"created_at": None},
+    {"created_at": datetime(2026, 9, 19, 11, 59, 59, tzinfo=UTC)},
+])
+def test_hosted_sms_rejects_wrong_content_target_or_timing(changes):
+    with pytest.raises(AssertionError):
+        _check_hosted_rows([_hosted_sms_row(**changes)])
+
+
+def test_hosted_sms_rejects_non_marker_duplicate():
+    with pytest.raises(AssertionError, match="duplicate"):
+        _check_hosted_rows([
+            _hosted_sms_row(), _hosted_sms_row(id="extra", text="All done"),
+        ])
+
+
+def test_hosted_sms_rejects_any_send_before_recorded_hangup():
+    with pytest.raises(AssertionError, match="before a recorded call end"):
+        _check_hosted_rows([_hosted_sms_row()], ended_at=None)
+
+
+def test_hosted_sms_accepts_one_exact_post_call_row_but_not_old_baseline():
+    message = _hosted_sms_row()
+    assert _check_hosted_rows([
+        _hosted_sms_row(id="baseline", text="old unrelated body"), message,
+    ]) == [message]
+    assert _check_hosted_rows([], ended_at=None) == []
 
 
 def test_record_timestamp_accepts_datetime_and_iso_z():
@@ -210,6 +304,8 @@ def test_matching_post_call_action_requires_open_current_marker_sms():
     for item in (
         {**matching, "status": "canceled"},
         {**matching, "details": "Send a different marker."},
+        {**matching, "details": "Send victorechojuliet."},
+        {**matching, "details": "Send unvictor echo juliet."},
         {**matching, "action": "create_note", "details": marker},
     ):
         assert voice._matching_post_call_action(
@@ -244,6 +340,7 @@ def test_action_gate_diagnostic_is_bounded_and_content_redacted():
         "open_count": 1,
         "marker_count": 1,
         "sms_count": 1,
+        "max_marker_words": 3,
         "matching_action": True,
     }
     assert "customer-secret" not in repr(diagnostic)

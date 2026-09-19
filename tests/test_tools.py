@@ -679,9 +679,11 @@ def test_place_call_without_any_line_tells_agent_how_to_fix():
 def test_whoami_reports_the_two_lines():
     client = _FakeClient()
     client.identity.imessage_enabled = True
+    client.identity.display_name = "Example Assistant"
 
     data = _call(client, "inkbox_whoami", {})
 
+    assert data["display_name"] == "Example Assistant"
     assert data["lines"]["dedicated_phone_line"] == "+15550001111"
     assert data["lines"]["shared_imessage_line"] == "enabled"
     # The shared line's number is managed by Inkbox and never surfaced.

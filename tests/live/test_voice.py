@@ -31,10 +31,10 @@ import pytest
 # cadence. Two identical no-reply sends to the same number trip the
 # duplicate_body rule (422), so every call request must carry a fresh body.
 _CALL_ME_PHRASINGS = (
-    "Please call me right now by phone and set voicemail_detection to disabled.",
-    "Can you ring me now with voicemail_detection disabled?",
-    "Give me a call now, using disabled voicemail_detection.",
-    "Please phone me right away and disable voicemail_detection.",
+    "Please call me right now by phone.",
+    "Can you ring me now?",
+    "Give me a call now.",
+    "Please phone me right away.",
 )
 
 
@@ -42,13 +42,7 @@ def _call_me_text(*, hosted: bool = False) -> str:
     """A fresh call-request body each send (rotating phrasing + unique ref)."""
     phrasing = _CALL_ME_PHRASINGS[uuid.uuid4().int % len(_CALL_ME_PHRASINGS)]
     if hosted:
-        # Name the purpose concretely. "Complete my spoken request" forward-refers
-        # to something only said later on the call, and the agent answers by
-        # asking what the call is about instead of dialing.
-        phrasing += (
-            " Use Voice AI for the call: I will say what I need out loud, and it"
-            " must record the post-call action I ask for before we hang up."
-        )
+        phrasing += " I have a request I'd like to explain over the phone."
     return f"{phrasing} (ref {uuid.uuid4().hex[:6]})"
 
 REMOTE_KEY = os.environ.get("REMOTE_INKBOX_API_KEY")
@@ -181,23 +175,22 @@ def _spoken_tokens(value: str | None) -> list[str]:
 
 
 def _spoken_key(value: str | None) -> str:
-    key = "".join(_spoken_tokens(value))
-    # Claude is a common ASR homophone for "cloud". Canonicalize the observed
-    # boundary-less form too ("cloudpapa") without relaxing any of the other
-    # current-run marker, action, status, channel, or recipient requirements.
-    return key.replace("cloud", "claude")
+    """Match contiguous whole words, ignoring only punctuation and case."""
+    tokens = _spoken_tokens(value)
+    return f" {' '.join(tokens)} " if tokens else ""
 
 
-def _message_created_at(message):
-    """Return an aware server timestamp from an SDK SMS row."""
-    value = getattr(message, "created_at", None)
+def _message_created_at(message, field="created_at"):
+    """Return an aware server timestamp from an SDK record."""
+    value = getattr(message, field, None)
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=UTC)
     text = str(value or "").strip()
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     except ValueError:
         return None
 
@@ -210,6 +203,26 @@ def _sms_target_numbers(message) -> set[str]:
         for recipient in (getattr(message, "recipients", None) or [])
     )
     return {digits for value in values if (digits := _digits(value))}
+
+
+def _assert_hosted_sms_rows(messages, before, marker, recipient, ended_at):
+    """Validate every new outbound side effect, not just marker matches."""
+    fresh = [message for message in messages if message.id not in before]
+    assert len(fresh) <= 1, "hosted call produced duplicate outbound SMS rows"
+    for message in fresh:
+        assert ended_at is not None, "hosted SMS appeared before a recorded call end"
+        created_at = _message_created_at(message)
+        assert created_at is not None, "hosted SMS has no server timestamp"
+        assert created_at >= ended_at, "hosted SMS was created before the call ended"
+        recipient_matches = _sms_target_numbers(message) == {_digits(recipient)}
+        assert recipient_matches, (
+            "hosted SMS did not target only the authoritative caller"
+        )
+        body_matches = _spoken_tokens(getattr(message, "text", None)) == _spoken_tokens(marker)
+        assert body_matches, (
+            "hosted SMS body differs from the requested words"
+        )
+    return fresh
 
 
 def _has_after_call_sms_intent(value: str | None) -> bool:
@@ -262,6 +275,7 @@ def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
     open_count = 0
     marker_count = 0
     sms_count = 0
+    max_marker_words = 0
     matching_action = False
     marker_key = _spoken_key(marker)
     for item in items[:10]:
@@ -277,6 +291,9 @@ def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
         is_open = str(status).casefold() == "open"
         has_marker = bool(marker_key) and marker_key in _spoken_key(value)
         has_sms_intent = _has_sms_action_intent(value)
+        max_marker_words = max(max_marker_words, sum(
+            _spoken_key(word) in _spoken_key(value) for word in _spoken_tokens(marker)
+        ))
         open_count += int(is_open)
         marker_count += int(has_marker)
         sms_count += int(has_sms_intent)
@@ -289,6 +306,7 @@ def _post_call_action_diagnostic(call, marker) -> dict[str, int | bool]:
         "open_count": open_count,
         "marker_count": marker_count,
         "sms_count": sms_count,
+        "max_marker_words": max_marker_words,
         "matching_action": matching_action,
     }
 
@@ -343,14 +361,19 @@ def _wait_for_persisted_hosted_request(
     assert marker_key
     driver_transcript_ready = False
     aut_transcript_ready = False
+    driver_readback_ready = False
+    aut_readback_ready = False
     action_ready = False
     driver_transcript_diagnostic: dict[str, int | bool | str] = {}
     aut_transcript_diagnostic: dict[str, int | bool | str] = {}
     action_diagnostic: dict[str, int | bool | str] = {}
     while time.monotonic() < deadline:
         try:
-            _all, _rem, local = _segments(remote, number_id, call_id)
+            _all, heard, local = _segments(remote, number_id, call_id)
             text = " ".join(segment.text.strip() for segment in local)
+            driver_readback_ready = marker_key in _spoken_key(
+                " ".join(segment.text.strip() for segment in heard)
+            )
             driver_transcript_ready = (
                 marker_key in _spoken_key(text)
                 and _has_after_call_sms_intent(text)
@@ -363,8 +386,11 @@ def _wait_for_persisted_hosted_request(
         except Exception as exc:  # transcripts may trail call teardown briefly
             driver_transcript_diagnostic = {"error_type": type(exc).__name__}
         try:
-            _all, caller, _local = _segments(aut, "unused", aut_call_id)
+            _all, caller, spoken = _segments(aut, "unused", aut_call_id)
             text = " ".join(segment.text.strip() for segment in caller)
+            aut_readback_ready = marker_key in _spoken_key(
+                " ".join(segment.text.strip() for segment in spoken)
+            )
             aut_transcript_ready = (
                 marker_key in _spoken_key(text)
                 and _has_after_call_sms_intent(text)
@@ -382,7 +408,8 @@ def _wait_for_persisted_hosted_request(
             action_diagnostic = _post_call_action_diagnostic(aut_call, marker)
         except Exception as exc:
             action_diagnostic = {"error_type": type(exc).__name__}
-        if driver_transcript_ready and aut_transcript_ready and action_ready:
+        if (driver_transcript_ready and aut_transcript_ready and action_ready
+                and driver_readback_ready and aut_readback_ready):
             return
         time.sleep(POLL_EVERY_S)
     pytest.fail(
@@ -390,6 +417,7 @@ def _wait_for_persisted_hosted_request(
         "post-call SMS action before the shared deadline "
         f"(driver_transcript_ready={driver_transcript_ready}, "
         f"aut_transcript_ready={aut_transcript_ready}, action_ready={action_ready}, "
+        f"driver_readback_ready={driver_readback_ready}, aut_readback_ready={aut_readback_ready}, "
         f"driver_transcript_gate={driver_transcript_diagnostic}, "
         f"aut_transcript_gate={aut_transcript_diagnostic}, "
         f"action_gate={action_diagnostic})"
@@ -690,26 +718,27 @@ def test_outbound_call_hosted_and_post_call_wakeup():
                 if (getattr(c, "direction", "") or "").lower() == "outbound"
                 and _digits(getattr(c, "remote_phone_number", "") or "")[-10:] == driver_tail]
 
-    def _outbound_sms_to_driver():
-        return [
-            message
-            for message in aut.texts.list(aut_number_id, limit=200)
-            if (getattr(message, "direction", "") or "").lower() == "outbound"
-            and driver_number in _sms_target_numbers(message)
-        ]
+    sms_since = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+
+    def _outbound_sms():
+        rows = {}
+        offset = 0
+        while True:
+            page = aut.texts.list(
+                aut_number_id, limit=200, offset=offset, start_datetime=sms_since,
+            )
+            for message in page:
+                if _enum_value(getattr(message, "direction", "")).lower() == "outbound":
+                    rows[message.id] = message
+            if len(page) < 200:
+                return list(rows.values())
+            offset += len(page)
 
     _sweep_matching_calls(remote, _inbound_calls)
     _sweep_matching_calls(aut, _outbound_calls)
     before_calls = {call.id for call in _inbound_calls()}
     before_outbound = {call.id for call in _outbound_calls()}
-    baseline_sms = _outbound_sms_to_driver()
-    before_sms = {message.id for message in baseline_sms}
-    baseline_times = [
-        created_at
-        for message in baseline_sms
-        if (created_at := _message_created_at(message)) is not None
-    ]
-    sms_watermark = max(baseline_times, default=datetime.min.replace(tzinfo=UTC))
+    before_sms = {message.id for message in _outbound_sms()}
     assert GATEWAY_LOG and os.path.exists(GATEWAY_LOG), (
         "GATEWAY_LOG must expose the bridge's host-native tool settlement"
     )
@@ -778,6 +807,10 @@ def test_outbound_call_hosted_and_post_call_wakeup():
             HOSTED_POST_CALL_MARKER,
             deadline=pre_hangup_deadline,
         )
+        _assert_hosted_sms_rows(
+            _outbound_sms(), before_sms, HOSTED_POST_CALL_MARKER,
+            driver_number, None,
+        )
     finally:
         _hangup_fresh_calls(remote, _inbound_calls, before_calls)
         _hangup_fresh_calls(aut, _outbound_calls, before_outbound)
@@ -792,71 +825,35 @@ def test_outbound_call_hosted_and_post_call_wakeup():
         scenario_deadline - HOSTED_DUPLICATE_GRACE_S - POLL_EVERY_S
     )
     log = ""
-    marker_sms = []
+    current_sms = []
     while time.monotonic() < settlement_deadline:
         log = _gateway_log_since(log_offset)
-        marker_sms = [
-            message
-            for message in _outbound_sms_to_driver()
-            if message.id not in before_sms
-            and (created_at := _message_created_at(message)) is not None
-            and created_at >= sms_watermark
-            and _spoken_key(HOSTED_POST_CALL_MARKER)
-            in _spoken_key(getattr(message, "text", None))
-        ]
-        if tool_marker in log and completed_marker in log and marker_sms:
+        ended_at = _message_created_at(aut.calls.get(placed.id), "ended_at")
+        current_sms = _assert_hosted_sms_rows(
+            _outbound_sms(), before_sms, HOSTED_POST_CALL_MARKER,
+            driver_number, ended_at,
+        )
+        if tool_marker in log and completed_marker in log and current_sms:
             break
         time.sleep(POLL_EVERY_S)
-    tool_completed = tool_marker in log
-    receipt_completed = completed_marker in log
-    assert tool_completed, (
+    assert tool_marker in log, (
         "hosted call ended without one exact-recipient SMS confirmed by the "
         "Claude session's post-SDK-return delivery marker"
     )
-    assert receipt_completed, (
-        "hosted SMS was sent but its post-call receipt did not complete"
-    )
-    current_candidate_count = len([
-        message
-        for message in _outbound_sms_to_driver()
-        if message.id not in before_sms
-        and (created_at := _message_created_at(message)) is not None
-        and created_at >= sms_watermark
-    ])
-    assert marker_sms, (
-        "hosted completion did not create a current exact-recipient sender-side "
-        f"SMS row with the spoken marker; candidate_count={current_candidate_count}"
-    )
+    assert completed_marker in log, "hosted post-call receipt did not complete"
+    assert current_sms, "hosted completion did not create the requested SMS"
 
-    # Give any accidental second attempt time to become visible, then prove the
-    # API-accepted side effect occurred exactly once. Carrier delivery is
-    # asynchronous and belongs to the SMS delivery lane, not reconciliation.
     assert time.monotonic() + HOSTED_DUPLICATE_GRACE_S <= scenario_deadline, (
         "hosted settlement left no room for the duplicate-detection grace window"
     )
     time.sleep(HOSTED_DUPLICATE_GRACE_S)
-    marker_sms = [
-        message
-        for message in _outbound_sms_to_driver()
-        if message.id not in before_sms
-        and (created_at := _message_created_at(message)) is not None
-        and created_at >= sms_watermark
-        and _spoken_key(HOSTED_POST_CALL_MARKER)
-        in _spoken_key(getattr(message, "text", None))
-    ]
-    current_candidate_count = len([
-        message
-        for message in _outbound_sms_to_driver()
-        if message.id not in before_sms
-        and (created_at := _message_created_at(message)) is not None
-        and created_at >= sms_watermark
-    ])
-    assert len(marker_sms) == 1, (
-        "hosted post-call processing did not produce exactly one current-marker "
-        "SMS to the authoritative caller: "
-        f"candidate_count={current_candidate_count} matching_count={len(marker_sms)}"
+    ended_at = _message_created_at(aut.calls.get(placed.id), "ended_at")
+    current_sms = _assert_hosted_sms_rows(
+        _outbound_sms(), before_sms, HOSTED_POST_CALL_MARKER,
+        driver_number, ended_at,
     )
-    tool_completion_count = log.count(tool_marker)
-    assert tool_completion_count == 1, (
+    assert len(current_sms) == 1, "hosted completion must produce exactly one SMS"
+    log = _gateway_log_since(log_offset)
+    assert log.count(tool_marker) == 1, (
         "hosted post-call processing recorded duplicate successful SMS side effects"
     )

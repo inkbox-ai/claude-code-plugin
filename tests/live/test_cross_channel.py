@@ -29,7 +29,7 @@ import os
 import re
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -170,8 +170,12 @@ def test_sms_request_gets_email_response(xc):
     remote, remote_email, aut_email = xc["remote"], xc["remote_email"], xc["aut_email"]
     token = _token()
 
+    since = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+
     def _email_from_aut():
-        return [m for m in remote.messages.list(remote_email, direction=MessageDirection.INBOUND)
+        return [m for m in remote.messages.list(
+            remote_email, direction=MessageDirection.INBOUND, start_datetime=since,
+        )
                 if aut_email.lower() in (getattr(m, "from_address", "") or "").lower()]
 
     before = {m.id for m in _email_from_aut()}
@@ -331,8 +335,7 @@ def test_email_request_gets_call(xc):
     remote.messages.send(
         xc["remote_email"], to=[xc["aut_email"]], subject="please call me",
         body_text=(
-            "Please place a phone call to my number now with "
-            "voicemail_detection disabled — I'd rather talk than type."
+            "Please call my number now — I'd rather talk than type."
         ),
     )
     call = _wait_for_new_call_pair(
@@ -358,8 +361,7 @@ def test_sms_request_gets_call(xc):
     remote.texts.send(
         remote_pid, to=aut_phone,
         text=(
-            "Please place a phone call to my number right now with "
-            "voicemail_detection disabled — actually call me, don't text back. "
+            "Please call my number right now, don't text back. "
             f"(ref {_token()})"
         ),
     )

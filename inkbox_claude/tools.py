@@ -346,7 +346,7 @@ def build_inkbox_mcp_server(
 
     @tool(
         "inkbox_whoami",
-        "Show this agent's Inkbox identity: handle, email address, and its two "
+        "Show this agent's Inkbox identity: handle, display name, email address, and its two "
         "calling lines (dedicated phone number + shared iMessage line).",
         {},
     )
@@ -364,6 +364,7 @@ def build_inkbox_mcp_server(
             imessage_enabled = bool(getattr(identity, "imessage_enabled", False))
             return {
                 "handle": identity.agent_handle,
+                "display_name": getattr(identity, "display_name", None),
                 "email": getattr(mailbox, "email_address", None),
                 "phone": dedicated_number,
                 "imessage_enabled": imessage_enabled,
@@ -544,14 +545,22 @@ def build_inkbox_mcp_server(
         "rejected). If origination is omitted it is resolved automatically. The "
         "configured phone-call voice stack handles the call. Always pass purpose "
         "so the live call or hosted agent knows why it is calling; optionally pass opening_message, context, "
-        "and voicemail_detection (enabled or disabled).",
+        "and voicemail_detection (enabled or disabled). Omit voicemail_detection "
+        "to use the configured setting; override it only when requested.",
         {
-            "to_number": str,
-            "purpose": str,
-            "origination": str,
-            "opening_message": str,
-            "context": str,
-            "voicemail_detection": str,
+            "type": "object",
+            "properties": {
+                "to_number": {"type": "string"},
+                "purpose": {"type": "string"},
+                "origination": {"type": "string"},
+                "opening_message": {"type": "string"},
+                "context": {"type": "string"},
+                "voicemail_detection": {
+                    "type": "string",
+                    "description": "Optional override; omit to retain the configured setting.",
+                },
+            },
+            "required": ["to_number", "purpose"],
         },
     )
     async def inkbox_place_call(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -862,11 +871,24 @@ def build_inkbox_mcp_server(
     @tool(
         "inkbox_update_contact",
         "Update an existing contact by id (look it up first). Only the fields "
-        "you pass change; emails / phones replace the whole list (strings, first "
-        "is primary).",
-        {"contact_id": str, "given_name": str, "family_name": str,
-         "preferred_name": str, "company_name": str, "job_title": str,
-         "notes": str, "emails": list, "phones": list},
+        "you pass change. Omit emails / phones for profile-only edits; passing "
+        "either replaces that whole list (strings, first is primary).",
+        {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "string"},
+                "given_name": {"type": "string"},
+                "family_name": {"type": "string"},
+                "preferred_name": {"type": "string"},
+                "company_name": {"type": "string"},
+                "job_title": {"type": "string"},
+                "notes": {"type": "string"},
+                "emails": {"type": "array", "items": {"type": "string"}},
+                "phones": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["contact_id"],
+            "additionalProperties": False,
+        },
     )
     async def inkbox_update_contact(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
@@ -1186,7 +1208,7 @@ def build_inkbox_mcp_server(
         inkbox_a2a_ask_caller,
         inkbox_a2a_fail,
     ]
-    server = create_sdk_mcp_server(name="inkbox", version="0.2.9", tools=tools)
+    server = create_sdk_mcp_server(name="inkbox", version="0.2.13", tools=tools)
     tool_names = [
         "mcp__inkbox__inkbox_whoami",
         "mcp__inkbox__inkbox_send_email",

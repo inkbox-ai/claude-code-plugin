@@ -22,6 +22,7 @@ import os
 import re
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -47,19 +48,12 @@ def _digits(s: str) -> str:
 
 
 def _phone_present(phone: str, body: str) -> bool:
-    """True if the agent reported ``phone`` in ``body``.
-
-    Accepts either the full number (all digits present) or a privacy-masked
-    form the model tends to emit in formal identity listings, where it keeps a
-    leading prefix + the last 4 and masks the middle (e.g. ``+192****3235``).
-    The masked branch requires a run of mask chars immediately followed by the
-    real last-4, so it won't false-match on markdown bold (``**name:**``).
-    """
+    """Require the complete number, allowing ordinary phone formatting."""
     want = _digits(phone)
-    if want[-10:] in _digits(body):
-        return True
-    tail = re.escape(want[-4:])
-    return bool(re.search(r"[*xX•·]{2,}\D{0,2}" + tail, body))
+    if not want:
+        return False
+    pattern = r"(?<!\d)" + r"[\s().-]*".join(want) + r"(?!\d)"
+    return re.search(pattern, body) is not None
 
 
 def _mailbox(client) -> str:
@@ -103,8 +97,14 @@ def _ask(
     """
     from inkbox.mail.types import MessageDirection
 
+    # Freeze before the baseline/send, allowing clock skew without rescanning
+    # lifetime history. Keep every page and all equal-timestamp rows.
+    since = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+
     def _inbound():
-        return list(remote.messages.list(remote_email, direction=MessageDirection.INBOUND))
+        return list(remote.messages.list(
+            remote_email, direction=MessageDirection.INBOUND, start_datetime=since,
+        ))
 
     before = {str(msg.id) for msg in _inbound()}
     nonce = f"smoke-{uuid.uuid4().hex[:8]}"
@@ -170,6 +170,8 @@ def test_basic_reply(ctx):
 def test_reports_own_identity(ctx):
     aut = ctx["aut"]
     handle = _mailbox(aut).split("@", 1)[0]
+    display_name = aut.get_identity(handle).display_name
+    assert display_name, "identity-reporting scenario requires a display name"
     aut_email = ctx["aut_email"]
     aut_phone = _first_phone(aut)
     assert aut_phone, "AUT identity has no phone number to report"
@@ -183,6 +185,7 @@ def test_reports_own_identity(ctx):
         "full — every digit, with no masking, asterisks, or abbreviation.",
         accept=lambda candidate: (
             handle in candidate
+            and display_name.lower() in candidate
             and aut_email in candidate
             and _phone_present(aut_phone, candidate)
         ),
@@ -191,8 +194,8 @@ def test_reports_own_identity(ctx):
     has_email = aut_email in body
     assert has_handle, "reply missing the expected handle"
     assert has_email, "reply missing the expected email"
-    # Accept a privacy-masked phone (the model self-redacts the middle digits
-    # in formal listings) as well as full.
+    has_display_name = display_name.lower() in body
+    assert has_display_name, "reply missing the expected display name"
     has_phone = _phone_present(aut_phone, body)
     assert has_phone, "reply missing the expected phone"
 
@@ -219,6 +222,8 @@ def test_reports_sender_details(ctx):
     name = (getattr(contact, "preferred_name", None) or getattr(contact, "given_name", None) or "")
     emails = [e.value for e in getattr(contact, "emails", [])]
     phones = [p.value for p in getattr(contact, "phones", [])]
+    complete_contact = bool(name and emails and phones)
+    assert complete_contact, "sender-details scenario needs a complete contact fixture"
 
     body = _ask(
         ctx["remote"],
@@ -228,24 +233,19 @@ def test_reports_sender_details(ctx):
         "Include my email address and phone number in full — every character "
         "and digit, with no masking, asterisks, or abbreviation.",
         accept=lambda candidate: (
-            (not name or name.lower() in candidate)
+            name.lower() in candidate
             and any(e.lower() in candidate for e in emails)
-            and (not phones or any(_phone_present(p, candidate) for p in phones))
+            and any(_phone_present(p, candidate) for p in phones)
         ),
     )
-    if name:
-        has_name = name.lower() in body
-        assert has_name, "reply missing the expected sender name"
+    has_name = name.lower() in body
+    assert has_name, "reply missing the expected sender name"
     has_email = any(e.lower() in body for e in emails)
     assert has_email, (
         "reply missing an expected sender email"
     )
-    if phones:
-        # Accept full or privacy-masked (see _phone_present).
-        has_phone = any(_phone_present(p, body) for p in phones)
-        assert has_phone, (
-            "reply missing an expected sender phone"
-        )
+    has_phone = any(_phone_present(p, body) for p in phones)
+    assert has_phone, "reply missing an expected sender phone"
 
 
 def test_aware_of_inkbox_tools(ctx):
@@ -267,10 +267,10 @@ def test_aware_of_inkbox_tools(ctx):
         ctx["aut_email"],
         ctx["remote_email"],
         "List the exact names of all the Inkbox tools you have access to, one per line.",
-        accept=lambda candidate: all(t.lower() in candidate for t in contact_tools),
+        accept=lambda candidate: all(t.lower() in candidate for t in tool_names),
     )
     hits = [t for t in tool_names if t.lower() in body]
-    assert len(hits) >= 3, (
+    assert len(hits) == len(tool_names), (
         f"agent named too few tools (matched_count={len(hits)} "
         f"available_count={len(tool_names)})"
     )
@@ -310,9 +310,8 @@ def test_contact_crud_tool_use(ctx):
             ctx["remote"],
             ctx["aut_email"],
             ctx["remote_email"],
-            "Use inkbox_create_contact now. Create a new contact named "
-            f"{contact_name} with email {contact_email}. Do not just describe the action. "
-            f"After the tool succeeds, reply exactly: CREATED {nonce}",
+            f"Create a new contact named {contact_name} with email {contact_email}. "
+            f"When done, reply exactly: CREATED {nonce}",
         )
         assert "created" in created and nonce in created, created[:500]
         matches = _contacts_by_email(aut, contact_email)
@@ -324,9 +323,9 @@ def test_contact_crud_tool_use(ctx):
             ctx["remote"],
             ctx["aut_email"],
             ctx["remote_email"],
-            "Use inkbox_update_contact now. Update contactId "
-            f"{contact_id} and set notes to {updated_notes}. Do not create a second contact. "
-            f"After the tool succeeds, reply exactly: UPDATED {nonce}",
+            f"Update the contact with email {contact_email}: set its notes to "
+            f"{updated_notes}. Do not create a second contact. "
+            f"When done, reply exactly: UPDATED {nonce}",
         )
         assert "updated" in updated and nonce in updated, updated[:500]
         fetched = aut.contacts.get(contact_id)
@@ -336,8 +335,8 @@ def test_contact_crud_tool_use(ctx):
             ctx["remote"],
             ctx["aut_email"],
             ctx["remote_email"],
-            "I confirm this is a temporary test contact. Use inkbox_delete_contact now "
-            f"to delete contactId {contact_id}. After the tool succeeds, reply exactly: DELETED {nonce}",
+            f"Delete the temporary contact with email {contact_email}. "
+            f"I confirm that I want it deleted. When done, reply exactly: DELETED {nonce}",
         )
         assert "deleted" in deleted and nonce in deleted, deleted[:500]
         contact_removed = not _contacts_by_email(aut, contact_email)
