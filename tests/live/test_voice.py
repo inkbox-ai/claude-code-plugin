@@ -361,14 +361,19 @@ def _wait_for_persisted_hosted_request(
     assert marker_key
     driver_transcript_ready = False
     aut_transcript_ready = False
+    driver_readback_ready = False
+    aut_readback_ready = False
     action_ready = False
     driver_transcript_diagnostic: dict[str, int | bool | str] = {}
     aut_transcript_diagnostic: dict[str, int | bool | str] = {}
     action_diagnostic: dict[str, int | bool | str] = {}
     while time.monotonic() < deadline:
         try:
-            _all, _rem, local = _segments(remote, number_id, call_id)
+            _all, heard, local = _segments(remote, number_id, call_id)
             text = " ".join(segment.text.strip() for segment in local)
+            driver_readback_ready = marker_key in _spoken_key(
+                " ".join(segment.text.strip() for segment in heard)
+            )
             driver_transcript_ready = (
                 marker_key in _spoken_key(text)
                 and _has_after_call_sms_intent(text)
@@ -381,8 +386,11 @@ def _wait_for_persisted_hosted_request(
         except Exception as exc:  # transcripts may trail call teardown briefly
             driver_transcript_diagnostic = {"error_type": type(exc).__name__}
         try:
-            _all, caller, _local = _segments(aut, "unused", aut_call_id)
+            _all, caller, spoken = _segments(aut, "unused", aut_call_id)
             text = " ".join(segment.text.strip() for segment in caller)
+            aut_readback_ready = marker_key in _spoken_key(
+                " ".join(segment.text.strip() for segment in spoken)
+            )
             aut_transcript_ready = (
                 marker_key in _spoken_key(text)
                 and _has_after_call_sms_intent(text)
@@ -400,7 +408,8 @@ def _wait_for_persisted_hosted_request(
             action_diagnostic = _post_call_action_diagnostic(aut_call, marker)
         except Exception as exc:
             action_diagnostic = {"error_type": type(exc).__name__}
-        if driver_transcript_ready and aut_transcript_ready and action_ready:
+        if (driver_transcript_ready and aut_transcript_ready and action_ready
+                and driver_readback_ready and aut_readback_ready):
             return
         time.sleep(POLL_EVERY_S)
     pytest.fail(
@@ -408,6 +417,7 @@ def _wait_for_persisted_hosted_request(
         "post-call SMS action before the shared deadline "
         f"(driver_transcript_ready={driver_transcript_ready}, "
         f"aut_transcript_ready={aut_transcript_ready}, action_ready={action_ready}, "
+        f"driver_readback_ready={driver_readback_ready}, aut_readback_ready={aut_readback_ready}, "
         f"driver_transcript_gate={driver_transcript_diagnostic}, "
         f"aut_transcript_gate={aut_transcript_diagnostic}, "
         f"action_gate={action_diagnostic})"

@@ -98,7 +98,8 @@ def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unava
     assert "status='failed'" in str(exc.value)
 
 
-def test_wait_for_persisted_hosted_request_requires_both_transcripts_and_action():
+@pytest.mark.parametrize("missing_readback", [None, "driver", "aut"])
+def test_wait_for_persisted_hosted_request_requires_both_transcripts_and_action(monkeypatch, missing_readback):
     voice = _load_live_voice_module()
     marker = "victor echo juliet"
     remote = SimpleNamespace(calls=_Calls(
@@ -123,15 +124,23 @@ def test_wait_for_persisted_hosted_request_requires_both_transcripts_and_action(
         )],
     ))
 
-    assert voice._wait_for_persisted_hosted_request(
-        remote,
-        "unused-number-id",
-        "driver-call-id",
-        aut,
-        "aut-call-id",
-        marker,
-        deadline=time.monotonic() + 1,
-    ) is None
+    if missing_readback != "driver":
+        remote.calls._transcripts.append(SimpleNamespace(party="remote", text=marker))
+    if missing_readback != "aut":
+        aut.calls._transcripts.append(SimpleNamespace(party="local", text=marker))
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+
+    def wait():
+        return voice._wait_for_persisted_hosted_request(
+            remote, "unused-number-id", "driver-call-id", aut, "aut-call-id", marker,
+            deadline=time.monotonic() + 0.01,
+        )
+
+    if missing_readback:
+        with pytest.raises(pytest.fail.Exception, match=f"{missing_readback}_readback_ready=False"):
+            wait()
+    else:
+        assert wait() is None
 
 
 def test_wait_for_persisted_hosted_request_requires_aut_transcript(monkeypatch):
