@@ -206,9 +206,12 @@ def test_sms_basic_reply(sms):
 @real_only
 def test_sms_reports_own_identity(sms):
     aut_email = sms["aut"].mailboxes.list()[0].email_address
+    aut_phone, _ = _phone(sms["aut"])
     body = _ask_sms(sms, "Reply with just your Inkbox email address and phone number — short.")
     email_present = aut_email in body
     assert email_present, "reply missing the expected email"
+    phone_pattern = r"(?<!\d)" + r"[\s().-]*".join(_digits(aut_phone)) + r"(?!\d)"
+    assert re.search(phone_pattern, body), "reply missing the complete phone number"
 
 
 @real_only
@@ -229,7 +232,7 @@ def test_sms_aware_of_inkbox_tools(sms):
     tool_names = _plugin_tool_names()
     body = _ask_sms(sms, "Name three of your Inkbox tools (exact names).")
     hits = [t for t in tool_names if t.lower() in body]
-    assert len(hits) >= 2, f"agent named too few tools (matched_count={len(hits)})"
+    assert len(hits) >= 3, f"agent named too few tools (matched_count={len(hits)})"
 
 
 # ── Outbound delivery-failure retry loop ────────────────────────────────

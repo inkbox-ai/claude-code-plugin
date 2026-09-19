@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 
 def _live_email_module():
     path = Path(__file__).parent / "live" / "test_email_intelligence.py"
@@ -11,6 +13,18 @@ def _live_email_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("body, expected", [
+    ("Phone: +1 (555) 111-2222", True),
+    ("Phone: +15551112222", True),
+    ("Phone: +155****2222", False),
+    ("Phone: 5551112222", False),
+    ("Phone: +155511122223", False),
+    ("Ref 1555; other reference 1112222", False),
+])
+def test_full_phone_answer_rejects_masking_truncation_and_unrelated_digits(body, expected):
+    assert _live_email_module()._phone_present("+15551112222", body) is expected
 
 
 class _Messages:
