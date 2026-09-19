@@ -102,6 +102,7 @@ def build_channel_prompt(
     email_address: str = "",
     phone_number: str = "",
     channels: str = "email, SMS, iMessage, and voice calls",
+    display_name: str = "",
 ) -> str:
     """Render the channel prompt for one bridged session.
 
@@ -111,11 +112,14 @@ def build_channel_prompt(
         email_address (str): Identity mailbox address, if provisioned.
         phone_number (str): Identity phone number, if provisioned.
         channels (str): Human-readable list of reachable channels.
+        display_name (str): Configured identity display name, if present.
 
     Returns:
         str: The prompt text to append to the claude_code preset.
     """
     parts = [p for p in (identity_handle, email_address, phone_number) if p]
+    if display_name:
+        parts.append(f"display name: {display_name!r}")
     identity_line = " / ".join(parts) or "not yet provisioned"
     return CHANNEL_PROMPT.format(
         channels=channels,

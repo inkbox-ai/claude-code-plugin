@@ -42,6 +42,24 @@ def make_session(sent, typing=None):
     )
 
 
+def test_session_supplies_display_name_to_actual_host_options(monkeypatch):
+    options_seen = []
+
+    class FakeClient:
+        def __init__(self, options):
+            options_seen.append(options)
+
+        async def connect(self):
+            pass
+
+    monkeypatch.setattr(sessions_mod, "CLAUDE_SDK_AVAILABLE", True)
+    monkeypatch.setattr(sessions_mod, "ClaudeSDKClient", FakeClient)
+    session = make_session([])
+    session.identity_info["display_name"] = "Example Assistant"
+    asyncio.run(session._ensure_client())
+    assert "Example Assistant" in options_seen[0].system_prompt["append"]
+
+
 def test_hosted_sms_preflight_is_durable_exact_target_and_single_use(
     tmp_path, monkeypatch,
 ):

@@ -1041,6 +1041,7 @@ class ContactSession:
             identity_handle=self.identity_info.get("handle", ""),
             email_address=self.identity_info.get("email", ""),
             phone_number=self.identity_info.get("phone", ""),
+            display_name=self.identity_info.get("display_name", ""),
         )
         if self.system_prompt_extra:
             prompt_append = f"{prompt_append}\n\n{self.system_prompt_extra}"

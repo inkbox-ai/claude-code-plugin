@@ -880,6 +880,7 @@ class InkboxGateway:
         phone = getattr(self._identity, "phone_number", None)
         identity_info = {
             "handle": self._identity.agent_handle,
+            "display_name": str(getattr(self._identity, "display_name", "") or ""),
             "email": str(getattr(mailbox, "email_address", "") or ""),
             "phone": str(getattr(phone, "number", "") or ""),
         }
