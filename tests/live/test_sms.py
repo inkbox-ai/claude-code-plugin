@@ -216,13 +216,12 @@ def test_sms_reports_sender_details(sms):
     aut, remote = sms["aut"], sms["remote"]
     remote_email = remote.mailboxes.list()[0].email_address
     matches = aut.contacts.lookup(email=remote_email)
-    if not matches:
-        pytest.skip("no contact card for the sender to report")
+    assert matches, "sender-details scenario requires the seeded contact card"
     name = (getattr(matches[0], "preferred_name", None) or getattr(matches[0], "given_name", None) or "")
+    assert name, "sender-details scenario requires a named contact"
     body = _ask_sms(sms, "Who am I to you? Tell me what you have on file about me.")
-    if name:
-        name_present = name.lower() in body
-        assert name_present, "reply missing the expected sender name"
+    name_present = name.lower() in body
+    assert name_present, "reply missing the expected sender name"
 
 
 @real_only

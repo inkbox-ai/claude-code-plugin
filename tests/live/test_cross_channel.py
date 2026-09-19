@@ -335,8 +335,7 @@ def test_email_request_gets_call(xc):
     remote.messages.send(
         xc["remote_email"], to=[xc["aut_email"]], subject="please call me",
         body_text=(
-            "Please place a phone call to my number now with "
-            "voicemail_detection disabled — I'd rather talk than type."
+            "Please call my number now — I'd rather talk than type."
         ),
     )
     call = _wait_for_new_call_pair(
@@ -362,8 +361,7 @@ def test_sms_request_gets_call(xc):
     remote.texts.send(
         remote_pid, to=aut_phone,
         text=(
-            "Please place a phone call to my number right now with "
-            "voicemail_detection disabled — actually call me, don't text back. "
+            "Please call my number right now, don't text back. "
             f"(ref {_token()})"
         ),
     )
