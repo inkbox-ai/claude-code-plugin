@@ -390,6 +390,14 @@ def test_stages_do_not_reuse_previous_stage_reply(driver, monkeypatch):
     assert _scripted_speech(sent, driver) == [(100.0, "intro"), (103.0, "request")]
 
 
+@pytest.mark.parametrize("reply", ["alphabeta", "unal pha beta", "alpha betamax", "beta alpha"])
+def test_stages_do_not_accept_merged_partial_or_reordered_reply(driver, monkeypatch, reply):
+    sent = _run_staged_socket(driver, monkeypatch, [
+        {"text": "intro"}, {"text": "request", "expected_reply": "alpha beta"}, {"text": "confirm"},
+    ], [(1, _peer("ready")), (4, _peer(reply))])
+    assert _scripted_speech(sent, driver) == [(100.0, "intro"), (103.0, "request")]
+
+
 def test_stages_ignore_partial_blank_and_text_done_as_reply(driver, monkeypatch):
     sent = _run_staged_socket(driver, monkeypatch, [{"text": "intro"}, {"text": "request"}], [
         (1, _peer("")), (2, _peer("ready", final=False)), (3, _peer(None)),

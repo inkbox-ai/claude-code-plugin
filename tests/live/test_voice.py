@@ -175,11 +175,9 @@ def _spoken_tokens(value: str | None) -> list[str]:
 
 
 def _spoken_key(value: str | None) -> str:
-    key = "".join(_spoken_tokens(value))
-    # Claude is a common ASR homophone for "cloud". Canonicalize the observed
-    # boundary-less form too ("cloudpapa") without relaxing any of the other
-    # current-run marker, action, status, channel, or recipient requirements.
-    return key.replace("cloud", "claude")
+    """Match contiguous whole words, ignoring only punctuation and case."""
+    tokens = _spoken_tokens(value)
+    return f" {' '.join(tokens)} " if tokens else ""
 
 
 def _message_created_at(message, field="created_at"):

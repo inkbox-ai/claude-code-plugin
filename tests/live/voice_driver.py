@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -84,8 +85,9 @@ ANSWER_CONTAINS = os.environ.get("VOICE_DRIVER_ANSWER_CONTAINS", "")
 
 
 def _speech_key(text: str) -> str:
-    """Compare speech ignoring ASR casing, spacing and punctuation."""
-    return "".join(char for char in text.casefold() if char.isalnum())
+    """Compare whole words, ignoring only casing and punctuation."""
+    tokens = re.findall(r"[a-z0-9]+", text.casefold())
+    return f" {' '.join(tokens)} " if tokens else ""
 
 
 def _load_stages(path: str) -> list[dict[str, str]]:

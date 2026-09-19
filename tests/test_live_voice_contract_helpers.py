@@ -72,8 +72,20 @@ def test_stage_diagnostics_are_bounded_and_exclude_content():
 
 
 def test_spoken_marker_normalizes_punctuation_and_case():
-    assert voice._spoken_key("Victor-Echo, JULIET!") == "victorechojuliet"
-    assert voice._spoken_key("cloudpapa") == voice._spoken_key("Claude Papa")
+    assert voice._spoken_key("Victor-Echo, JULIET!") == " victor echo juliet "
+    assert voice._spoken_key(None) == ""
+
+
+@pytest.mark.parametrize("observed", [
+    "victorechojuliet", "unvictor echo juliet", "victor echo julietextra",
+    "victor juliet echo", "victor another echo juliet",
+])
+def test_spoken_marker_rejects_merged_partial_or_changed_words(observed):
+    assert voice._spoken_key("victor echo juliet") not in voice._spoken_key(observed)
+
+
+def test_spoken_marker_does_not_alias_different_words():
+    assert voice._spoken_key("cloud papa") != voice._spoken_key("Claude Papa")
 
 
 def test_hosted_call_request_does_not_supply_the_spoken_task_or_solution():
@@ -292,6 +304,8 @@ def test_matching_post_call_action_requires_open_current_marker_sms():
     for item in (
         {**matching, "status": "canceled"},
         {**matching, "details": "Send a different marker."},
+        {**matching, "details": "Send victorechojuliet."},
+        {**matching, "details": "Send unvictor echo juliet."},
         {**matching, "action": "create_note", "details": marker},
     ):
         assert voice._matching_post_call_action(
