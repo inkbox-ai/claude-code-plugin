@@ -87,10 +87,11 @@ jobs:
           elif [ "${{ matrix.scenario }}" = "outbound_hosted" ]; then
             RUN_TOKEN="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             marker="$(python3 tests/live/voice_marker.py "$RUN_TOKEN")"
+            spoken_marker="${marker// /, }"
             marker_file="$RUNNER_TEMP/hosted_marker.txt"
             driver_line_file="$RUNNER_TEMP/voice_driver_line.txt"
             printf '%s' "$marker" > "$marker_file"
-            printf '%s' "Do not text during this call. After we hang up, send me one SMS containing exactly: $marker. Save one post-call action now, with both title and details exactly: Send SMS $marker. After the tool succeeds, read back the exact three-word SMS body." > "$driver_line_file"
+            printf '%s' "Do not text during this call. After we hang up, send one SMS with exactly these words: $spoken_marker. Save one post-call action titled Send SMS, with details exactly $spoken_marker. After the tool succeeds, read back the SMS body." > "$driver_line_file"
             echo "INKBOX_VOICE_STACK=inkbox_voice_ai" >> "$GITHUB_ENV"
             echo "INKBOX_REALTIME_ENABLED=false" >> "$GITHUB_ENV"
             echo "HOSTED_POST_CALL_MARKER_FILE=$marker_file" >> "$GITHUB_ENV"

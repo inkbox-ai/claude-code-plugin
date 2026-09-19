@@ -27,9 +27,9 @@ def test_workflow_uses_one_short_hosted_action_utterance():
     workflow = (Path(__file__).parent.parent / ".github/workflows/live-voice.yml").read_text()
 
     assert (
-        "Do not text during this call. After we hang up, send me one SMS containing exactly: $marker. "
-        "Save one post-call action now, with both title and details exactly: Send SMS $marker. "
-        "After the tool succeeds, read back the exact three-word SMS body."
+        "Do not text during this call. After we hang up, send one SMS with exactly these words: $spoken_marker. "
+        "Save one post-call action titled Send SMS, with details exactly $spoken_marker. "
+        "After the tool succeeds, read back the SMS body."
         in workflow
     )
     assert "Upload logs on failure" not in workflow
