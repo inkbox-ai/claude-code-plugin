@@ -15,6 +15,7 @@ import mimetypes
 import secrets
 import time
 import uuid
+from copy import deepcopy
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -401,6 +402,24 @@ def build_inkbox_mcp_server(
             result = await asyncio.to_thread(_run)
             _mark_tool_delivery("email", target)
             return _result(result)
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
+        "inkbox_reply_companion",
+        "Reply to the current Companion group using its fixed email reply-all or conversation target.",
+        {"text": str},
+    )
+    async def inkbox_reply_companion(args: Dict[str, Any]) -> Dict[str, Any]:
+        session = CURRENT_SESSION.get()
+        if session is None or not session.reply_meta.get("companion") or not session._turn_active:
+            return _error("No active Companion conversation.")
+        try:
+            await session.send_fn(
+                session.chat_id, str(args["text"]), session.mode, deepcopy(session.reply_meta),
+            )
+            session._current_channel_tool_delivery = True
+            return _result({"sent": True})
         except Exception as exc:
             return _error(str(exc))
 
@@ -1161,6 +1180,7 @@ def build_inkbox_mcp_server(
     tools = [
         inkbox_whoami,
         inkbox_send_email,
+        inkbox_reply_companion,
         inkbox_send_sms,
         inkbox_send_imessage,
         inkbox_place_call,
@@ -1185,10 +1205,13 @@ def build_inkbox_mcp_server(
         inkbox_a2a_ask_caller,
         inkbox_a2a_fail,
     ]
-    server = create_sdk_mcp_server(name="inkbox", version="0.2.9", tools=tools)
+    from . import __version__
+
+    server = create_sdk_mcp_server(name="inkbox", version=__version__, tools=tools)
     tool_names = [
         "mcp__inkbox__inkbox_whoami",
         "mcp__inkbox__inkbox_send_email",
+        "mcp__inkbox__inkbox_reply_companion",
         "mcp__inkbox__inkbox_send_sms",
         "mcp__inkbox__inkbox_send_imessage",
         "mcp__inkbox__inkbox_place_call",

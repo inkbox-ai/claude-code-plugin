@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -104,6 +105,11 @@ class _Turn:
     a2a_context: Optional[Dict[str, Any]] = None
     capture_tools: bool = False
     hosted_sms_context: Optional[Dict[str, Any]] = None
+    mode: Optional[str] = None
+    reply_meta: Optional[Dict[str, Any]] = None
+    completion: Optional["asyncio.Future[None]"] = None
+    checkpoint: Optional[Callable[[str], None]] = None
+    authorize: Optional[Callable[[], Awaitable[None]]] = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +395,7 @@ class ContactSession:
         self._current_channel_tool_delivery = False
         self._current_tool_deliveries: list[ToolDeliveryResult] = []
         self._current_hosted_sms_context: Optional[Dict[str, Any]] = None
+        self.companion_approver = ""
 
     # ------------------------------------------------------------------
     # Inbound routing
@@ -465,7 +472,16 @@ class ContactSession:
             turn = await self._queue.get()
             try:
                 await self._run_turn(turn)
+                if turn.checkpoint is not None:
+                    turn.checkpoint("completed")
+                if turn.completion is not None and not turn.completion.done():
+                    turn.completion.set_result(None)
             except Exception as exc:
+                if turn.completion is not None:
+                    if not turn.completion.done():
+                        turn.completion.set_exception(exc)
+                    await self.close()
+                    continue
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
                 if self._interrupting:
@@ -477,6 +493,20 @@ class ContactSession:
                     await self._reply(_turn_error_notice(exc))
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
+
+    async def run_companion(
+        self, text: str, mode: str, meta: Dict[str, Any], checkpoint: Callable[[str], None],
+        authorize: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Queue one complete input without commands, approvals, or interruption."""
+        completion = asyncio.get_running_loop().create_future()
+        await self._queue.put(_Turn(
+            text=text, mode=mode, reply_meta=deepcopy(meta),
+            completion=completion, checkpoint=checkpoint, authorize=authorize,
+        ))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
+        await completion
 
     # ------------------------------------------------------------------
     # Control commands (/clear, /new, /stop)
@@ -766,6 +796,9 @@ class ContactSession:
             )
 
     async def _run_turn(self, turn: _Turn) -> None:
+        if turn.reply_meta is not None:
+            self.mode = turn.mode or self.mode
+            self.reply_meta = deepcopy(turn.reply_meta)
         self._interrupting = False  # fresh turn starts un-interrupted
         self._current_channel_tool_delivery = False
         self._current_tool_deliveries: list[ToolDeliveryResult] = []
@@ -788,30 +821,44 @@ class ContactSession:
             while True:
                 try:
                     client = await self._ensure_client()
+                    if turn.authorize is not None:
+                        await turn.authorize()
                     # Keep a typing indicator alive on the human's channel for
                     # the whole turn, then always tear it down — even if the
                     # turn raises.
                     self._turn_active = True
                     typing_task = asyncio.create_task(self._typing_loop())
+                    if turn.checkpoint is not None:
+                        turn.checkpoint("submitting")
                     await client.query(turn.text)
+                    if turn.checkpoint is not None:
+                        turn.checkpoint("submitted")
 
                     chunks: list[str] = []
                     final: Optional[str] = None
+                    completed = False
                     async for message in client.receive_response():
                         if isinstance(message, AssistantMessage):
                             for block in message.content:
                                 if isinstance(block, TextBlock):
                                     chunks.append(block.text)
                         elif isinstance(message, ResultMessage):
+                            if turn.checkpoint is not None:
+                                completed = not message.is_error and message.subtype == "success"
                             final = message.result
                             if message.session_id and self.on_session_id:
                                 self.resume_session_id = message.session_id
                                 self.on_session_id(self.chat_id, message.session_id)
+                                if turn.checkpoint is not None:
+                                    turn.checkpoint("submitted")
+                    if turn.checkpoint is not None and (not completed or not self.resume_session_id):
+                        raise RuntimeError("Companion host completion could not be confirmed")
                     reply = (final or "\n\n".join(chunks)).strip()
                     break
                 except Exception as exc:
                     if (
-                        retried_missing_resume
+                        turn.checkpoint is not None
+                        or retried_missing_resume
                         or not self.resume_session_id
                         or not _is_missing_resume_error(exc)
                     ):
@@ -912,6 +959,9 @@ class ContactSession:
         Returns:
             None
         """
+        if turn.reply_meta is not None:
+            await self.send_fn(self.chat_id, reply, turn.mode or self.mode, deepcopy(turn.reply_meta))
+            return
         try:
             await self._reply(reply)
         except Exception as exc:
@@ -1059,6 +1109,8 @@ class ContactSession:
     # ------------------------------------------------------------------
 
     async def _can_use_tool(self, tool_name: str, input_data: Dict[str, Any], context: Any):
+        if self.reply_meta.get("companion") and not self.companion_approver:
+            return PermissionResultDeny(message="This conversation has no verified sender to approve tools.")
         # AskUserQuestion → numbered poll on the human's channel.
         if tool_name == "AskUserQuestion":
             questions = list(input_data.get("questions") or [])
@@ -1138,6 +1190,19 @@ class ContactSession:
 
     async def _reply(self, text: str) -> None:
         await self.send_fn(self.chat_id, text, self.mode, self.reply_meta)
+
+    async def stop_companion(self) -> None:
+        """Stop the host worker before its journal owner can be released."""
+        if self._worker is not None:
+            self._worker.cancel()
+            await asyncio.gather(self._worker, return_exceptions=True)
+        while not self._queue.empty():
+            turn = self._queue.get_nowait()
+            if turn.completion is not None and not turn.completion.done():
+                turn.completion.cancel()
+        if self.pending is not None and not self.pending.future.done():
+            self.pending.future.cancel()
+        await self.close()
 
     async def close(self) -> None:
         if self._client is not None:
@@ -1231,4 +1296,7 @@ class SessionManager:
 
     async def close_all(self) -> None:
         for session in self.sessions.values():
-            await session.close()
+            if session.chat_id.startswith("companion:"):
+                await session.stop_companion()
+            else:
+                await session.close()

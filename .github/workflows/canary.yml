@@ -28,7 +28,7 @@ jobs:
       - name: Install bridge + latest SDK
         run: |
           pip install \
-            "inkbox==0.5.9" \
+            "inkbox==0.7.3" \
             -e . pytest
           pip install -U claude-agent-sdk
 

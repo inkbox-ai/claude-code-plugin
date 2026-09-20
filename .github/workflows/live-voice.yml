@@ -60,7 +60,7 @@ jobs:
       - name: Install bridge + driver deps
         run: |
           pip install \
-            "inkbox==0.5.9" \
+            "inkbox==0.7.3" \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI

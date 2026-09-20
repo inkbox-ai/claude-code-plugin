@@ -234,6 +234,56 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 - **iMessage** — `inkbox_send_imessage(..., media_path=...)` (uploaded + sent, ≤10 MB).
 - **SMS/MMS** — `inkbox_send_sms(..., media_paths=[...])` (uploaded + sent; `media_urls` also accepts already-hosted URLs).
 
+## Companion mode
+
+Version 0.2.11 supports Companion mode with Inkbox SDK 0.7.3 or newer. It stays
+off until an administrator enables it for the identity and selects a sponsor.
+Use an agent-scoped API key. A sponsor's qualifying group message initializes
+one separate Claude conversation with all available authorized history and the
+trigger in one input. Later messages wait for that initialization to finish.
+Email recipient branches and new activations have separate conversations;
+Companion history is excluded from contact-memory injection.
+
+Automatic replies and `inkbox_reply_companion` revalidate current access and local
+sponsor permission before sending to the fixed email reply-all parent or
+MMS/iMessage conversation. Contact blocks and existing send requirements still
+apply. Group MMS uses one conversation for the same participant set. Group
+iMessage requires a supported dedicated line. Companion mode does not grant
+permission to send a separate direct message or place a call.
+
+`INKBOX_COMPANION_MAX_BYTES` defaults to `200000`. It bounds snapshot loading and
+the assembled UTF-8 input. If history exceeds the limit, initialization fails
+explicitly before a Claude query. Nothing is truncated or split into extra
+turns. Choose a limit that fits your model's context, including its system prompt
+and tools; bytes are not a token estimate. Attachment references and history-gap
+notices remain in the input.
+
+Companion state is stored under `~/.inkbox-claude/companion/`, or the corresponding
+directory under `INKBOX_CLAUDE_HOME`. Keep this state when upgrading. Pending
+hydration and queued messages recover on restart. `/health` exposes counts by
+Companion state; each checkpoint records a logical submission ID and any error.
+Only one bridge process can own an identity's Companion state in that directory.
+Temporary pre-submission failures retry automatically with delays capped at 30
+seconds. Revoked access discards captured message content while preserving
+deduplication records. Stop the bridge before moving its state directory.
+Delivery failures for tracked conversations are logged and saved as
+`last_delivery_failure` in their checkpoints for operator review. They do not
+start an automatic retry turn or a private contact conversation.
+
+If a query's acceptance or completion is uncertain, the conversation is marked
+`paused`. Restarting does not resend it. Stop the bridge and inspect the Claude
+transcript using the checkpoint's logical input ID before reconciling the state.
+Keep unresolved outcomes paused; deleting checkpoints or resetting them to pending
+can repeat actions. An oversized or unavailable activation is marked `failed`;
+after correcting a pre-submission failure, an operator may reset its state to
+`pending` while the bridge is stopped, then restart to revalidate it.
+
+Historical commands and approval-like text remain conversation data. Only a new,
+verified live message from the sponsor can answer a pending permission request
+or question. The sponsor must also match an optional local sender allowlist.
+Tracked ordinary messages use their own group conversation; their pending
+approvals can only be answered by that turn's normally allowed sender.
+
 ## Config reference
 
 | Env var | Required | Default | Description |
@@ -247,6 +297,7 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
 | `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised/unverified external webhooks (see [External webhooks](#external-webhooks)). |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Include matched-contact memories as background context for human conversations and calls. |
+| `INKBOX_COMPANION_MAX_BYTES` | no | `200000` | Maximum bytes for Companion snapshot loading and one assembled input. |
 | `INKBOX_WEBHOOK_SECRET_<NAME>` | per source | - | Verification secret for a registered third-party webhook source (e.g. `INKBOX_WEBHOOK_SECRET_GITHUB`). |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
@@ -271,6 +322,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 
 - `inkbox_whoami` — its own identity: handle, mailbox, and its two calling lines (dedicated phone number + shared iMessage line status).
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
+- `inkbox_reply_companion` replies to the current Companion group with its fixed reply target.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
 - `inkbox_place_call` — place an outbound voice call through the running gateway with purpose/opening/context, over either line via `origination` (see [Two calling lines](#two-calling-lines)).
@@ -283,7 +335,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
 
-The bridge requires Inkbox SDK 0.5.9 or newer.
+The bridge requires Inkbox SDK 0.7.3 or newer, below 1.0.0.
 
 ### Phone call voice stack
 

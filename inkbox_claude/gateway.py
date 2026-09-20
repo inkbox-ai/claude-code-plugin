@@ -747,6 +747,7 @@ class InkboxGateway:
         self._public_host: str = ""
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
+        self._companion: Any = None
 
         self._self_addresses: set[str] = set()
         self._recent_request_ids: Dict[str, float] = {}
@@ -789,7 +790,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.5.9,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.7.3,<1.0.0'")
         if self.cfg.voice_stack_invalid_value:
             raise RuntimeError(
                 f"invalid INKBOX_VOICE_STACK={self.cfg.voice_stack_invalid_value!r}; rerun setup"
@@ -849,6 +850,7 @@ class InkboxGateway:
             on_send_rejected=self._note_send_rejection,
             health_fn=self.health_report,
         )
+        self._companion_receiver().recover()
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
 
@@ -1538,6 +1540,8 @@ class InkboxGateway:
             logger.exception("[bridge] hosted call completion failed call_id=%s", call_id)
 
     async def _cleanup(self) -> None:
+        if self._companion is not None:
+            await self._companion.close()
         jobs = list(self._hosted_call_jobs.values())
         for task in jobs:
             task.cancel()
@@ -1558,7 +1562,22 @@ class InkboxGateway:
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        return web.json_response({"ok": True, "identity": self.cfg.identity})
+        result = {"ok": True, "identity": self.cfg.identity}
+        if self._companion is not None:
+            counts: Dict[str, int] = {}
+            for record in self._companion.records.values():
+                state = record["state"]
+                counts[state] = counts.get(state, 0) + 1
+            result["companion"] = counts
+        return web.json_response(result)
+
+    def _companion_receiver(self):
+        """Create the durable receiver after the identity and sessions are ready."""
+        from .companion import CompanionReceiver
+
+        if self._companion is None:
+            self._companion = CompanionReceiver(self)
+        return self._companion
 
     def _prune_dedup_ids(self) -> None:
         now = time.time()
@@ -1658,6 +1677,41 @@ class InkboxGateway:
         # Trusted source label. ``None`` means no registered provider claimed
         # the request — an unknown/unverifiable third party.
         source = provider.name if provider is not None else None
+
+        if source == "inkbox" and self._companion is not None:
+            failure_scopes = self._companion.delivery_failure_scopes(envelope)
+            if failure_scopes:
+                if not self.cfg.require_signature and not provider.verify(
+                    body=body, headers=dict(request.headers),
+                    url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key,
+                ):
+                    return web.Response(status=401, text="Companion events require a valid signature")
+                try:
+                    self._companion.record_delivery_failure(envelope, failure_scopes)
+                except RuntimeError as exc:
+                    return web.Response(status=503, text=str(exc))
+                return web.json_response({"ok": True, "companion": "delivery_failed"})
+
+        data = envelope.get("data")
+        has_companion = "companion" in envelope or (isinstance(data, dict) and "companion" in data)
+        if source == "inkbox" and has_companion:
+            # Companion authority always requires a signature, including local test configurations.
+            if not self.cfg.require_signature and not provider.verify(
+                body=body, headers=dict(request.headers),
+                url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key,
+            ):
+                return web.Response(status=401, text="Companion events require a valid signature")
+            if self.sessions is None:
+                return web.Response(status=503, text="Companion receiver is starting")
+            try:
+                result = self._companion_receiver().accept(envelope)
+            except ValueError as exc:
+                return web.Response(status=400, text=str(exc))
+            except PermissionError as exc:
+                return web.Response(status=403, text=str(exc))
+            except RuntimeError as exc:
+                return web.Response(status=503, text=str(exc))
+            return web.json_response(result)
 
         request_id = request.headers.get("X-Inkbox-Request-Id", "")
         if self._dedup_begin(request_id):
@@ -3846,6 +3900,8 @@ class InkboxGateway:
                 kwargs["conversation_id"] = conversation_id
             else:
                 kwargs["to"] = str(meta.get("to") or chat_id)
+            if meta.get("companion"):
+                await self._companion_receiver().authorize_reply(chat_id, mode, meta)
             await asyncio.to_thread(identity.send_text, **kwargs)
         elif mode == "imessage":
             text = strip_markdown(content)
@@ -3857,6 +3913,8 @@ class InkboxGateway:
                 conversation_id = str(chat_id).split(":", 1)[1]
             if not conversation_id:
                 raise ValueError(f"No iMessage conversation id for chat {chat_id}")
+            if meta.get("companion"):
+                await self._companion_receiver().authorize_reply(chat_id, mode, meta)
             await asyncio.to_thread(
                 identity.send_imessage,
                 conversation_id=conversation_id,
@@ -3864,6 +3922,15 @@ class InkboxGateway:
             )
         else:  # email
             identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            if meta.get("companion"):
+                context = meta["reply_context"]
+                if context.get("channel") != "mail" or not context.get("reply_to_message_id"):
+                    raise ValueError("Companion email reply requires a stored parent")
+                await self._companion_receiver().authorize_reply(chat_id, mode, meta)
+                await asyncio.to_thread(
+                    identity.reply_all_email, str(context["reply_to_message_id"]), body_text=content,
+                )
+                return
             subject = str(meta.get("subject") or "").strip()
             reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Claude Code agent"
             await asyncio.to_thread(

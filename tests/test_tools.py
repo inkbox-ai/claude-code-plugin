@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
@@ -237,6 +238,7 @@ def test_coding_agent_tool_tier_is_registered():
     expected = {
         "inkbox_whoami",
         "inkbox_send_email",
+        "inkbox_reply_companion",
         "inkbox_send_sms",
         "inkbox_send_imessage",
         "inkbox_place_call",
@@ -275,6 +277,35 @@ def test_get_contact_and_delete_contact_tools():
     assert contact["id"] == "contact-1"
     assert deleted["deleted"] == "contact-1"
     assert client.contacts.deleted == ["contact-1"]
+
+
+def test_companion_reply_tool_uses_active_fixed_target():
+    async def scenario():
+        sent = []
+
+        async def send(chat_id, text, mode, meta):
+            sent.append((chat_id, text, mode, meta))
+
+        session = SimpleNamespace(
+            chat_id="companion:example", mode="email", _turn_active=True,
+            reply_meta={"companion": True, "reply_context": {"reply_to_message_id": "parent-one"}},
+            send_fn=send, _current_channel_tool_delivery=False,
+        )
+        token = tools_mod.CURRENT_SESSION.set(session)
+        try:
+            tools, _ = _tool_map(_FakeClient())
+            result = await tools["inkbox_reply_companion"]({"text": "Hello group"})
+            session.reply_meta["reply_context"]["reply_to_message_id"] = "parent-two"
+            assert not result.get("is_error")
+            assert sent[0][3]["reply_context"]["reply_to_message_id"] == "parent-one"
+            assert session._current_channel_tool_delivery
+            session._turn_active = False
+            assert (await tools["inkbox_reply_companion"]({"text": "Late"}))["is_error"]
+            assert len(sent) == 1
+        finally:
+            tools_mod.CURRENT_SESSION.reset(token)
+
+    asyncio.run(scenario())
 
 
 def test_a2a_tools_send_check_and_reply():
