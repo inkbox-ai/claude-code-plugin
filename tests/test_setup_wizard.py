@@ -83,6 +83,21 @@ def test_env_reads_quoted_value_from_file(tmp_path, monkeypatch):
 # ----------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("version, accepted", [
+    ("0.5.9", False), ("0.7.2", False), ("0.7.3rc1", False),
+    ("0.7.3", True), ("0.7.4", True),
+])
+def test_setup_requires_installed_companion_sdk(monkeypatch, capsys, version, accepted):
+    symbols = {"Inkbox": object()}
+    monkeypatch.setattr("importlib.metadata.version", lambda _name: version)
+    monkeypatch.setattr(setup_wizard, "_load_inkbox_symbols", lambda: symbols)
+    monkeypatch.setattr(setup_wizard, "_is_interactive_stdin", lambda: False)
+
+    assert setup_wizard._ensure_inkbox_sdk() is (symbols if accepted else None)
+    if not accepted:
+        assert "older than 0.7.3" in capsys.readouterr().out
+
+
 def test_install_command_prefers_uv_when_available(monkeypatch):
     monkeypatch.setattr(setup_wizard.sys, "executable", "/tmp/venv/bin/python")
     monkeypatch.setattr(setup_wizard.shutil, "which", lambda name: "/bin/uv" if name == "uv" else None)

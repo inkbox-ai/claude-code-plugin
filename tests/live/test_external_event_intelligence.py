@@ -102,7 +102,15 @@ def test_signed_external_event_completes_agent_turn():
     marker = f"[bridge] external-event turn done: external:live-e2e:{event_id}"
 
     status, body = _post_external_event(envelope)
-    assert status == 200 and json.loads(body).get("ok") is True, \
-        f"webhook not accepted: {status} {body!r}"
-    assert _wait_for_log(marker), \
-        f"signed external event never completed the expected agent turn: {marker}"
+    try:
+        response_ok = json.loads(body).get("ok") is True
+    except json.JSONDecodeError:
+        response_ok = False
+    accepted = status == 200 and response_ok
+    assert accepted, (
+        f"webhook not accepted (status={status})"
+    )
+    turn_completed = _wait_for_log(marker)
+    assert turn_completed, (
+        "signed external event never completed the expected agent turn"
+    )

@@ -74,7 +74,7 @@ def test_wait_for_call_pair_rejects_duplicate_aut_legs(monkeypatch):
     ]
     monkeypatch.setattr(cross.time, "sleep", lambda _seconds: None)
 
-    with pytest.raises(AssertionError, match="duplicate AUT call legs"):
+    with pytest.raises(AssertionError, match="duplicate AUT call records"):
         cross._wait_for_new_call_pair(
             SimpleNamespace(calls=_Calls([driver])),
             SimpleNamespace(calls=_Calls(aut_calls)),

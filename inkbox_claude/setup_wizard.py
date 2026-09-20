@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's other dependency (claude-agent-sdk) is checked by doctor.
-INKBOX_MIN_VERSION = (0, 5, 9)
+INKBOX_MIN_VERSION = (0, 7, 3)
 INKBOX_REQUIREMENTS = ("inkbox>=0.7.3,<1.0.0", "aiohttp>=3.9")
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
@@ -1081,7 +1081,7 @@ def _configure_voice_ai(
         "set_incoming_call_action",
     )
     if any(not callable(getattr(identity, name, None)) for name in required):
-        print_error("  Inkbox Voice AI requires Inkbox SDK 0.5.9 or newer.")
+        print_error("  Inkbox Voice AI requires Inkbox SDK 0.7.3 or newer.")
         return False, authority_identity, ""
     try:
         current = identity.get_hosted_agent_config()

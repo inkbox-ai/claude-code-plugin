@@ -698,6 +698,38 @@ def test_exclusive_owner_is_checked_before_reading_journals(harness):
     asyncio.run(scenario())
 
 
+def test_gateway_shutdown_drains_companion_and_a2a_progress(harness):
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        entered, stop_progress = asyncio.Event(), asyncio.Event()
+
+        async def receive(_client):
+            entered.set()
+            await asyncio.Event().wait()
+
+        harness.hooks.receive = receive
+        await gw._handle_webhook(Request(envelope))
+        await asyncio.wait_for(entered.wait(), 2)
+        progress = asyncio.create_task(stop_progress.wait())
+        acknowledgement = asyncio.create_task(asyncio.Event().wait())
+        gw._a2a_progress_stop_events["task-one"] = stop_progress
+        gw._a2a_progress_tasks["task-one"] = progress
+        gw._a2a_ack_tasks["task-one:message-one"] = ("task-one", acknowledgement)
+
+        await asyncio.wait_for(gw._cleanup(), 2)
+
+        assert gw._closing and gw._companion._closed
+        assert stop_progress.is_set() and progress.done()
+        assert acknowledgement.cancelled()
+        assert not gw._a2a_progress_tasks and not gw._a2a_ack_tasks
+        assert all(session._worker.done() for session in gw.sessions.sessions.values())
+        assert len(harness.queries) == 1
+        assert not harness.outputs
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("stage", ["initialization", "live", "ordinary", "connect"])
 def test_transient_failure_recovers_without_another_receipt(harness, monkeypatch, stage):
     async def scenario():

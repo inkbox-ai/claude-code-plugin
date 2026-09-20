@@ -49,10 +49,10 @@ def test_wait_for_two_way_call_fails_immediately_on_canceled_leg():
     message = str(exc.value)
     assert "status='canceled'" in message
     assert "hangup_reason='remote'" in message
-    assert "is_blocked=False" in message
+    assert " reason=" not in message
 
 
-def test_wait_for_two_way_call_returns_remote_speech_when_both_parties_spoke():
+def test_wait_for_two_way_call_returns_aut_local_speech_when_both_parties_spoke():
     voice = _load_live_voice_module()
     segments = [
         SimpleNamespace(party="remote", text="hello"),
@@ -63,7 +63,22 @@ def test_wait_for_two_way_call_returns_remote_speech_when_both_parties_spoke():
         transcripts=segments,
     ))
 
-    assert voice._wait_for_two_way_call(remote, "unused-number-id", "call-id") == "hello"
+    assert voice._wait_for_two_way_call(remote, "unused-number-id", "call-id") == "hi back"
+
+
+def test_driver_leg_requires_only_driver_local_speech():
+    voice = _load_live_voice_module()
+    remote = SimpleNamespace(calls=_Calls(
+        call=SimpleNamespace(status="answered"),
+        transcripts=[SimpleNamespace(party="local", text="scripted caller line")],
+    ))
+
+    assert voice._wait_for_driver_local_speech(
+        remote,
+        "unused-number-id",
+        "call-id",
+        deadline=time.monotonic() + 1,
+    ) == "scripted caller line"
 
 
 def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unavailable():
@@ -83,7 +98,7 @@ def test_wait_for_two_way_call_checks_terminal_state_while_transcripts_are_unava
     assert "status='failed'" in str(exc.value)
 
 
-def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
+def test_wait_for_persisted_hosted_request_requires_both_transcripts_and_action():
     voice = _load_live_voice_module()
     marker = "victor echo juliet"
     remote = SimpleNamespace(calls=_Calls(
@@ -102,7 +117,10 @@ def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
             "action": "send_sms",
             "details": f"Send {marker} to the caller.",
         }]),
-        transcripts=[],
+        transcripts=[SimpleNamespace(
+            party="remote",
+            text=f"After this call ends, send one SMS containing {marker}.",
+        )],
     ))
 
     assert voice._wait_for_persisted_hosted_request(
@@ -114,3 +132,33 @@ def test_wait_for_persisted_hosted_request_requires_transcript_and_action():
         marker,
         deadline=time.monotonic() + 1,
     ) is None
+
+
+def test_wait_for_persisted_hosted_request_requires_aut_transcript(monkeypatch):
+    voice = _load_live_voice_module()
+    marker = "victor echo juliet"
+    transcript = [SimpleNamespace(
+        party="local",
+        text=f"After this call ends, send one SMS containing {marker}.",
+    )]
+    remote = SimpleNamespace(calls=_Calls(call=SimpleNamespace(), transcripts=transcript))
+    aut = SimpleNamespace(calls=_Calls(
+        call=SimpleNamespace(post_call_action_items=[{
+            "status": "open",
+            "action": "send_sms",
+            "details": f"Send {marker} to the caller.",
+        }]),
+        transcripts=[],
+    ))
+    monkeypatch.setattr(voice, "POLL_EVERY_S", 0)
+
+    with pytest.raises(pytest.fail.Exception, match="aut_transcript_ready=False"):
+        voice._wait_for_persisted_hosted_request(
+            remote,
+            "unused-number-id",
+            "driver-call-id",
+            aut,
+            "aut-call-id",
+            marker,
+            deadline=time.monotonic() + 0.01,
+        )

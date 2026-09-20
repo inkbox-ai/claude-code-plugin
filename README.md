@@ -173,6 +173,8 @@ Claude Code never silently runs anything destructive. The bridge passes a `can_u
 
 Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Claude session ids are persisted in `~/.inkbox-claude/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Claude finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
+**A2A worker progress.** Inbound A2A tasks receive an immediate pickup acknowledgement, followed by short progress updates about every three minutes until the task settles. Set `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` to change the cadence or `0` to disable periodic updates.
+
 **Typing indicator.** While Claude works on a turn, the bridge keeps a typing indicator alive on your iMessage thread (refreshed every few seconds, since it expires) so you can see it's busy. SMS, email, and voice have no typing indicator, so this is iMessage-only.
 
 **Delivery failures.** An outbound message can die two ways, and the bridge feeds both into one delivery-failure loop. It can be **rejected at send time** — the server's content policy blocks it (markdown artifacts, emoji overload), the recipient has opted out, the address is bad, or the body is too long — which comes back as an error on the send call. Or it can be **accepted and then fail downstream** — a carrier filters the SMS, an iMessage is declined, an email bounces — which Inkbox reports asynchronously (`text.delivery_failed`/`text.delivery_unconfirmed`, `imessage.delivery_failed`, `message.bounced`/`message.failed`). Either way the bridge wakes the affected contact's session to tell Claude *which* message didn't land and *why*, so it can fix and resend or reach you another way using its Inkbox tools. The wake-up runs as a side-effect turn — Claude acts via tools rather than replying on the channel that just failed. Sends are **hard-capped at three per logical reply** with the budget shared across both surfaces (keyed by conversation/recipient): after that the thread goes quiet with a loud log line instead of looping. The budget resets on a fresh inbound, a delivered receipt, or a 30-minute TTL, and repeat webhooks for the same message are de-duplicated. Transient (5xx) send failures are excluded — a bare resend clears those.
@@ -236,7 +238,7 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 
 ## Companion mode
 
-Version 0.2.11 supports Companion mode with Inkbox SDK 0.7.3 or newer. It stays
+Version 0.2.13 supports Companion mode with Inkbox SDK 0.7.3 or newer. It stays
 off until an administrator enables it for the identity and selects a sponsor.
 Use an agent-scoped API key. A sponsor's qualifying group message initializes
 one separate Claude conversation with all available authorized history and the
@@ -298,6 +300,7 @@ approvals can only be answered by that turn's normally allowed sender.
 | `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised/unverified external webhooks (see [External webhooks](#external-webhooks)). |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Include matched-contact memories as background context for human conversations and calls. |
 | `INKBOX_COMPANION_MAX_BYTES` | no | `200000` | Maximum bytes for Companion snapshot loading and one assembled input. |
+| `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between short progress updates for active inbound A2A tasks; `0` disables periodic updates. |
 | `INKBOX_WEBHOOK_SECRET_<NAME>` | per source | - | Verification secret for a registered third-party webhook source (e.g. `INKBOX_WEBHOOK_SECRET_GITHUB`). |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
 | `INKBOX_PUBLIC_URL` | no | - | Public bridge URL. Omit to use an Inkbox tunnel. |
@@ -402,3 +405,11 @@ python -m pytest
 - **Contact-keyed sessions**: webhook payloads carry resolved contacts; a single resolved contact id becomes the session key, otherwise the raw address/number does. One human, one session, every channel.
 - **Escalation over the active channel**: a pending permission/poll captures the contact's next inbound message as its answer, on whichever text channel they're using.
 - **Claude Agent SDK**: each session is one `ClaudeSDKClient` (its own Claude Code subprocess) with the `claude_code` system-prompt preset plus a messaging channel prompt appended, `can_use_tool` for escalation, and an in-process MCP server for the Inkbox tools.
+
+### HD realtime voice
+
+Realtime calls request 16 kHz mono PCM16 call audio. The bridge continuously
+resamples to and from the realtime session's 24 kHz PCM format, preserving audio
+across WebSocket frame boundaries. Older call streams that advertise 8 kHz μ-law
+(or omit their audio descriptor) remain supported. Call audio quality also depends
+on the remote connection. Hosted voice and managed speech modes are unchanged.

@@ -6,12 +6,14 @@ def test_read_config_defaults(monkeypatch):
         "INKBOX_API_KEY", "INKBOX_IDENTITY", "INKBOX_ALLOW_ALL_USERS",
         "INKBOX_ALLOWED_USERS", "INKBOX_AUTO_ALLOWED_TOOLS", "INKBOX_BASE_URL",
         "INKBOX_CONTACT_MEMORIES_ENABLED",
+        "INKBOX_A2A_PROGRESS_INTERVAL_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
     cfg = read_config()
     assert cfg.base_url == ""
     assert cfg.require_signature is True
     assert cfg.contact_memories_enabled is True
+    assert cfg.a2a_progress_interval_seconds == 180
     assert "Read" in cfg.auto_allowed_tools
     assert "Bash" not in cfg.auto_allowed_tools
 
@@ -32,6 +34,11 @@ def test_read_config_env(monkeypatch):
 def test_contact_memories_can_be_disabled(monkeypatch):
     monkeypatch.setenv("INKBOX_CONTACT_MEMORIES_ENABLED", "false")
     assert read_config().contact_memories_enabled is False
+
+
+def test_a2a_progress_interval_can_be_configured(monkeypatch):
+    monkeypatch.setenv("INKBOX_A2A_PROGRESS_INTERVAL_SECONDS", "60")
+    assert read_config().a2a_progress_interval_seconds == 60
 
 
 def _clear_realtime_env(monkeypatch):

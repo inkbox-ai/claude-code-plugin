@@ -132,7 +132,10 @@ def _ask(
             body = getattr(remote.messages.get(remote_email, msg.id), "body_text", "") or ""
             lowered = body.lower()
             bad = [m for m in ERROR_MARKERS if m in lowered]
-            assert not bad, f"reply is an error, not a real answer: {bad}\n{body[:300]}"
+            assert not bad, (
+                "reply is an error, not a real answer "
+                f"(matched_error_count={len(bad)})"
+            )
             candidates.append(body)
             # Without a content predicate, preserve the original strict
             # request/reply correlation. Predicate-based intelligence checks
@@ -140,10 +143,9 @@ def _ask(
             if (accept is None and _is_reply(msg)) or (accept is not None and accept(lowered)):
                 return lowered
         time.sleep(POLL_EVERY_S)
-    previews = "\n---\n".join(body[:500] for body in candidates) or "(none)"
     pytest.fail(
-        f"no acceptable reply within {TIMEOUT_S:.0f}s to: {question!r}\n"
-        f"new emails from AUT:\n{previews}"
+        f"no acceptable reply within {TIMEOUT_S:.0f}s "
+        f"(candidate_count={len(candidates)})"
     )
 
 
@@ -185,11 +187,14 @@ def test_reports_own_identity(ctx):
             and _phone_present(aut_phone, candidate)
         ),
     )
-    assert handle in body, f"reply missing handle {handle!r}\n{body[:400]}"
-    assert aut_email in body, f"reply missing email {aut_email!r}\n{body[:400]}"
+    has_handle = handle in body
+    has_email = aut_email in body
+    assert has_handle, "reply missing the expected handle"
+    assert has_email, "reply missing the expected email"
     # Accept a privacy-masked phone (the model self-redacts the middle digits
     # in formal listings) as well as full.
-    assert _phone_present(aut_phone, body), f"reply missing phone {aut_phone!r}\n{body[:400]}"
+    has_phone = _phone_present(aut_phone, body)
+    assert has_phone, "reply missing the expected phone"
 
 
 def test_reports_sender_details(ctx):
@@ -229,12 +234,18 @@ def test_reports_sender_details(ctx):
         ),
     )
     if name:
-        assert name.lower() in body, f"reply missing sender name {name!r}\n{body[:400]}"
-    assert any(e.lower() in body for e in emails), f"reply missing sender email {emails}\n{body[:400]}"
+        has_name = name.lower() in body
+        assert has_name, "reply missing the expected sender name"
+    has_email = any(e.lower() in body for e in emails)
+    assert has_email, (
+        "reply missing an expected sender email"
+    )
     if phones:
         # Accept full or privacy-masked (see _phone_present).
-        assert any(_phone_present(p, body) for p in phones), \
-            f"reply missing sender phone {phones}\n{body[:400]}"
+        has_phone = any(_phone_present(p, body) for p in phones)
+        assert has_phone, (
+            "reply missing an expected sender phone"
+        )
 
 
 def test_aware_of_inkbox_tools(ctx):
@@ -259,9 +270,15 @@ def test_aware_of_inkbox_tools(ctx):
         accept=lambda candidate: all(t.lower() in candidate for t in contact_tools),
     )
     hits = [t for t in tool_names if t.lower() in body]
-    assert len(hits) >= 3, f"agent named only {hits} of its tools {tool_names}\n{body[:500]}"
+    assert len(hits) >= 3, (
+        f"agent named too few tools (matched_count={len(hits)} "
+        f"available_count={len(tool_names)})"
+    )
     missing_contacts = sorted(t for t in contact_tools if t.lower() not in body)
-    assert not missing_contacts, f"agent did not name contact tools {missing_contacts}\n{body[:500]}"
+    assert not missing_contacts, (
+        "agent did not name every required contact tool "
+        f"(missing_count={len(missing_contacts)})"
+    )
 
 
 def _contacts_by_email(client, email: str):
@@ -299,9 +316,9 @@ def test_contact_crud_tool_use(ctx):
         )
         assert "created" in created and nonce in created, created[:500]
         matches = _contacts_by_email(aut, contact_email)
-        assert matches, f"agent said it created {contact_email}, but lookup found nothing"
+        assert matches, "agent reported contact creation but lookup found nothing"
         contact_id = str(getattr(matches[0], "id", "") or "")
-        assert contact_id, f"created contact has no id: {matches[0]!r}"
+        assert contact_id, "created contact has no persisted identifier"
 
         updated = _ask(
             ctx["remote"],
@@ -323,6 +340,7 @@ def test_contact_crud_tool_use(ctx):
             f"to delete contactId {contact_id}. After the tool succeeds, reply exactly: DELETED {nonce}",
         )
         assert "deleted" in deleted and nonce in deleted, deleted[:500]
-        assert not _contacts_by_email(aut, contact_email)
+        contact_removed = not _contacts_by_email(aut, contact_email)
+        assert contact_removed, "deleted contact remained visible"
     finally:
         _delete_contacts_by_email(aut, contact_email)

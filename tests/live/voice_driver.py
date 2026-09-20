@@ -43,19 +43,44 @@ API_KEY = os.environ["REMOTE_INKBOX_API_KEY"]
 BASE_URL = os.environ.get("INKBOX_BASE_URL", "https://inkbox.ai")
 PORT = int(os.environ.get("VOICE_DRIVER_PORT", "8090"))
 STATE_FILE = os.environ.get("VOICE_DRIVER_STATE", "/tmp/voice_driver_state.json")
-LINE = os.environ.get(
-    "VOICE_DRIVER_LINE",
-    "Hi, this is a quick test call. Please reply out loud with one short sentence, then say goodbye.",
+LINE_FILE = os.environ.get("VOICE_DRIVER_LINE_FILE", "")
+LINE = (
+    Path(LINE_FILE).read_text(encoding="utf-8").strip()
+    if LINE_FILE
+    else os.environ.get(
+        "VOICE_DRIVER_LINE",
+        "Hi, this is a quick test call. Please reply out loud with one short sentence, then say goodbye.",
+    )
 )
 # Answering-machine detection scores whoever answers: a greeting longer than the
 # carrier's `greeting_duration_millis` (3.5s) reads as a voicemail announcement
 # and the call is hung up before the agent ever speaks. Answer the way a person
 # does - one word, then silence - and hold the prompt until that window closes.
 GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
+# Delay before the first ask. A greeting arrives as several final transcripts
+# 1.5-5s apart, so no silence threshold tells "between greeting sentences" from
+# "greeting over" — the first ask is simply allowed to land wherever it lands, and
+# _run_turn re-asks once the agent is actually idle.
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
 # Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
 # must send an explicit stop or the leg lingers until the server max-duration cap.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
+# Re-ask the question this often while the agent is idle. An ask the greeting
+# talked over is otherwise never repeated and the call idles out with the agent
+# still waiting for a request. 0 disables re-asking.
+REASK_EVERY_S = float(os.environ.get("VOICE_DRIVER_REASK", "20"))
+# Never re-ask until the agent has been silent this long, so a reply or a tool
+# round-trip in progress is never talked over.
+QUIET_GAP_S = float(os.environ.get("VOICE_DRIVER_QUIET_GAP", "6"))
+MAX_REASKS = int(os.environ.get("VOICE_DRIVER_MAX_REASKS", "2"))
+# The agent saying this back means the question landed; stop re-asking so a
+# question that already took effect never turns into a second one.
+ANSWER_CONTAINS = os.environ.get("VOICE_DRIVER_ANSWER_CONTAINS", "")
+
+
+def _speech_key(text: str) -> str:
+    """Compare speech ignoring ASR casing, spacing and punctuation."""
+    return "".join(char for char in text.casefold() if char.isalnum())
 
 app = FastAPI()
 
@@ -76,7 +101,10 @@ async def phone_media_ws(ws: WebSocket) -> None:
         (b"x-use-inkbox-speech-to-text", b"true"),
     ])
     log.info("call WS accepted")
-    spoke = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    answered = asyncio.Event()        # agent said the expected answer back
+    state = {"last_heard": 0.0}       # monotonic ts of the agent's most recent turn
+    answer_key = _speech_key(ANSWER_CONTAINS)
     convo: asyncio.Task | None = None
 
     async def _say(text: str) -> None:
@@ -84,18 +112,32 @@ async def phone_media_ws(ws: WebSocket) -> None:
         await ws.send_text(json.dumps({"event": "text", "done": True}))
         log.info("spoke: %s", text)
 
-    async def _speak(text: str) -> None:
-        if spoke.is_set():
-            return
-        spoke.set()
-        await _say(text)
-
     async def _run_turn() -> None:
         # Speak one line, give the agent a turn, then hang up so the call ends fast.
         await _say(GREETING)
         await asyncio.sleep(SPEAK_AFTER_S)
-        await _speak(LINE)
-        await asyncio.sleep(LISTEN_S)
+        await _say(LINE)
+        asked_at = loop.time()
+        state["last_heard"] = asked_at
+        # Re-ask if the agent never got the question: the greeting routinely runs
+        # several seconds past our first ask, and a lost ask leaves the agent
+        # waiting while the call idles out. Re-ask ONLY once the agent has gone
+        # quiet and has not already answered, so neither an in-progress reply nor
+        # a question that already landed is spoken over or repeated.
+        started = loop.time()
+        reasks = 0
+        while loop.time() - started < LISTEN_S:
+            await asyncio.sleep(1.0)
+            if (
+                REASK_EVERY_S > 0
+                and not answered.is_set()
+                and reasks < MAX_REASKS
+                and loop.time() - asked_at >= REASK_EVERY_S
+                and loop.time() - state["last_heard"] >= QUIET_GAP_S
+            ):
+                await _say(LINE)
+                asked_at = loop.time()
+                reasks += 1
         try:
             await ws.send_text(json.dumps({"event": "stop"}))
             log.info("sent stop (hangup)")
@@ -111,8 +153,11 @@ async def phone_media_ws(ws: WebSocket) -> None:
                 log.info("call start: %s", ev.get("stream_id"))
                 convo = asyncio.create_task(_run_turn())
             elif kind == "transcript" and ev.get("is_final"):
-                log.info("heard (final): %s", ev.get("text"))
-                await _speak(LINE)  # speak now if the greeting beat our timer
+                text = ev.get("text") or ""
+                log.info("heard (final): %s", text)
+                state["last_heard"] = loop.time()  # agent is actively talking
+                if answer_key and answer_key in _speech_key(text):
+                    answered.set()
             elif kind == "stop":
                 log.info("call stop: %s", ev.get("reason"))
                 break
