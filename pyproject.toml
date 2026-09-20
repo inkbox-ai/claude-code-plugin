@@ -14,6 +14,9 @@ dependencies = [
 [project.scripts]
 inkbox-claude = "inkbox_claude.cli:main"
 
+[tool.uv.sources]
+inkbox = { git = "https://github.com/inkbox-ai/inkbox", rev = "449966c885208d41f995d09c54072e012df9eb1a", subdirectory = "sdk/python" }
+
 [tool.setuptools.packages.find]
 include = ["inkbox_claude*"]
 

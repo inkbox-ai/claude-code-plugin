@@ -395,6 +395,12 @@ On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent
 
 ## Development
 
+Development installs and PR checks use SDK 0.7.3 from the public
+[`inkbox` source at `449966c885208d41f995d09c54072e012df9eb1a`](https://github.com/inkbox-ai/inkbox/tree/449966c885208d41f995d09c54072e012df9eb1a/sdk/python).
+The uv source override and lockfile pin that revision; CI builds its wheel before
+installing it alongside the bridge. This validates a source build, not a registry
+release. The package requirement remains `inkbox>=0.7.3,<1.0.0`.
+
 ```bash
 python -m pytest
 ```

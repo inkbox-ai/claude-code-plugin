@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  INKBOX_SDK_REV: 449966c885208d41f995d09c54072e012df9eb1a
+
 jobs:
   # Offline tests exercise SDK pagination with a mocked transport.
   unit:
@@ -25,8 +28,16 @@ jobs:
         with:
           version: "latest"
 
+      - name: Build pinned Inkbox SDK wheel
+        run: |
+          git init "$RUNNER_TEMP/inkbox-sdk"
+          git -C "$RUNNER_TEMP/inkbox-sdk" fetch --depth=1 https://github.com/inkbox-ai/inkbox "$INKBOX_SDK_REV"
+          git -C "$RUNNER_TEMP/inkbox-sdk" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/inkbox-sdk" rev-parse HEAD)" = "$INKBOX_SDK_REV"
+          uv build --wheel --out-dir "$RUNNER_TEMP/inkbox-sdk-wheel" "$RUNNER_TEMP/inkbox-sdk/sdk/python"
+
       - name: Install test deps
-        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox==0.7.3"
+        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "$RUNNER_TEMP/inkbox-sdk-wheel/inkbox-0.7.3-py3-none-any.whl"
 
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.
@@ -55,10 +66,18 @@ jobs:
         with:
           node-version: 22
 
+      - name: Build pinned Inkbox SDK wheel
+        run: |
+          git init "$RUNNER_TEMP/inkbox-sdk"
+          git -C "$RUNNER_TEMP/inkbox-sdk" fetch --depth=1 https://github.com/inkbox-ai/inkbox "$INKBOX_SDK_REV"
+          git -C "$RUNNER_TEMP/inkbox-sdk" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/inkbox-sdk" rev-parse HEAD)" = "$INKBOX_SDK_REV"
+          uv build --wheel --out-dir "$RUNNER_TEMP/inkbox-sdk-wheel" "$RUNNER_TEMP/inkbox-sdk/sdk/python"
+
       - name: Install bridge + latest SDK
         run: |
           tests/ci/retry_install.sh uv pip install --system \
-            "inkbox==0.7.3" \
+            "$RUNNER_TEMP/inkbox-sdk-wheel/inkbox-0.7.3-py3-none-any.whl" \
             -e . pytest
           tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 
