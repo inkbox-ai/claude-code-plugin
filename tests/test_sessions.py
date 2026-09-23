@@ -1120,3 +1120,20 @@ def test_double_text_interrupts_running_turn():
         session._worker.cancel()
 
     asyncio.run(scenario())
+
+
+def test_send_failure_log_omits_recipient_and_provider_detail(caplog):
+    async def scenario():
+        session = make_session([])
+        session.chat_id = "private-recipient@example.com"
+
+        async def fail(*_args):
+            raise RuntimeError("provider echoed private message body and credential")
+
+        session.send_fn = fail
+        await session._deliver_reply(_Turn(text="input"), "private reply")
+
+    asyncio.run(scenario())
+    assert "RuntimeError" in caplog.text
+    assert "private" not in caplog.text
+    assert "credential" not in caplog.text

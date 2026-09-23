@@ -1306,3 +1306,23 @@ def test_delivery_failure_storage_error_is_not_acknowledged_or_routed(harness, m
         await gw._cleanup()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error,status", [(ValueError, 400), (PermissionError, 403), (RuntimeError, 503)])
+def test_companion_http_errors_do_not_expose_exception_details(harness, monkeypatch, error, status):
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        receiver = gw._companion_receiver()
+
+        def fail(_envelope):
+            raise error("private database path and request credentials")
+
+        monkeypatch.setattr(receiver, "accept", fail)
+        response = await gw._handle_webhook(Request(envelope))
+        assert response.status == status
+        assert "private" not in response.text
+        assert "credentials" not in response.text
+        await gw._cleanup()
+
+    asyncio.run(scenario())

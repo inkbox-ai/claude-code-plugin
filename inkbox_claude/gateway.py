@@ -1763,8 +1763,8 @@ class InkboxGateway:
                     return web.Response(status=401, text="Companion events require a valid signature")
                 try:
                     self._companion.record_delivery_failure(envelope, failure_scopes)
-                except RuntimeError as exc:
-                    return web.Response(status=503, text=str(exc))
+                except RuntimeError:
+                    return web.Response(status=503, text="Companion delivery receipt is unavailable")
                 return web.json_response({"ok": True, "companion": "delivery_failed"})
 
         data = envelope.get("data")
@@ -1780,12 +1780,12 @@ class InkboxGateway:
                 return web.Response(status=503, text="Companion receiver is starting")
             try:
                 result = self._companion_receiver().accept(envelope)
-            except ValueError as exc:
-                return web.Response(status=400, text=str(exc))
-            except PermissionError as exc:
-                return web.Response(status=403, text=str(exc))
-            except RuntimeError as exc:
-                return web.Response(status=503, text=str(exc))
+            except ValueError:
+                return web.Response(status=400, text="Invalid Companion event")
+            except PermissionError:
+                return web.Response(status=403, text="Companion event is not permitted")
+            except RuntimeError:
+                return web.Response(status=503, text="Companion receiver is temporarily unavailable")
             return web.json_response(result)
 
         request_id = request.headers.get("X-Inkbox-Request-Id", "")

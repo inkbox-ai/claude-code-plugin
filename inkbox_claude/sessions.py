@@ -1046,7 +1046,7 @@ class ContactSession:
         try:
             await self.send_fn(self.chat_id, reply, mode, meta)
         except Exception as exc:
-            logger.warning("[session %s] reply send rejected: %s", self.chat_id, _send_error_reason(exc))
+            logger.warning("Reply send rejected (%s)", type(exc).__name__)
             if self.on_send_rejected is not None:
                 await self.on_send_rejected(self.chat_id, mode, meta, reply, exc)
 
