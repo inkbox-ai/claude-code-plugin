@@ -214,6 +214,10 @@ class CompanionReceiver:
                 raise RuntimeError("Companion identity already has an active owner") from None
             self.records = {}
             self.quarantined = {path.stem for path in self.root.glob("*.invalid")}
+            self.quarantined_routes = {
+                key: self.quarantined_route(self.root / f"{key}.invalid")
+                for key in self.quarantined
+            }
             for path in self.root.glob("*.json"):
                 key = path.stem
                 if key in self.quarantined:
@@ -231,6 +235,9 @@ class CompanionReceiver:
                     finally:
                         os.close(directory)
                     self.quarantined.add(key)
+                    self.quarantined_routes[key] = self.quarantined_route(
+                        path.with_suffix(".invalid")
+                    )
                     logger.error("Companion checkpoint quarantined; its scope is paused: %s", key)
                     continue
                 self.records[key] = record
@@ -250,6 +257,18 @@ class CompanionReceiver:
         """Address a journal by its complete authority scope."""
         parts = [self.owner, *(scope.get(name) for name in SCOPE_FIELDS)]
         return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
+
+    def quarantined_route(self, path: Path) -> tuple[str, str] | None:
+        """Recover only routing that still matches the reserved checkpoint key."""
+        try:
+            scope = json.loads(path.read_text())["scope"]
+            channel, conversation = scope["channel"], scope["conversation_id"]
+            require_uuid(conversation)
+            if channel in MODES and self.scope_key(scope) == path.stem:
+                return channel, conversation
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
+        return None
 
     def validate_record(self, key: str, record: dict) -> None:
         """Reject inconsistent persisted routing before starting any worker."""
@@ -425,6 +444,8 @@ class CompanionReceiver:
             "outbound",
         }:
             return []
+        # Unknown corrupt routing cannot safely fall through to contact recovery.
+        unknown = [key for key, route in self.quarantined_routes.items() if route is None]
         conversation = (
             message.get("thread_id")
             if channel == "mail"
@@ -433,8 +454,11 @@ class CompanionReceiver:
         try:
             conversation = str(UUID(str(conversation)))
         except ValueError:
-            return []
-        return [
+            return unknown
+        return unknown + [
+            key for key, route in self.quarantined_routes.items()
+            if route == (channel, conversation)
+        ] + [
             key
             for key, record in self.records.items()
             if record["scope"]["channel"] == channel
@@ -445,6 +469,8 @@ class CompanionReceiver:
         """Persist an authenticated scoped diagnostic without scheduling a turn."""
         if self._closing or self._closed or self.failed_write:
             raise RuntimeError("Companion checkpoint storage is unavailable")
+        if any(key in self.quarantined for key in keys):
+            raise RuntimeError("Companion delivery checkpoint is invalid")
         channel = FAILURE_CHANNELS[envelope["event_type"]]
         message = envelope["data"]["text_message" if channel == "phone" else "message"]
         message_id = message.get("id")

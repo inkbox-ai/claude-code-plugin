@@ -1231,6 +1231,55 @@ def test_delivery_failure_stays_scoped_without_private_routing_after_restart(
 
 
 @pytest.mark.parametrize("channel", ["mail", "phone", "imessage"])
+@pytest.mark.parametrize("corruption", ["event-state", "unreadable", "routing-mismatch"])
+def test_quarantined_delivery_failure_never_wakes_private_recovery(
+    harness, monkeypatch, channel, corruption
+):
+    async def scenario():
+        envelope, pages = fixture(channel)
+        gw, _ = harness.build(pages)
+        harness.hooks.reply = "Initial group response"
+        await gw._handle_webhook(Request(envelope))
+        await drained(gw)
+        path = next(gw._companion.root.glob("*.json"))
+        await gw._cleanup()
+        record = json.loads(path.read_text())
+        if corruption == "event-state":
+            record["events"][uid(12)]["state"] = "invalid"
+        elif corruption == "routing-mismatch":
+            record["scope"]["conversation_id"] = uid(99)
+        original = "{broken json" if corruption == "unreadable" else json.dumps(record)
+        path.write_text(original)
+
+        def forbidden(*_args, **_kwargs):
+            pytest.fail("Quarantined delivery failure reached private recovery")
+
+        for _ in range(2):
+            restarted, _ = harness.build(pages)
+            restored = restarted._companion_receiver()
+            for name in ("_chat_key", "_note_outbound_delivery_failure"):
+                monkeypatch.setattr(restarted, name, forbidden)
+            monkeypatch.setattr(restarted.sessions, "get", forbidden)
+            failure = delivery_failure(channel)
+            assert (await restarted._handle_webhook(Request(failure))).status == 503
+            unrelated = delivery_failure(channel, conversation=98)
+            other_channel = "phone" if channel == "mail" else "mail"
+            for other in (unrelated, delivery_failure(other_channel)):
+                if corruption == "event-state":
+                    assert restored.delivery_failure_scopes(other) == []
+                else:
+                    assert (await restarted._handle_webhook(Request(other))).status == 503
+            assert path.with_suffix(".invalid").read_text() == original
+            assert not path.exists()
+            assert len(harness.queries) == 1
+            assert len(harness.outputs) == 1
+            assert not restarted.sessions.sessions
+            await restarted._cleanup()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("channel", ["mail", "phone", "imessage"])
 @pytest.mark.parametrize("case", ["mode-off", "unknown-conversation", "different-channel"])
 def test_unknown_delivery_failure_keeps_ordinary_routing(harness, monkeypatch, channel, case):
     async def scenario():
