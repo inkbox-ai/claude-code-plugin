@@ -28,6 +28,7 @@
   own scope; unsigned Companion envelopes never enter ordinary routing.
 - Startup failures preserve selected sessions; closing during startup cannot
   resurrect a stale client. Early completed results retain their output.
+- Partial contact edits no longer require email or phone identifier fields.
 
 ### Changed
 

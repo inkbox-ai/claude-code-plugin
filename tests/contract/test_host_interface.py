@@ -95,6 +95,34 @@ def test_inkbox_mcp_server_builds_against_installed_sdk():
     assert expected <= set(tool_names)
 
 
+@pytest.mark.parametrize("field,value", [("notes", "Updated note"), ("given_name", "Ada")])
+def test_contact_update_accepts_partial_fields_through_real_mcp_schema(field, value):
+    import asyncio
+    from mcp.types import CallToolRequest, ListToolsRequest
+    from inkbox_claude.tools import build_inkbox_mcp_server
+
+    async def scenario():
+        client = MagicMock()
+        client.contacts.update.return_value = {"id": "contact-1", field: value}
+        config, _ = build_inkbox_mcp_server(client, "contract-test")
+        server = config["instance"]
+        listed = await server.request_handlers[ListToolsRequest](
+            ListToolsRequest(method="tools/list")
+        )
+        update = next(tool for tool in listed.root.tools if tool.name == "inkbox_update_contact")
+        assert update.inputSchema["required"] == ["contact_id"]
+        result = await server.request_handlers[CallToolRequest](
+            CallToolRequest(method="tools/call", params={
+                "name": "inkbox_update_contact",
+                "arguments": {"contact_id": "contact-1", field: value},
+            })
+        )
+        assert not result.root.isError, result.root.content
+        client.contacts.update.assert_called_once_with("contact-1", **{field: value})
+
+    asyncio.run(scenario())
+
+
 def test_claude_cli_installed_and_answers_version():
     """The SDK drives a ``claude`` subprocess; the CLI must be present and sane."""
     claude = shutil.which("claude")

@@ -882,10 +882,23 @@ def build_inkbox_mcp_server(
         "inkbox_update_contact",
         "Update an existing contact by id (look it up first). Only the fields "
         "you pass change; emails / phones replace the whole list (strings, first "
-        "is primary).",
-        {"contact_id": str, "given_name": str, "family_name": str,
-         "preferred_name": str, "company_name": str, "job_title": str,
-         "notes": str, "emails": list, "phones": list},
+        "is primary). Omit email and phone lists when changing only names or notes.",
+        {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "string"},
+                "given_name": {"type": "string"},
+                "family_name": {"type": "string"},
+                "preferred_name": {"type": "string"},
+                "company_name": {"type": "string"},
+                "job_title": {"type": "string"},
+                "notes": {"type": "string"},
+                "emails": {"type": "array", "items": {"type": "string"}},
+                "phones": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["contact_id"],
+            "additionalProperties": False,
+        },
     )
     async def inkbox_update_contact(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
