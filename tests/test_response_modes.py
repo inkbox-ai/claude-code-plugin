@@ -260,3 +260,75 @@ def test_invalid_response_modes_fail_clearly(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=name):
         read_config()
+
+
+def test_later_receipt_for_snapshot_source_is_not_a_new_model_turn(harness):
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        await gw._handle_webhook(Request(envelope))
+        await drained(gw)
+        historical = event({**envelope["companion"], "phase": "live", "sequence": 2}, "fred@example.com", 10, "/clear")
+        await gw._handle_webhook(Request(historical))
+        await drained(gw)
+        assert len(harness.queries) == 1
+        assert next(iter(gw.sessions.sessions.values())).resume_session_id == "host-0"
+        await gw._cleanup()
+    asyncio.run(scenario())
+
+
+def test_companion_live_approval_belongs_to_waking_sender_not_initial_sponsor(harness):
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages, permission_timeout_s=0.1)
+        await gw._handle_webhook(Request(envelope))
+        await drained(gw)
+        waiting, decisions = asyncio.Event(), []
+        async def receive(_client):
+            if len(harness.queries) == 2:
+                session = next(iter(gw.sessions.sessions.values()))
+                task = asyncio.create_task(session._escalate("permission", "Approve?"))
+                while session.pending is None:
+                    await asyncio.sleep(0)
+                waiting.set()
+                decisions.append(await task)
+        harness.hooks.receive = receive
+        scope = {**envelope["companion"], "phase": "live", "sequence": 2}
+        await gw._handle_webhook(Request(event(scope, "fred@example.com", 13, "Help me")))
+        await waiting.wait()
+        session = next(iter(gw.sessions.sessions.values()))
+        assert session.pending.sender == "fred@example.com"
+        await gw._handle_webhook(Request(event({**scope, "sequence": 3}, "owner@example.com", 14, "allow")))
+        await asyncio.gather(*list(gw._companion.approval_jobs))
+        assert not session.pending.future.done()
+        await gw._handle_webhook(Request(event({**scope, "sequence": 4}, "FRED@EXAMPLE.COM", 15, "allow")))
+        await drained(gw)
+        assert decisions == ["allow"]
+        await gw._cleanup()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("access,text,sender,controlled", [
+    ("direct", "@agent /status", "OWNER@EXAMPLE.COM", True),
+    ("direct", "/status", "owner@example.com", False),
+    ("sponsored", "@agent /status", "owner@example.com", False),
+    ("direct", "@agent /status", "fred@example.com", False),
+])
+def test_companion_sponsor_controls_obey_current_gates(harness, access, text, sender, controlled):
+    async def scenario():
+        envelope, pages = fixture()
+        envelope["data"]["message"]["body"] = "@agent begin"
+        gw, _ = harness.build(pages, group_reply_mode="mention")
+        await gw._handle_webhook(Request(envelope))
+        await drained(gw)
+        scope = {**envelope["companion"], "phase": "live", "sequence": 2}
+        current = event(scope, sender, 13, text)
+        current["data"]["message"]["sender_access"] = access
+        await gw._handle_webhook(Request(current))
+        record = (await drained(gw))[0]
+        assert record["state"] == "initialized"
+        assert bool(harness.outputs) is controlled
+        if controlled:
+            assert "idle" in harness.outputs[0][2]["body_text"]
+        await gw._cleanup()
+    asyncio.run(scenario())

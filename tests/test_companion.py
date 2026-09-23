@@ -825,12 +825,16 @@ def test_admitted_turn_uses_saved_route_without_reloading_access(
         harness.hooks.receive = receive
         await gw._handle_webhook(Request(envelope))
         record = (await drained(gw))[0]
-        assert record["state"] == "initialized"
         assert len(transport.calls) == 3
-        assert len(harness.outputs) == 1
+        if revocation == "sponsor":
+            assert record["state"] == "failed"
+            assert record["revoked"] and not harness.outputs
+        else:
+            assert record["state"] == "initialized"
+            assert len(harness.outputs) == 1
         assert len(harness.queries) == 1
         if delivery == "tool":
-            assert not tool_results[0].get("is_error")
+            assert bool(tool_results[0].get("is_error")) is (revocation == "sponsor")
         await gw._handle_webhook(Request(envelope))
         await drained(gw)
         assert len(harness.queries) == 1
@@ -839,7 +843,7 @@ def test_admitted_turn_uses_saved_route_without_reloading_access(
     asyncio.run(scenario())
 
 
-def test_ordinary_admitted_reply_uses_original_sender(harness):
+def test_ordinary_reply_rechecks_local_sender_without_network(harness):
     async def scenario():
         envelope, pages = fixture()
         envelope["companion"].update(phase="ordinary")
@@ -853,10 +857,10 @@ def test_ordinary_admitted_reply_uses_original_sender(harness):
         harness.hooks.receive = receive
         await gw._handle_webhook(Request(envelope))
         record = (await drained(gw))[0]
-        assert record["state"] == "ordinary"
+        assert record["state"] == "failed"
         assert len(harness.queries) == 1
         assert not transport.calls
-        assert len(harness.outputs) == 1
+        assert not harness.outputs
         await gw._cleanup()
 
     asyncio.run(scenario())

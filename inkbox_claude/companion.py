@@ -480,6 +480,9 @@ class CompanionReceiver:
                 or mode != MODES[record["scope"]["channel"]]
                 or self.active_replies.get(chat_id) != meta):
             raise PermissionError("No authorized Companion reply target")
+        sender = record.get("sponsor") or meta.get("sender", "")
+        if not self.gateway._sender_allowed(sender):
+            raise PermissionError("Companion sender is no longer locally allowed")
 
     def begin_send(self, chat_id: str) -> None:
         """Mark the external boundary after all local send preparation succeeded."""
@@ -606,7 +609,7 @@ class CompanionReceiver:
         """Checkpoint startup, submission, and complete output separately."""
         record = self.records[key]
         session = self.gateway.sessions.get(record["session_key"])
-        session.companion_approver = record.get("sponsor") or event["sender"]
+        session.companion_approver = event["sender"]
 
         def checkpoint(state: str, **result: str) -> None:
             if self._closing or self._closed:
@@ -695,7 +698,7 @@ class CompanionReceiver:
                             raise ValueError("Companion email audience changed")
                         # Keep the saved sponsor anchor even for live email replies.
                 meta = reply_meta(scope, context)
-                meta["sender"] = record.get("sponsor") or event["sender"]
+                meta["sender"] = event["sender"]
                 raw_text = await self.raw_text(event)
                 if message["id"] not in record.get("history_ids", []):
                     item = json.dumps({

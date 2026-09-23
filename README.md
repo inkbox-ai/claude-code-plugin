@@ -271,7 +271,8 @@ and valid approval answers from the asked sender remain mention-exempt.
 Automatic replies and `inkbox_reply_companion` use the saved sponsor email
 reply-all anchor or signed MMS/iMessage conversation. The bridge reuses that
 route and its startup identity without loading activation history again for each
-turn or reply. Existing send requirements still apply. Group iMessage requires a
+turn or reply. Optional local sender rules still apply without a network lookup, as do
+existing send requirements. Group iMessage requires a
 supported dedicated line. Companion mode does not grant permission to send a
 separate direct message or place a call.
 
@@ -305,7 +306,7 @@ after correcting a pre-submission failure, an operator may reset its state to
 `pending` while the bridge is stopped, then restart to revalidate it.
 
 Historical commands and approval-like text remain conversation data. Only a new
-live message from the prompted sponsor can answer a Companion permission request
+live message from the sender who was asked can answer a Companion permission request
 or question; it must pass both current sender-access and addressing policies.
 The prompt explains the mention requirement. Sponsor slash controls use the same
 gates. Email author comparisons are case-insensitive; phone authors match exactly.

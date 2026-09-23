@@ -29,7 +29,8 @@
 ### Changed
 
 - Requires published Inkbox SDK `>=0.7.6,<1.0.0`.
-- Companion approvals and sponsor controls use current-message admission and
+- Companion approvals bind to the asked sender; sponsor controls bind to the
+  activation sponsor. Both use current-message admission and
   addressing gates. Ordinary group controls and asked-sender approvals remain
   mention-exempt.
 - Live Companion turns reuse the saved signed route and sponsor reply anchor
