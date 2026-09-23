@@ -790,6 +790,70 @@ def test_transient_failure_recovers_without_another_receipt(harness, monkeypatch
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("stage", ["hydration", "startup", "pre-send"])
+@pytest.mark.parametrize("failure", ["sdk-transport", "http-429", "http-503", "runtime"])
+def test_retry_budget_keeps_transport_recovery_and_pauses_deterministic_failures(
+    harness, monkeypatch, stage, failure
+):
+    async def scenario():
+        import httpx
+        from inkbox.exceptions import InkboxAPIError
+
+        envelope, pages = fixture()
+        gw, transport = harness.build(pages)
+        harness.hooks.reply = "Saved complete answer"
+        receiver = gw._companion_receiver()
+        receiver.schedule = lambda _: None
+        receiver.accept(envelope)
+        key = next(iter(receiver.records))
+        record = receiver.records[key]
+        error = (
+            httpx.ConnectError("Connection unavailable") if failure == "sdk-transport"
+            else InkboxAPIError(int(failure.removeprefix("http-")), "Unavailable")
+            if failure.startswith("http-") else RuntimeError("Incompatible host response")
+        )
+        original_send = gw.send_to_contact
+
+        async def fail(*_args):
+            raise error
+
+        if stage == "hydration":
+            transport.error = error
+        elif stage == "startup":
+            harness.hooks.connect = fail
+        else:
+            monkeypatch.setattr(gw, "send_to_contact", fail)
+        for attempt in range(1, 7):
+            assert await receiver.drain_once(key) is (failure != "runtime" or attempt <= 5)
+        assert record["retry_count"] == 6
+        assert len(harness.queries) == (1 if stage == "pre-send" else 0)
+        assert not harness.outputs
+        if stage == "pre-send":
+            assert record["events"][uid(12)]["state"] == "generated"
+            assert record["events"][uid(12)]["reply"] == "Saved complete answer"
+        if failure == "runtime":
+            assert record["state"] == "paused"
+            assert record["error"] == "retry_exhausted:RuntimeError"
+            await gw._cleanup()
+            restarted, _ = harness.build(pages)
+            restarted._companion_receiver().recover()
+            assert (await drained(restarted))[0]["state"] == "paused"
+            assert len(harness.queries) == (1 if stage == "pre-send" else 0)
+            assert not harness.outputs
+            await restarted._cleanup()
+        else:
+            transport.error = None
+            harness.hooks.connect = None
+            monkeypatch.setattr(gw, "send_to_contact", original_send)
+            assert await receiver.drain_once(key) is False
+            assert len(harness.queries) == 1
+            assert len(harness.outputs) == 1
+            assert "error" not in record and "retry_count" not in record
+            await gw._cleanup()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("channel", ["mail", "phone", "imessage"])
 @pytest.mark.parametrize("delivery", ["automatic", "tool"])
 @pytest.mark.parametrize("revocation", ["activation", "sponsor"])

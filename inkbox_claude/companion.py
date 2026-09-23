@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 CHANNELS = {"message.received": "mail", "text.received": "phone", "imessage.received": "imessage"}
@@ -51,6 +53,19 @@ SOURCE_FIELDS = (
 REVOKED_STATUSES = {401, 403, 404, 409}
 RETRY_INITIAL_DELAY = 1.0
 RETRY_MAX_DELAY = 30.0
+RETRY_MAX_NONTRANSPORT = 5
+
+
+def retryable_read(exc: Exception) -> bool:
+    """Recognize transport failures and retryable HTTP responses from the SDK."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+    return (
+        isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError))
+        or status == 429
+        or (isinstance(status, int) and 500 <= status < 600)
+    )
 
 
 def require_uuid(value: Any) -> None:
@@ -645,6 +660,7 @@ class CompanionReceiver:
                 await self.gateway.send_to_contact(chat_id, reply, MODES[record["scope"]["channel"]], meta)
             event["state"] = "completed"
             record.pop("error", None)
+            record.pop("retry_count", None)
             self.save(key)
         finally:
             self.active_replies.pop(chat_id, None)
@@ -669,6 +685,7 @@ class CompanionReceiver:
             if state == "generated":
                 event.update(reply=result["reply"], reply_meta=deepcopy(meta))
                 record["context"] = []
+                record.pop("retry_count", None)
             self.save(key)
 
         async def authorize() -> None:
@@ -710,12 +727,17 @@ class CompanionReceiver:
                     initial_source_id=next(source_id for source_id, event in record["events"].items() if event["scope"]["sequence"] == record["scope"]["sequence"]),
                 )
                 record.pop("error", None)
+                record.pop("retry_count", None)
                 self.save(key)
             while not self._closing:
                 if record["state"] in {"failed", "paused"}:
                     return False
                 events = [event for event in record["events"].values() if event["state"] in {"pending", "generated"}]
                 if not events:
+                    if "retry_count" in record:
+                        record.pop("retry_count", None)
+                        record.pop("error", None)
+                        self.save(key)
                     return False
                 event = min(events, key=lambda item: item["scope"]["sequence"])
                 if event["state"] == "generated":
@@ -793,8 +815,13 @@ class CompanionReceiver:
             elif isinstance(exc, ValueError) or getattr(exc, "status_code", None) == 413:
                 record.update(state="failed", error=str(exc) if isinstance(exc, ValueError) else "activation_unavailable")
             else:
-                record["error"] = f"retry_scheduled:{type(exc).__name__}"
-                retry = True
+                attempt = record.get("retry_count", 0) + 1
+                record["retry_count"] = attempt
+                if retryable_read(exc) or attempt <= RETRY_MAX_NONTRANSPORT:
+                    record["error"] = f"retry_scheduled:{type(exc).__name__}"
+                    retry = True
+                else:
+                    record.update(state="paused", error=f"retry_exhausted:{type(exc).__name__}")
             self.save(key)
             logger.warning("Companion work %s: %s", key, record["error"])
             return retry

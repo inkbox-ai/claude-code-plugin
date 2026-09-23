@@ -296,7 +296,9 @@ are held instead of starting private recovery. If corruption also destroys the
 routing information, all delivery-failure callbacks are held until it is repaired;
 ordinary inbound messages and healthy Companion scopes still work.
 Temporary startup, hydration, and pre-submission failures retry automatically
-with delays capped at 30 seconds. Completed model results are checkpointed before
+with delays capped at 30 seconds. Network failures and HTTP 429/5xx remain
+retryable; other unexpected failures pause after five retries for operator review.
+Completed model results are checkpointed before
 sending, so a known pre-send failure retries delivery without rerunning the model.
 If activation loading reports unavailable access, captured message content is
 discarded while deduplication records remain. Stop the bridge before moving its state directory.
