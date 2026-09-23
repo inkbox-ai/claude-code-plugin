@@ -835,6 +835,147 @@ def test_missing_resume_notice_mentions_stale_session():
     assert "/health" in notice
 
 
+NOT_LOGGED_IN = "Not logged in · Please run /login"
+
+
+class _AuthText:
+    def __init__(self, text):
+        self.text = text
+
+
+class _AuthAssistant:
+    def __init__(self, text, error=None):
+        self.content = [_AuthText(text)]
+        self.error = error
+
+
+class _AuthResult:
+    def __init__(self, result, session_id, is_error=False):
+        self.result = result
+        self.session_id = session_id
+        self.is_error = is_error
+
+
+def _auth_client_factory(monkeypatch, outcomes, clients):
+    """Each new client plays the next outcome: "auth" or a reply string.
+
+    "auth" mirrors what the Claude Code CLI streams when its login is bad:
+    an assistant message flagged ``authentication_failed`` plus an error
+    result, both carrying the canned text, and no exception.
+    """
+
+    class FakeClient:
+        def __init__(self):
+            self.outcome = outcomes[len(clients)]
+            self.connects = 0
+            self.disconnects = 0
+            clients.append(self)
+
+        async def connect(self):
+            self.connects += 1
+
+        async def query(self, _text):
+            pass
+
+        async def receive_response(self):
+            if self.outcome == "auth":
+                yield _AuthAssistant(NOT_LOGGED_IN, error="authentication_failed")
+                yield _AuthResult(NOT_LOGGED_IN, "synthetic-session", is_error=True)
+            else:
+                yield _AuthAssistant(self.outcome)
+                yield _AuthResult(self.outcome, "old-session")
+
+        async def disconnect(self):
+            self.disconnects += 1
+
+    monkeypatch.setattr(sessions_mod, "CLAUDE_SDK_AVAILABLE", True)
+    monkeypatch.setattr(sessions_mod, "AssistantMessage", _AuthAssistant)
+    monkeypatch.setattr(sessions_mod, "TextBlock", _AuthText)
+    monkeypatch.setattr(sessions_mod, "ResultMessage", _AuthResult)
+    monkeypatch.setattr(sessions_mod, "ClaudeSDKClient", lambda options: FakeClient())
+
+
+def test_not_logged_in_turn_reconnects_once_and_keeps_resume(monkeypatch):
+    async def scenario():
+        sent = []
+        clients = []
+        resume_ids = []
+        persisted = []
+        session = make_session(sent)
+        session.resume_session_id = "old-session"
+        session.on_session_id = lambda chat_id, sid: persisted.append(sid)
+        _auth_client_factory(monkeypatch, ["auth", "hi back"], clients)
+        real_ensure = session._ensure_client
+
+        async def ensure():
+            if session._client is None:
+                resume_ids.append(session.resume_session_id)
+            return await real_ensure()
+
+        session._ensure_client = ensure
+
+        await session._queue.put(_Turn(text="hello"))
+        await session._drain()
+
+        assert len(clients) == 2
+        assert clients[0].disconnects == 1
+        assert session._client is clients[1]
+        assert resume_ids == ["old-session", "old-session"]
+        assert session.resume_session_id == "old-session"
+        assert "synthetic-session" not in persisted
+        assert [text for _, text, _, _ in sent] == ["hi back"]
+
+    asyncio.run(scenario())
+
+
+def test_not_logged_in_twice_tells_human_to_login_on_host(monkeypatch):
+    async def scenario():
+        sent = []
+        clients = []
+        session = make_session(sent)
+        session.resume_session_id = "old-session"
+        _auth_client_factory(monkeypatch, ["auth", "auth"], clients)
+
+        await session._queue.put(_Turn(text="hello"))
+        await session._drain()
+
+        assert len(clients) == 2
+        assert all(c.disconnects == 1 for c in clients)
+        assert session._client is None
+        assert session.resume_session_id == "old-session"
+        assert len(sent) == 1
+        notice = sent[0][1]
+        assert NOT_LOGGED_IN not in notice
+        assert "/login" in notice
+        assert "/clear" in notice
+
+        # Once the host is logged in again, the next message recovers on its
+        # own: no /clear, same conversation.
+        clients.clear()
+        _auth_client_factory(monkeypatch, ["back online"], clients)
+        await session._queue.put(_Turn(text="again"))
+        await session._drain()
+
+        assert sent[-1][1] == "back online"
+        assert session.resume_session_id == "old-session"
+
+    asyncio.run(scenario())
+
+
+def test_not_logged_in_capture_turn_surfaces_auth_error(monkeypatch):
+    async def scenario():
+        clients = []
+        session = make_session([])
+        _auth_client_factory(monkeypatch, ["auth", "auth"], clients)
+
+        with pytest.raises(sessions_mod.ClaudeNotLoggedInError):
+            await session.run_consult("what's up")
+
+        assert len(clients) == 2
+
+    asyncio.run(scenario())
+
+
 def test_stop_command_interrupts_turn_without_clearing():
     async def scenario():
         sent = []
