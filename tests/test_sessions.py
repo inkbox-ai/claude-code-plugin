@@ -327,9 +327,9 @@ def test_rejected_reply_send_routes_to_delivery_failure_loop():
             detail = {"error": "message_blocked_spam_filter", "rule": "crypto_content",
                       "message": "Cryptocurrency price content is restricted."}
 
-        async def boom(_text):
+        async def boom(*_args):
             raise Blocked()
-        session._reply = boom
+        session.send_fn = boom
 
         await session._deliver_reply(_Turn(text="orig"), "Bitcoin: $63295")
 

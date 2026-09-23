@@ -71,11 +71,8 @@ jobs:
         with:
           version: "latest"
 
-      - name: Build pinned Inkbox SDK wheel
-        run: tests/ci/retry_install.sh bash tests/ci/build_inkbox_sdk.sh
-
       - name: Install bridge and protocol driver
-        run: tests/ci/retry_install.sh uv pip install --system --no-sources "$INKBOX_SDK_WHEEL" -e .
+        run: tests/ci/retry_install.sh uv pip install --system -e .
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code

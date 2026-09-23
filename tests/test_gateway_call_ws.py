@@ -196,6 +196,7 @@ def test_send_to_contact_uses_prefixed_sms_conversation_chat_id():
     identity = _FakeIdentity()
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
     gw._inkbox = _DeliveryInkbox(identity)
+    gw._identity = identity
 
     asyncio.run(gw.send_to_contact("sms:conv-123", "reply", "sms", {}))
 
@@ -206,6 +207,7 @@ def test_send_to_contact_uses_prefixed_imessage_conversation_chat_id():
     identity = _FakeIdentity()
     gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, identity="claude"))
     gw._inkbox = _DeliveryInkbox(identity)
+    gw._identity = identity
 
     asyncio.run(gw.send_to_contact("imessage:imconv-123", "reply", "imessage", {}))
 

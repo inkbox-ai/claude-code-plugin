@@ -75,7 +75,7 @@ def fixture(channel="mail", *, activation=2, scope=1, conversation=3):
 
 def event(scope, sender, message_id, text):
     channel = scope["channel"]
-    message = {"id": uid(message_id), "direction": "inbound"}
+    message = {"id": uid(message_id), "direction": "inbound", "sender_access": "direct"}
     if channel == "mail":
         message.update(
             from_address=sender,
@@ -360,7 +360,7 @@ def test_query_timeout_pauses_without_retry(harness):
 
         async def fail(_client, _text):
             stored = json.loads(next(harness.root.glob("companion/*/*.json")).read_text())
-            assert stored["state"] == "submitting"
+            assert stored["events"][uid(12)]["state"] == "submitting"
             raise TimeoutError("Acceptance unknown")
 
         harness.hooks.query = fail
@@ -399,10 +399,10 @@ def test_live_first_initializes_then_waits_for_completion(harness):
         assert len(harness.queries) == 1
         release.set()
         await drained(gw)
-        assert len(harness.queries) == 3
+        assert len(harness.queries) == 2
         assert "Welcome" in harness.queries[0]
-        assert "First live" in harness.queries[1]
-        assert "Sponsor follow-up" in harness.queries[2]
+        assert "First live" in harness.queries[0]
+        assert "Sponsor follow-up" in harness.queries[1]
         await gw._cleanup()
 
     asyncio.run(scenario())
@@ -451,7 +451,7 @@ def test_approval_requires_sponsor_or_current_ordinary_sender(harness, phase):
 def test_invalid_initialization_never_submits_partial_turn(harness, failure):
     async def scenario():
         envelope, pages = fixture()
-        settings = {"companion_max_bytes": 100} if failure == "size" else {}
+        settings = {"companion_max_bytes": 1000} if failure == "size" else {}
         if failure == "sponsor":
             settings["allowed_users"] = ["someone@example.com"]
         if failure == "scope":
@@ -475,7 +475,7 @@ def test_invalid_initialization_never_submits_partial_turn(harness, failure):
     asyncio.run(scenario())
 
 
-def test_revalidate_after_host_connect_before_query(harness):
+def test_host_startup_does_not_repeat_snapshot_request(harness):
     async def scenario():
         envelope, pages = fixture()
         gw, transport = harness.build(pages)
@@ -487,8 +487,9 @@ def test_revalidate_after_host_connect_before_query(harness):
 
         harness.hooks.connect = connect
         await gw._handle_webhook(Request(envelope))
-        assert (await drained(gw))[0]["state"] == "failed"
-        assert harness.queries == []
+        assert (await drained(gw))[0]["state"] == "initialized"
+        assert len(harness.queries) == 1
+        assert len(transport.calls) == 3
         await gw._cleanup()
 
     asyncio.run(scenario())
@@ -585,7 +586,7 @@ def test_live_arrival_cannot_retarget_initializer_reply(harness):
         await gw._handle_webhook(Request(event(scope, "fred@example.com", 13, "Next")))
         release.set()
         await drained(gw)
-        assert [output[1] for output in harness.outputs] == [uid(12), uid(13)]
+        assert [output[1] for output in harness.outputs] == [uid(12), uid(12)]
         await gw._cleanup()
 
     asyncio.run(scenario())
@@ -648,7 +649,7 @@ def test_ordinary_denial_and_invalid_metadata_are_not_acknowledged(harness):
     asyncio.run(scenario())
 
 
-def test_revoked_sponsor_cannot_answer_pending_approval(harness):
+def test_admitted_sponsor_answer_does_not_reload_snapshot(harness):
     async def scenario():
         from inkbox.exceptions import InkboxAPIError
 
@@ -673,7 +674,8 @@ def test_revoked_sponsor_cannot_answer_pending_approval(harness):
         await gw._handle_webhook(Request(event(scope, "owner@example.com", 13, "YES")))
         await asyncio.gather(*list(gw._companion.approval_jobs))
         await drained(gw)
-        assert decisions == [None]
+        assert decisions == ["YES"]
+        assert len(transport.calls) == 3
         assert len(harness.queries) == 1
         await gw._cleanup()
 
@@ -761,7 +763,9 @@ def test_transient_failure_recovers_without_another_receipt(harness, monkeypatch
 
             return call
 
-        if stage == "ordinary":
+        if stage == "live":
+            gw._fetch_mail_body = flaky(gw._fetch_mail_body)
+        elif stage == "ordinary":
             envelope["companion"].update(phase="ordinary")
             envelope["companion"].pop("activation_id")
             gw._fetch_mail_body = flaky(gw._fetch_mail_body)
@@ -789,7 +793,7 @@ def test_transient_failure_recovers_without_another_receipt(harness, monkeypatch
 @pytest.mark.parametrize("channel", ["mail", "phone", "imessage"])
 @pytest.mark.parametrize("delivery", ["automatic", "tool"])
 @pytest.mark.parametrize("revocation", ["activation", "sponsor"])
-def test_revocation_during_turn_prevents_all_replies(
+def test_admitted_turn_uses_saved_route_without_reloading_access(
     harness, monkeypatch, channel, delivery, revocation
 ):
     async def scenario():
@@ -821,12 +825,12 @@ def test_revocation_during_turn_prevents_all_replies(
         harness.hooks.receive = receive
         await gw._handle_webhook(Request(envelope))
         record = (await drained(gw))[0]
-        assert record["state"] == "failed"
-        assert record["revoked"]
-        assert harness.outputs == []
+        assert record["state"] == "initialized"
+        assert len(transport.calls) == 3
+        assert len(harness.outputs) == 1
         assert len(harness.queries) == 1
         if delivery == "tool":
-            assert tool_results[0]["is_error"]
+            assert not tool_results[0].get("is_error")
         await gw._handle_webhook(Request(envelope))
         await drained(gw)
         assert len(harness.queries) == 1
@@ -835,7 +839,7 @@ def test_revocation_during_turn_prevents_all_replies(
     asyncio.run(scenario())
 
 
-def test_ordinary_reply_rechecks_local_sender(harness):
+def test_ordinary_admitted_reply_uses_original_sender(harness):
     async def scenario():
         envelope, pages = fixture()
         envelope["companion"].update(phase="ordinary")
@@ -849,31 +853,26 @@ def test_ordinary_reply_rechecks_local_sender(harness):
         harness.hooks.receive = receive
         await gw._handle_webhook(Request(envelope))
         record = (await drained(gw))[0]
-        assert record["state"] == "failed"
+        assert record["state"] == "ordinary"
         assert len(harness.queries) == 1
         assert not transport.calls
-        assert not harness.outputs
+        assert len(harness.outputs) == 1
         await gw._cleanup()
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure", ["validation", "send"])
-def test_reply_failure_never_repeats_host_input(harness, failure):
+def test_uncertain_send_never_repeats_host_input(harness):
     async def scenario():
         envelope, pages = fixture()
         gw, transport = harness.build(pages)
         harness.hooks.reply = "Response"
 
         async def receive(_client):
-            if failure == "validation":
-                transport.error = ConnectionError("Temporarily unavailable")
-            else:
+            def fail(*_args, **_kwargs):
+                raise ConnectionError("Send outcome unknown")
 
-                def fail(*_args, **_kwargs):
-                    raise ConnectionError("Send outcome unknown")
-
-                gw._identity.reply_all_email = fail
+            gw._identity.reply_all_email = fail
 
         harness.hooks.receive = receive
         await gw._handle_webhook(Request(envelope))

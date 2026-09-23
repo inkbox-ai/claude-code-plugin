@@ -49,8 +49,8 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
 
 # Packages the wizard itself needs to talk to Inkbox during setup. The
 # gateway's other dependency (claude-agent-sdk) is checked by doctor.
-INKBOX_MIN_VERSION = (0, 7, 3)
-INKBOX_REQUIREMENTS = ("inkbox>=0.7.3,<1.0.0", "aiohttp>=3.9")
+INKBOX_MIN_VERSION = (0, 7, 6)
+INKBOX_REQUIREMENTS = ("inkbox>=0.7.6,<1.0.0", "aiohttp>=3.9")
 _BRACKETED_PASTE_PATTERN = re.compile(r"\x1b\[\s*200~|\x1b\[\s*201~")
 
 # Bundled avatar attached to the agent's Inkbox contact card during setup.
@@ -1081,7 +1081,7 @@ def _configure_voice_ai(
         "set_incoming_call_action",
     )
     if any(not callable(getattr(identity, name, None)) for name in required):
-        print_error("  Inkbox Voice AI requires Inkbox SDK 0.7.3 or newer.")
+        print_error("  Inkbox Voice AI requires Inkbox SDK 0.7.6 or newer.")
         return False, authority_identity, ""
     try:
         current = identity.get_hosted_agent_config()
@@ -2144,6 +2144,24 @@ def _print_agent_summary(identity: Any) -> None:
 # ----------------------------------------------------------------------
 
 
+def _configure_response_modes() -> None:
+    """Select response policies while preserving an existing setup's choices."""
+    group = (_env("INKBOX_GROUP_REPLY_MODE") or "auto").strip().lower()
+    selected = prompt_choice(
+        "Group replies",
+        ["Auto — respond when appropriate", "Mention — require @agent or @your-handle"],
+        default=1 if group == "mention" else 0,
+    )
+    _save("INKBOX_GROUP_REPLY_MODE", ("auto", "mention")[selected])
+    companion = (_env("INKBOX_COMPANION_RESPONSE_MODE") or "safe").strip().lower()
+    selected = prompt_choice(
+        "Companion replies",
+        ["Safe — only directly admitted senders wake the agent", "Relaxed — any delivered sender may wake the agent"],
+        default=1 if companion == "relaxed" else 0,
+    )
+    _save("INKBOX_COMPANION_RESPONSE_MODE", ("safe", "relaxed")[selected])
+
+
 def interactive_setup() -> None:
     """Run the full interactive Inkbox + Claude Code bridge setup.
 
@@ -2257,6 +2275,7 @@ def interactive_setup() -> None:
 
     _setup_signing_key(api_key, base_url, Inkbox)
 
+    _configure_response_modes()
     _configure_project_dir()
 
     # A live bridge means setup finished the job, so close on that rather than

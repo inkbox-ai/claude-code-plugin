@@ -67,13 +67,10 @@ jobs:
         with:
           version: "latest"
 
-      - name: Build pinned Inkbox SDK wheel
-        run: tests/ci/retry_install.sh bash tests/ci/build_inkbox_sdk.sh
-
       - name: Install bridge
         run: |
-          tests/ci/retry_install.sh uv pip install --system --no-sources \
-            "$INKBOX_SDK_WHEEL" \
+          tests/ci/retry_install.sh uv pip install --system \
+            \
             -e . pytest
 
       - name: Install Claude Code CLI

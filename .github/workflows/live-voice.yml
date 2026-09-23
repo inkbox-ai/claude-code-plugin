@@ -59,15 +59,12 @@ jobs:
         with:
           version: "latest"
 
-      - name: Build pinned Inkbox SDK wheel
-        run: tests/ci/retry_install.sh bash tests/ci/build_inkbox_sdk.sh
-
       # uvicorn[standard] matters: the bare install can't accept WebSocket
       # upgrades, and the driver's call-media endpoint is a WebSocket.
       - name: Install bridge + driver deps
         run: |
-          tests/ci/retry_install.sh uv pip install --system --no-sources \
-            "$INKBOX_SDK_WHEEL" \
+          tests/ci/retry_install.sh uv pip install --system \
+            \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI

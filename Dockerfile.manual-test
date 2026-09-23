@@ -11,7 +11,7 @@ RUN apt-get update \
 WORKDIR /src/claude-code-plugin
 COPY . .
 RUN /opt/inkbox-claude/bin/pip install --no-cache-dir \
-      "inkbox==0.7.3" \
+      "inkbox==0.7.6" \
     && /opt/inkbox-claude/bin/pip install --no-cache-dir .
 
 ENV PATH="/opt/inkbox-claude/bin:${PATH}" \

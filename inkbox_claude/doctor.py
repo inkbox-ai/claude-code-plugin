@@ -58,7 +58,7 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         import inkbox  # noqa: F401
         checks.append(("inkbox SDK", True, "installed"))
     except ImportError:
-        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.7.3,<1.0.0'"))
+        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.7.6,<1.0.0'"))
 
     try:
         import claude_agent_sdk  # noqa: F401

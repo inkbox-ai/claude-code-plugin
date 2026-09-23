@@ -836,7 +836,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.7.3,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.7.6,<1.0.0'")
         if self.cfg.voice_stack_invalid_value:
             raise RuntimeError(
                 f"invalid INKBOX_VOICE_STACK={self.cfg.voice_stack_invalid_value!r}; rerun setup"
@@ -1768,7 +1768,7 @@ class InkboxGateway:
                 return web.json_response({"ok": True, "companion": "delivery_failed"})
 
         data = envelope.get("data")
-        has_companion = "companion" in envelope or (isinstance(data, dict) and "companion" in data)
+        has_companion = envelope.get("companion") is not None
         if source == "inkbox" and has_companion:
             # Companion authority always requires a signature, including local test configurations.
             if not self.cfg.require_signature and not provider.verify(
@@ -2276,6 +2276,8 @@ class InkboxGateway:
             "sender": sender,
             "subject": subject,
             "thread_id": message.get("thread_id"),
+            "message_id": message.get("id"),
+            "raw_text": body_text,
             "contact": contact,
             "agent_identity": agent_identity,
             "contact_memories": memories,
@@ -2580,14 +2582,14 @@ class InkboxGateway:
                 contact=contact,
             )
         thread_key = self._thread_key("sms", conversation_id)
-        chat_id = self._chat_key(
-            data,
-            sender,
-            thread_key,
-            contact=contact,
-            allow_webhook_contact=False,
+        if is_group and not conversation_id:
+            return web.json_response({"ok": True, "ignored": "group-without-conversation"})
+        chat_id = thread_key if is_group else self._chat_key(
+            data, sender, thread_key, contact=contact, allow_webhook_contact=False,
         )
         meta = {
+            "raw_text": text,
+            "message_id": message.get("id"),
             "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
@@ -2668,6 +2670,8 @@ class InkboxGateway:
                 participants=participants,
                 contact=contact,
             )
+        if is_group and not conversation_id:
+            return web.json_response({"ok": True, "ignored": "group-without-conversation"})
         thread_key = self._thread_key("imessage", conversation_id)
         # A group is one shared context for everyone in it, so the conversation -
         # not the sender - is the chat. 1:1 keeps its per-contact chat.
@@ -2683,6 +2687,8 @@ class InkboxGateway:
             )
         )
         meta = {
+            "raw_text": text,
+            "message_id": message.get("id"),
             "conversation_id": conversation_id or None,
             "sender": sender,
             "contact": contact,
@@ -2746,14 +2752,22 @@ class InkboxGateway:
                         contact=contact,
                         agent_identity=agent_identity,
                     )
-                    chat_id = self._chat_key(
-                        data,
-                        sender,
-                        self._thread_key("imessage", conversation_id),
-                        contact=contact,
-                        allow_webhook_contact=False,
+                    summary = await self._lookup_imessage_conversation_summary(conversation_id)
+                    is_group = (
+                        self._conversation_summary_is_group(summary)
+                        or bool(self._field(reaction, "isGroup", "is_group"))
+                        or len(self._string_list_field(reaction, "participants")) > 1
+                        or self._thread_key("imessage", conversation_id) in getattr(self.sessions, "sessions", {})
+                    )
+                    if is_group and not conversation_id:
+                        return web.json_response({"ok": True, "ignored": "group-without-conversation"})
+                    chat_id = self._thread_key("imessage", conversation_id) if is_group else self._chat_key(
+                        data, sender, self._thread_key("imessage", conversation_id),
+                        contact=contact, allow_webhook_contact=False,
                     )
                     meta = {
+                        "conversation_kind": "group" if is_group else "direct",
+                        "raw_text": "",
                         "conversation_id": conversation_id or None,
                         "sender": sender,
                         "message_id": reaction_id or target_message_id,
@@ -2933,7 +2947,7 @@ class InkboxGateway:
         )
         # Run in the background so the webhook returns promptly; the turn can
         # take a while (the agent may send on another channel).
-        asyncio.create_task(self._run_failure_turn(chat_id, prompt, mode, target or ""))
+        asyncio.create_task(self._run_failure_turn(chat_id, prompt, mode, target or "", conversation_id))
         logger.warning(
             "[bridge] Woke agent about failed outbound %s (attempt %d/%d, stage=%s, error=%s)",
             mode,
@@ -2944,9 +2958,11 @@ class InkboxGateway:
         )
         return web.json_response({"ok": True})
 
-    async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str) -> None:
+    async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str, conversation_id: Optional[str] = None) -> None:
         try:
-            await self.sessions.get(chat_id).run_consult(prompt)
+            await self.sessions.get(chat_id).run_consult(prompt, mode=channel, reply_meta={
+                "to": recipient, "sender": recipient, "conversation_id": conversation_id,
+            })
         except Exception:
             logger.exception("[bridge] delivery-failure turn failed: %s → %s", channel, recipient)
 
@@ -3067,7 +3083,15 @@ class InkboxGateway:
                     recipient = rec_number.strip()
                 break
         conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
-        chat_id = self._chat_key(data, recipient, self._thread_key("sms", conversation_id))
+        thread_key = self._thread_key("sms", conversation_id)
+        summary = await self._lookup_text_conversation_summary(conversation_id)
+        is_group = (self._conversation_summary_is_group(summary)
+                    or bool(self._field(message, "isGroup", "is_group"))
+                    or len(message.get("recipients") or []) > 1
+                    or thread_key in getattr(self.sessions, "sessions", {}))
+        if is_group and not conversation_id:
+            return web.json_response({"ok": True, "ignored": "group-without-conversation"})
+        chat_id = thread_key if is_group else self._chat_key(data, recipient, thread_key)
         logger.info("[bridge] SMS delivery failed to %s: %s", recipient, reason or event_type)
         return await self._note_outbound_delivery_failure(
             mode="sms",
@@ -3100,7 +3124,15 @@ class InkboxGateway:
             or ""
         ).strip()
         conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
-        chat_id = self._chat_key(data, recipient, self._thread_key("imessage", conversation_id))
+        thread_key = self._thread_key("imessage", conversation_id)
+        summary = await self._lookup_imessage_conversation_summary(conversation_id)
+        is_group = (self._conversation_summary_is_group(summary)
+                    or bool(self._field(message, "isGroup", "is_group"))
+                    or len(message.get("recipients") or []) > 1
+                    or thread_key in getattr(self.sessions, "sessions", {}))
+        if is_group and not conversation_id:
+            return web.json_response({"ok": True, "ignored": "group-without-conversation"})
+        chat_id = thread_key if is_group else self._chat_key(data, recipient, thread_key)
         logger.info("[bridge] iMessage delivery failed to %s: %s", recipient, reason)
         return await self._note_outbound_delivery_failure(
             mode="imessage",
@@ -4807,7 +4839,9 @@ class InkboxGateway:
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:
                 raise ValueError(_message_too_long_reason("SMS", text, SMS_MAX_LENGTH))
-            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            identity = self._identity
+            if identity is None:
+                raise RuntimeError("Inkbox identity is not ready")
             kwargs: Dict[str, Any] = {"text": text}
             conversation_id = str(meta.get("conversation_id") or "").strip()
             if not conversation_id and str(chat_id).startswith("sms:"):
@@ -4818,12 +4852,15 @@ class InkboxGateway:
                 kwargs["to"] = str(meta.get("to") or chat_id)
             if meta.get("companion"):
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
+                self._companion_receiver().begin_send(chat_id)
             await asyncio.to_thread(identity.send_text, **kwargs)
         elif mode == "imessage":
             text = strip_markdown(content)
             if len(text) > IMESSAGE_MAX_LENGTH:
                 raise ValueError(_message_too_long_reason("iMessage", text, IMESSAGE_MAX_LENGTH))
-            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            identity = self._identity
+            if identity is None:
+                raise RuntimeError("Inkbox identity is not ready")
             conversation_id = str(meta.get("conversation_id") or "").strip()
             if not conversation_id and str(chat_id).startswith("imessage:"):
                 conversation_id = str(chat_id).split(":", 1)[1]
@@ -4831,27 +4868,27 @@ class InkboxGateway:
                 raise ValueError(f"No iMessage conversation id for chat {chat_id}")
             if meta.get("companion"):
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
+                self._companion_receiver().begin_send(chat_id)
             await asyncio.to_thread(
                 identity.send_imessage,
                 conversation_id=conversation_id,
                 text=text,
             )
         else:  # email
-            identity = await asyncio.to_thread(self._inkbox.get_identity, self.cfg.identity)
+            identity = self._identity
+            if identity is None:
+                raise RuntimeError("Inkbox identity is not ready")
             if meta.get("companion"):
                 context = meta["reply_context"]
                 if context.get("channel") != "mail" or not context.get("reply_to_message_id"):
                     raise ValueError("Companion email reply requires a stored parent")
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
+                self._companion_receiver().begin_send(chat_id)
                 await asyncio.to_thread(
                     identity.reply_all_email, str(context["reply_to_message_id"]), body_text=content,
                 )
                 return
-            subject = str(meta.get("subject") or "").strip()
-            reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}" if subject else "From your Claude Code agent"
-            await asyncio.to_thread(
-                identity.send_email,
-                to=[str(meta.get("to") or chat_id)],
-                subject=reply_subject,
-                body_text=content,
-            )
+            parent = str(meta.get("message_id") or "").strip()
+            if not parent:
+                raise ValueError("Email reply requires the stored inbound message ID")
+            await asyncio.to_thread(identity.reply_all_email, parent, body_text=content)

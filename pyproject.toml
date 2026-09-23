@@ -6,16 +6,13 @@ requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9",
   "audioop-lts>=0.2.1; python_version >= '3.13'",
-  "inkbox>=0.7.3,<1.0.0",
+  "inkbox>=0.7.6,<1.0.0",
   "claude-agent-sdk>=0.1.0",
   "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]
 
 [project.scripts]
 inkbox-claude = "inkbox_claude.cli:main"
-
-[tool.uv.sources]
-inkbox = { git = "https://github.com/inkbox-ai/inkbox", rev = "449966c885208d41f995d09c54072e012df9eb1a", subdirectory = "sdk/python" }
 
 [tool.setuptools.packages.find]
 include = ["inkbox_claude*"]
