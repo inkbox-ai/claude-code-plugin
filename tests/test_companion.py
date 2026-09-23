@@ -823,9 +823,12 @@ def test_retry_budget_keeps_transport_recovery_and_pauses_deterministic_failures
             harness.hooks.connect = fail
         else:
             monkeypatch.setattr(gw, "send_to_contact", fail)
-        for attempt in range(1, 7):
-            assert await receiver.drain_once(key) is (failure != "runtime" or attempt <= 5)
-        assert record["retry_count"] == 6
+        immediate_pause = failure == "runtime" and stage == "pre-send"
+        for attempt in range(1, 2 if immediate_pause else 7):
+            assert await receiver.drain_once(key) is (
+                not immediate_pause and (failure != "runtime" or attempt <= 5)
+            )
+        assert record.get("retry_count", 0) == (0 if immediate_pause else 6)
         assert len(harness.queries) == (1 if stage == "pre-send" else 0)
         assert not harness.outputs
         if stage == "pre-send":
@@ -833,7 +836,10 @@ def test_retry_budget_keeps_transport_recovery_and_pauses_deterministic_failures
             assert record["events"][uid(12)]["reply"] == "Saved complete answer"
         if failure == "runtime":
             assert record["state"] == "paused"
-            assert record["error"] == "retry_exhausted:RuntimeError"
+            assert record["error"] == (
+                "reply_preparation_failed:RuntimeError" if immediate_pause
+                else "retry_exhausted:RuntimeError"
+            )
             await gw._cleanup()
             restarted, _ = harness.build(pages)
             restarted._companion_receiver().recover()

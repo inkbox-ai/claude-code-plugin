@@ -814,6 +814,8 @@ class CompanionReceiver:
                 record.update(state="paused", error="uncertain_host_outcome")
             elif isinstance(exc, ValueError) or getattr(exc, "status_code", None) == 413:
                 record.update(state="failed", error=str(exc) if isinstance(exc, ValueError) else "activation_unavailable")
+            elif any(event["state"] == "generated" for event in record["events"].values()) and not retryable_read(exc):
+                record.update(state="paused", error=f"reply_preparation_failed:{type(exc).__name__}")
             else:
                 attempt = record.get("retry_count", 0) + 1
                 record["retry_count"] = attempt

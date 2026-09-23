@@ -297,7 +297,9 @@ routing information, all delivery-failure callbacks are held until it is repaire
 ordinary inbound messages and healthy Companion scopes still work.
 Temporary startup, hydration, and pre-submission failures retry automatically
 with delays capped at 30 seconds. Network failures and HTTP 429/5xx remain
-retryable; other unexpected failures pause after five retries for operator review.
+retryable; other unexpected startup or hydration failures pause after five retries
+for operator review. Nonretryable preparation failures for an already completed
+answer pause immediately, retaining the answer.
 Completed model results are checkpointed before
 sending, so a known pre-send failure retries delivery without rerunning the model.
 If activation loading reports unavailable access, captured message content is
