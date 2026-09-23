@@ -288,6 +288,10 @@ directory under `INKBOX_CLAUDE_HOME`. Keep this state when upgrading. Pending
 hydration and queued messages recover on restart. `/health` exposes counts by
 Companion state; each checkpoint records a logical submission ID and any error.
 Only one bridge process can own an identity's Companion state in that directory.
+Invalid checkpoints are preserved with an `.invalid` suffix and only that scope is
+paused; unrelated conversations and channels can still start. Keep quarantined
+files until an operator reconciles the uncertain state, rather than deleting them
+to admit duplicate work.
 Temporary startup, hydration, and pre-submission failures retry automatically
 with delays capped at 30 seconds. Completed model results are checkpointed before
 sending, so a known pre-send failure retries delivery without rerunning the model.

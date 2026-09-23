@@ -1115,9 +1115,13 @@ def test_invalid_checkpoint_fails_before_recovery(harness, corruption):
             stored["sender"] = "someone-else@example.com"
         path.write_text(json.dumps(record))
         restarted, _ = harness.build(pages)
-        with pytest.raises(ValueError):
-            restarted._companion_receiver()
+        restored = restarted._companion_receiver()
+        assert restored.records == {}
+        assert path.with_suffix(".invalid").exists()
+        with pytest.raises(RuntimeError, match="checkpoint is invalid"):
+            restored.accept(envelope)
         assert not harness.queries
+        await restarted._cleanup()
 
     asyncio.run(scenario())
 
@@ -1325,4 +1329,44 @@ def test_companion_http_errors_do_not_expose_exception_details(harness, monkeypa
         assert "credentials" not in response.text
         await gw._cleanup()
 
+    asyncio.run(scenario())
+
+
+def test_companion_without_inkbox_signature_cannot_fall_through_external_handler(harness, monkeypatch):
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        request = Request(envelope, signed=False)
+        request.headers = {}
+        response = await gw._handle_webhook(request)
+        assert response.status == 401
+        assert not harness.queries
+        assert gw._companion is None
+        await gw._cleanup()
+    asyncio.run(scenario())
+
+
+def test_invalid_checkpoint_only_pauses_its_scope_across_restarts(harness):
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        receiver = gw._companion_receiver()
+        receiver.schedule = lambda _: None
+        receiver.accept(envelope)
+        key = next(iter(receiver.records))
+        path = receiver.root / (key + ".json")
+        await gw._cleanup()
+        path.write_text("{broken json")
+        for _ in range(2):
+            restarted, _ = harness.build(pages)
+            restored = restarted._companion_receiver()
+            restored.schedule = lambda _: None
+            with pytest.raises(RuntimeError, match="checkpoint is invalid"):
+                restored.accept(envelope)
+            healthy = deepcopy(envelope)
+            healthy["companion"]["activation_id"] = uid(99)
+            restored.accept(healthy)
+            assert len(restored.records) == 1
+            assert not harness.queries
+            await restarted._cleanup()
     asyncio.run(scenario())

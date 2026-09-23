@@ -30,6 +30,7 @@ import shutil
 import threading
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1752,6 +1753,8 @@ class InkboxGateway:
         # Trusted source label. ``None`` means no registered provider claimed
         # the request — an unknown/unverifiable third party.
         source = provider.name if provider is not None else None
+        if envelope.get("companion") is not None and source != "inkbox":
+            return web.Response(status=401, text="Companion events require a valid Inkbox signature")
 
         if source == "inkbox" and self._companion is not None:
             failure_scopes = self._companion.delivery_failure_scopes(envelope)
@@ -2760,6 +2763,7 @@ class InkboxGateway:
                         or self._thread_key("imessage", conversation_id) in getattr(self.sessions, "sessions", {})
                     )
                     if is_group and not conversation_id:
+                        self._dedup_commit(event_key)
                         return web.json_response({"ok": True, "ignored": "group-without-conversation"})
                     chat_id = self._thread_key("imessage", conversation_id) if is_group else self._chat_key(
                         data, sender, self._thread_key("imessage", conversation_id),
@@ -2895,6 +2899,7 @@ class InkboxGateway:
         error_detail: Optional[str],
         stage: str,
         contact: Optional[Dict[str, Any]] = None,
+        reply_meta: Optional[Dict[str, Any]] = None,
     ) -> "web.Response":
         """Wake the agent about an undelivered outbound message.
 
@@ -2947,7 +2952,13 @@ class InkboxGateway:
         )
         # Run in the background so the webhook returns promptly; the turn can
         # take a while (the agent may send on another channel).
-        asyncio.create_task(self._run_failure_turn(chat_id, prompt, mode, target or "", conversation_id))
+        session = self.sessions.get(chat_id)
+        route = deepcopy(reply_meta or {})
+        if not route and callable(getattr(session, "_reply_route", None)):
+            saved_mode, saved_route = session._reply_route()
+            if saved_mode == mode and (not conversation_id or saved_route.get("conversation_id") == conversation_id):
+                route = deepcopy(saved_route)
+        asyncio.create_task(self._run_failure_turn(chat_id, prompt, mode, target or "", conversation_id, route))
         logger.warning(
             "[bridge] Woke agent about failed outbound %s (attempt %d/%d, stage=%s, error=%s)",
             mode,
@@ -2958,11 +2969,12 @@ class InkboxGateway:
         )
         return web.json_response({"ok": True})
 
-    async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str, conversation_id: Optional[str] = None) -> None:
+    async def _run_failure_turn(self, chat_id: str, prompt: str, channel: str, recipient: str, conversation_id: Optional[str] = None, reply_meta: Optional[Dict[str, Any]] = None) -> None:
         try:
-            await self.sessions.get(chat_id).run_consult(prompt, mode=channel, reply_meta={
+            route = deepcopy(reply_meta) if reply_meta else {
                 "to": recipient, "sender": recipient, "conversation_id": conversation_id,
-            })
+            }
+            await self.sessions.get(chat_id).run_consult(prompt, mode=channel, reply_meta=route)
         except Exception:
             logger.exception("[bridge] delivery-failure turn failed: %s → %s", channel, recipient)
 
@@ -3043,6 +3055,7 @@ class InkboxGateway:
             error_code=error_code,
             error_detail=error_detail,
             stage="send_rejected",
+            reply_meta=meta,
         )
 
     # ── Asynchronous delivery-failure webhooks ─────────────────────────

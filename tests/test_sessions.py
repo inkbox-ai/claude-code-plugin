@@ -1137,3 +1137,28 @@ def test_send_failure_log_omits_recipient_and_provider_detail(caplog):
     assert "RuntimeError" in caplog.text
     assert "private" not in caplog.text
     assert "credential" not in caplog.text
+
+
+def test_failed_permission_prompt_clears_pending_answer():
+    async def scenario():
+        session = make_session([])
+        async def fail(*_args):
+            raise ConnectionError("prompt was not delivered")
+        session.send_fn = fail
+        with pytest.raises(ConnectionError):
+            await session._escalate("permission", "Approve?")
+        assert session.pending is None
+    asyncio.run(scenario())
+
+
+def test_direct_contact_can_answer_email_permission_from_sms():
+    async def scenario():
+        session = make_session([])
+        session.mode = "email"
+        session.reply_meta = {"sender": "person@example.com", "message_id": "stored-email"}
+        task = asyncio.create_task(session._escalate("permission", "Approve?"))
+        await asyncio.sleep(0)
+        await session.handle_inbound("allow", "sms", {"sender": "+15555550101", "conversation_kind": "direct"})
+        assert await task == "allow"
+        assert session._queue.empty()
+    asyncio.run(scenario())

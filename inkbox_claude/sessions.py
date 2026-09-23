@@ -438,7 +438,7 @@ class ContactSession:
             sender = str(meta.get("sender") or "")
             from .companion import same_author
             pending_reply = (not meta.get("reaction") and
-                             (same_author(mode, sender, expected) if expected else not is_group)
+                             (not (is_group or meta.get("companion")) or (bool(expected) and same_author(mode, sender, expected)))
                              and (not is_group or self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None))
         quiet = (is_group and self.cfg.group_reply_mode == "mention" and not command
                  and not pending_reply and not mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity))
@@ -1281,8 +1281,8 @@ class ContactSession:
             questions=list(questions or []),
             tool_name=tool_name,
         )
-        await self._reply(prompt_text)
         try:
+            await self._reply(prompt_text)
             return await asyncio.wait_for(
                 self.pending.future, timeout=self.cfg.permission_timeout_s
             )

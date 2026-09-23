@@ -23,6 +23,9 @@
   original channel and destination. Automatic email replies preserve recipients
   and threading through the SDK reply-all operation.
 - Mixed-case email authors work throughout initialization and approval handling.
+- Failed permission prompts release pending answers, and email failure recovery
+  preserves the original stored reply UUID. Corrupt checkpoints pause only their
+  own scope; unsigned Companion envelopes never enter ordinary routing.
 - Startup failures preserve selected sessions; closing during startup cannot
   resurrect a stale client. Early completed results retain their output.
 

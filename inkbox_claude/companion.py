@@ -212,11 +212,28 @@ class CompanionReceiver:
                 fcntl.flock(self._owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError("Companion identity already has an active owner") from None
-            self.records = {
-                path.stem: json.loads(path.read_text()) for path in self.root.glob("*.json")
-            }
-            for key, record in self.records.items():
-                self.validate_record(key, record)
+            self.records = {}
+            self.quarantined = {path.stem for path in self.root.glob("*.invalid")}
+            for path in self.root.glob("*.json"):
+                key = path.stem
+                if key in self.quarantined:
+                    continue
+                try:
+                    record = json.loads(path.read_text())
+                    self.validate_record(key, record)
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    # Preserve the original bytes and reserve the filename's scope
+                    # permanently. An invalid checkpoint must never be replayed as new.
+                    path.replace(path.with_suffix(".invalid"))
+                    directory = os.open(self.root, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                    self.quarantined.add(key)
+                    logger.error("Companion checkpoint quarantined; its scope is paused: %s", key)
+                    continue
+                self.records[key] = record
                 if record["state"] in {"submitting", "submitted"} or any(
                     event["state"] in {"submitting", "submitted", "sending"}
                     for event in record["events"].values()
@@ -331,6 +348,8 @@ class CompanionReceiver:
         ):
             raise RuntimeError("Companion mode requires Inkbox SDK 0.7.6 or newer")
         key = self.scope_key(scope)
+        if key in self.quarantined:
+            raise RuntimeError("Companion scope is paused because its checkpoint is invalid")
         record = self.records.setdefault(
             key,
             {

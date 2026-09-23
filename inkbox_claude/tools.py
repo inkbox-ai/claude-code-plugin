@@ -663,7 +663,7 @@ def build_inkbox_mcp_server(
             try:
                 call = identity.place_call(**call_kwargs)
             except TypeError:
-                raise RuntimeError("phone call voice stacks require inkbox SDK 0.7.3 or newer")
+                raise RuntimeError("phone call voice stacks require inkbox SDK 0.7.6 or newer")
             return {
                 "placed": True,
                 "id": str(getattr(call, "id", "")),

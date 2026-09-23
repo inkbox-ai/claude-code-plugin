@@ -116,3 +116,29 @@ def test_automatic_email_uses_real_sdk_reply_all_endpoint_and_original_uuid():
     with pytest.raises(ValueError, match="stored inbound"):
         asyncio.run(gw.send_to_contact("contact", "Reply", "email", {"to": "sender@example.com"}))
     assert len(calls) == 1
+
+
+def test_email_failure_recovery_keeps_original_inbound_reply_uuid():
+    async def scenario():
+        gw = gateway()
+        original = {"sender": "person@example.com", "to": "person@example.com", "conversation_id": "thread", "message_id": "inbound-stored-uuid"}
+        await gw._note_send_rejection("contact", "email", original, "failed answer", ValueError("rejected"))
+        original["message_id"] = "later-message"
+        await asyncio.sleep(0)
+        route = gw.sessions.get("contact").run_consult.call_args.kwargs["reply_meta"]
+        assert route["message_id"] == "inbound-stored-uuid"
+        assert route["conversation_id"] == "thread"
+    asyncio.run(scenario())
+
+
+def test_missing_group_reaction_is_committed_to_dedup():
+    async def scenario():
+        gw = gateway()
+        gw._lookup_imessage_conversation_summary = AsyncMock(return_value={"is_group": True})
+        event = {"data": {"reaction": {"id": "reaction-missing-conversation", "remote_number": "+15555550101", "direction": "inbound", "reaction": "like", "is_group": True}}}
+        first = await gw._on_imessage_reaction_received(event)
+        assert "group-without-conversation" in first.text
+        second = await gw._on_imessage_reaction_received(event)
+        assert "deduped" in second.text
+        assert not gw.sessions.sessions
+    asyncio.run(scenario())
