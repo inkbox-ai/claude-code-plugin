@@ -22,7 +22,7 @@ class _FakeSession:
     def __init__(self):
         self.consulted = []
 
-    async def run_consult(self, prompt):
+    async def run_consult(self, prompt, **kwargs):
         self.consulted.append(prompt)
         return ""
 

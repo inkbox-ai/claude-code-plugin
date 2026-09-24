@@ -95,6 +95,37 @@ def test_inkbox_mcp_server_builds_against_installed_sdk():
     assert expected <= set(tool_names)
 
 
+@pytest.mark.parametrize("field,value", [("notes", "Updated note"), ("given_name", "Ada")])
+def test_contact_update_accepts_partial_fields_through_real_mcp_schema(field, value):
+    import asyncio
+    import anyio
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+    from inkbox_claude.tools import build_inkbox_mcp_server
+
+    async def scenario():
+        client = MagicMock()
+        client.contacts.update.return_value = {"id": "contact-1", field: value}
+        config, _ = build_inkbox_mcp_server(client, "contract-test")
+        server = config["instance"]
+        async with create_client_server_memory_streams() as (client_streams, server_streams):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(server.run, *server_streams, server.create_initialization_options())
+                async with ClientSession(*client_streams) as session:
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    update = next(tool for tool in listed.tools if tool.name == "inkbox_update_contact")
+                    assert update.model_dump(by_alias=True)["inputSchema"]["required"] == ["contact_id"]
+                    result = await session.call_tool(
+                        "inkbox_update_contact", {"contact_id": "contact-1", field: value}
+                    )
+                    assert not result.model_dump(by_alias=True).get("isError"), result.content
+                tasks.cancel_scope.cancel()
+        client.contacts.update.assert_called_once_with("contact-1", **{field: value})
+
+    asyncio.run(scenario())
+
+
 def test_claude_cli_installed_and_answers_version():
     """The SDK drives a ``claude`` subprocess; the CLI must be present and sane."""
     claude = shutil.which("claude")

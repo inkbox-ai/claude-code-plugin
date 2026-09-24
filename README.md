@@ -171,7 +171,7 @@ Claude Code never silently runs anything destructive. The bridge passes a `can_u
 
 ## Sessions
 
-Sessions are keyed by Inkbox contact, so one person = one conversation across channels. Claude session ids are persisted in `~/.inkbox-claude/sessions.json` and resumed across bridge restarts — your conversation picks up where it left off. Replies go out on the channel you last used. If a voice call ends before Claude finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
+Direct sessions are keyed by Inkbox contact, so one person shares context across channels. SMS and iMessage groups instead use their conversation ID: all participants share one session, separate from direct messages and other groups. Reactions and delivery recovery stay in that group. Claude session IDs persist in `~/.inkbox-claude/sessions.json` across restarts. Each turn keeps its original reply destination, including errors and permission prompts. Automatic email replies use reply-all on the stored inbound message, preserving its To/CC and thread; explicit send tools can still start a new email. If a voice call ends before Claude finishes a voice reply, that late voice reply is dropped instead of silently switching to SMS or email.
 
 **A2A worker progress.** Inbound A2A tasks receive an immediate pickup acknowledgement, followed by short progress updates about every three minutes until the task settles. Set `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` to change the cadence or `0` to disable periodic updates.
 
@@ -236,6 +236,94 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 - **iMessage** — `inkbox_send_imessage(..., media_path=...)` (uploaded + sent, ≤10 MB).
 - **SMS/MMS** — `inkbox_send_sms(..., media_paths=[...])` (uploaded + sent; `media_urls` also accepts already-hosted URLs).
 
+## Companion mode
+
+Version 0.2.13 supports Companion mode with Inkbox SDK 0.7.6 or newer. It stays
+off until an administrator enables it for the identity and selects a sponsor.
+Use an agent-scoped API key. The bridge loads every initialization-history page,
+including attachment references and notices, before processing the current
+receipt. Historical sponsor messages do not trigger separate replies. Sessions
+are isolated by environment, identity, channel, conversation scope, and activation;
+a new activation starts separate context. Companion history is excluded from
+contact-memory injection.
+
+Two independent settings control when a model turn starts:
+
+- `INKBOX_GROUP_REPLY_MODE=auto|mention` (default `auto`). In `mention` mode,
+  the current message must contain a whole `@agent` or `@your-handle` mention,
+  case-insensitively. Links, email addresses, and previous messages do not count.
+  For Companion email, putting the agent's mailbox in the current **To** list
+  also counts; Cc and Bcc alone do not.
+- `INKBOX_COMPANION_RESPONSE_MODE=safe|relaxed` (default `safe`). Safe mode
+  wakes only for a current `sender_access="direct"` message. Sponsored messages
+  and messages without recognized access metadata remain context-only. Relaxed
+  mode permits any delivered sender to wake the agent, subject to mention mode.
+  `direct` means the message passed contact rules without sponsorship, including
+  allowed-by-default senders—not permanent trust or permission to execute tools.
+
+Quiet messages are durably buffered without starting the model, using tools,
+typing, interrupting a running turn, or changing its reply destination. They are
+included as context in the next eligible turn. The setup wizard offers both
+settings for new and reconfigured identities and preserves existing choices.
+Mention mode also applies to ordinary SMS/iMessage groups. Ordinary slash controls
+and valid approval answers from the asked sender remain mention-exempt.
+
+Automatic replies and `inkbox_reply_companion` use the saved sponsor email
+reply-all anchor or signed MMS/iMessage conversation. The bridge reuses that
+route and its startup identity without loading activation history again for each
+turn or reply. Optional local sender rules still apply without a network lookup, as do
+existing send requirements. Group iMessage requires a
+supported dedicated line. Companion mode does not grant permission to send a
+separate direct message or place a call.
+
+`INKBOX_COMPANION_MAX_BYTES` defaults to `200000`. It bounds snapshot loading and
+the assembled UTF-8 input. If history exceeds the limit, initialization fails
+explicitly before a Claude query. Nothing is truncated or split into extra
+turns. Choose a limit that fits your model's context, including its system prompt
+and tools; bytes are not a token estimate. Attachment references and history-gap
+notices remain in the input.
+
+Companion state is stored under `~/.inkbox-claude/companion/`, or the corresponding
+directory under `INKBOX_CLAUDE_HOME`. Keep this state when upgrading. Pending
+hydration and queued messages recover on restart. `/health` exposes counts by
+Companion state; each checkpoint records a logical submission ID and any error.
+Only one bridge process can own an identity's Companion state in that directory.
+Invalid checkpoints are preserved with an `.invalid` suffix and only that scope is
+paused; unrelated conversations and channels can still start. Keep quarantined
+files until an operator reconciles the uncertain state, rather than deleting them
+to admit duplicate work. Delivery-failure callbacks for quarantined conversations
+are held instead of starting private recovery. If corruption also destroys the
+routing information, all delivery-failure callbacks are held until it is repaired;
+ordinary inbound messages and healthy Companion scopes still work.
+Temporary startup, hydration, and pre-submission failures retry automatically
+with delays capped at 30 seconds. Network failures and HTTP 429/5xx remain
+retryable; other unexpected startup or hydration failures pause after five retries
+for operator review. Nonretryable preparation failures for an already completed
+answer pause immediately, retaining the answer.
+Completed model results are checkpointed before
+sending, so a known pre-send failure retries delivery without rerunning the model.
+If activation loading reports unavailable access, captured message content is
+discarded while deduplication records remain. Stop the bridge before moving its state directory.
+Delivery failures for tracked conversations are logged and saved as
+`last_delivery_failure` in their checkpoints for operator review. They do not
+start an automatic retry turn or a private contact conversation.
+
+If a query's acceptance, completion, or send outcome is uncertain, the conversation is marked
+`paused`. Restarting does not resend it. Stop the bridge and inspect the Claude
+transcript using the checkpoint's logical input ID before reconciling the state.
+Keep unresolved outcomes paused; deleting checkpoints or resetting them to pending
+can repeat actions. An oversized or unavailable activation is marked `failed`;
+after correcting a pre-submission failure, an operator may reset its state to
+`pending` while the bridge is stopped, then restart to revalidate it.
+
+Historical commands and approval-like text remain conversation data. Only a new
+live message from the sender who was asked can answer a Companion permission request
+or question; it must pass both current sender-access and addressing policies.
+The prompt explains the mention requirement. Sponsor slash controls use the same
+gates. Email author comparisons are case-insensitive; phone authors match exactly.
+Tracked ordinary messages use their own group conversation, separate from active
+Companion context.
+
 ## Config reference
 
 | Env var | Required | Default | Description |
@@ -249,6 +337,9 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
 | `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised/unverified external webhooks (see [External webhooks](#external-webhooks)). |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Include matched-contact memories as background context for human conversations and calls. |
+| `INKBOX_GROUP_REPLY_MODE` | no | `auto` | `auto` or `mention`; only current explicit mentions wake group turns. |
+| `INKBOX_COMPANION_RESPONSE_MODE` | no | `safe` | `safe` requires current direct admission; `relaxed` permits any delivered sender. |
+| `INKBOX_COMPANION_MAX_BYTES` | no | `200000` | Maximum bytes for Companion snapshot loading and one assembled input. |
 | `INKBOX_A2A_PROGRESS_INTERVAL_SECONDS` | no | `180` | Seconds between short progress updates for active inbound A2A tasks; `0` disables periodic updates. |
 | `INKBOX_WEBHOOK_SECRET_<NAME>` | per source | - | Verification secret for a registered third-party webhook source (e.g. `INKBOX_WEBHOOK_SECRET_GITHUB`). |
 | `INKBOX_BASE_URL` | no | SDK default | Override the Inkbox API base URL. |
@@ -274,6 +365,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 
 - `inkbox_whoami` — its own identity: handle, mailbox, and its two calling lines (dedicated phone number + shared iMessage line status).
 - `inkbox_send_email` — send email; attach local files with `attachment_paths`.
+- `inkbox_reply_companion` replies to the current Companion group with its fixed reply target.
 - `inkbox_send_sms` — send SMS/MMS; attach local files with `media_paths` (or hosted `media_urls`).
 - `inkbox_send_imessage` — send into an iMessage conversation; attach a local file with `media_path`.
 - `inkbox_place_call` — place an outbound voice call through the running gateway with purpose/opening/context, over either line via `origination` (see [Two calling lines](#two-calling-lines)).
@@ -286,7 +378,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
 
-The bridge requires Inkbox SDK 0.5.9 or newer.
+The bridge requires Inkbox SDK 0.7.6 or newer, below 1.0.0.
 
 ### Phone call voice stack
 
@@ -342,6 +434,10 @@ On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent
 6. Call the number, ask what it's working on, hang up mid-answer, and verify the late voice tail is not silently sent as SMS or email.
 
 ## Development
+
+Development installs and CI use the published Inkbox SDK (`>=0.7.6,<1.0.0`),
+including typed `sender_access` on initialization-history entries. Contract tests
+also exercise the latest Claude Agent SDK and Claude Code CLI.
 
 ```bash
 python -m pytest

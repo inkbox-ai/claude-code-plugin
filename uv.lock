@@ -407,7 +407,7 @@ wheels = [
 
 [[package]]
 name = "claude-code-plugin"
-version = "0.2.12"
+version = "0.2.13"
 source = { virtual = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -422,7 +422,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'", specifier = ">=0.2.1" },
     { name = "claude-agent-sdk", specifier = ">=0.1.0" },
-    { name = "inkbox", specifier = ">=0.5.9,<1.0.0" },
+    { name = "inkbox", specifier = ">=0.7.6,<1.0.0" },
     { name = "segno", specifier = ">=1.5" },
 ]
 
@@ -696,7 +696,7 @@ wheels = [
 
 [[package]]
 name = "inkbox"
-version = "0.5.14"
+version = "0.7.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argon2-cffi" },
@@ -706,9 +706,9 @@ dependencies = [
     { name = "h2" },
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/04/0599f9ded121fdb5cba955bdb3908a75d401f447a56b2550e15f837bc7da/inkbox-0.5.14.tar.gz", hash = "sha256:92c3a706e8e289a362f0a7a42090b6fae251bbac6ff9d9989afabb583d20758a", size = 392084, upload-time = "2026-08-07T18:14:00.652Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/95/6e/b5e45858c64c458d84cf9b0590e3b387888b2852b6159b901a226f205d9c/inkbox-0.7.7.tar.gz", hash = "sha256:ecc14eb1e209013bfba8a9ffcd4de44cdb9445dfcd8d8eb0b3ede2f92fd4fd8f", size = 460696, upload-time = "2026-09-22T20:52:25.284Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/f1/ef2d2fe3b5e004aac375796268dc438a8900e45abf1669c591d640b8d3b8/inkbox-0.5.14-py3-none-any.whl", hash = "sha256:bf256f2091a76dfcf56e896f8aaf54199efb60d693074f6ea5b2ac57d9b4313d", size = 266404, upload-time = "2026-08-07T18:13:59.309Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/f7/2eea6215600e03ae40c71a9eb1ebb5fb0f3f56d4c7cede5a838168e9970e/inkbox-0.7.7-py3-none-any.whl", hash = "sha256:ae1dd641d7452a96daad28bee3f1d30add66b11d329c98a9602e760801a089d3", size = 301883, upload-time = "2026-09-22T20:52:23.852Z" },
 ]
 
 [[package]]

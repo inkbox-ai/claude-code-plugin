@@ -343,7 +343,7 @@ def test_group_sms_selects_only_resolved_sender_contact_memories(monkeypatch):
 
     asyncio.run(gw._on_text_received(envelope))
 
-    body, _, meta = gw.sessions.by_id["contact-sender"].inbound[0]
+    body, _, meta = gw.sessions.by_id["sms:conv-memory"].inbound[0]
     assert body.startswith("[inkbox:group_sms")
     assert meta["contact_memories"] == ["sender memory"]
 

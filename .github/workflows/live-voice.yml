@@ -55,12 +55,16 @@ jobs:
         with:
           node-version: 22
 
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: "latest"
+
       # uvicorn[standard] matters: the bare install can't accept WebSocket
       # upgrades, and the driver's call-media endpoint is a WebSocket.
       - name: Install bridge + driver deps
         run: |
-          tests/ci/retry_install.sh pip install \
-            "inkbox==0.5.9" \
+          tests/ci/retry_install.sh uv pip install --system \
+            \
             -e . pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI

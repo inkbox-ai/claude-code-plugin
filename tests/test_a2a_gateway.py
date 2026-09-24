@@ -60,6 +60,7 @@ def _gateway(tmp_path):
     gateway._a2a_canceled_tasks = {}
     gateway._a2a_ingest_lock = asyncio.Lock()
     gateway._closing = False
+    gateway._companion = None
     gateway.cfg = BridgeConfig(project_dir=str(tmp_path))
     task = types.SimpleNamespace(
         id="task-1",

@@ -64,6 +64,14 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _mode_env(name: str, default: str, choices: set[str]) -> str:
+    """Validate a response policy instead of silently changing its meaning."""
+    value = (os.getenv(name) or default).strip().lower()
+    if value not in choices:
+        raise ValueError(f"{name} must be one of: {', '.join(sorted(choices))}")
+    return value
+
+
 def _csv_env(name: str) -> List[str]:
     raw = os.getenv(name) or ""
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -89,6 +97,9 @@ class BridgeConfig:
     # off: only registered, signature-verified sources get through).
     external_events_enabled: bool = False
     contact_memories_enabled: bool = True
+    companion_max_bytes: int = 200_000
+    group_reply_mode: str = "auto"
+    companion_response_mode: str = "safe"
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     # Claude Code side
@@ -193,6 +204,9 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
+        companion_max_bytes=int(os.getenv("INKBOX_COMPANION_MAX_BYTES") or 200_000),
+        group_reply_mode=_mode_env("INKBOX_GROUP_REPLY_MODE", "auto", {"auto", "mention"}),
+        companion_response_mode=_mode_env("INKBOX_COMPANION_RESPONSE_MODE", "safe", {"safe", "relaxed"}),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
         project_dir=str(os.getenv("CLAUDE_PROJECT_DIR") or extra.get("project_dir") or os.getcwd()).strip(),

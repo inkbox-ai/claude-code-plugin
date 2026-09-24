@@ -15,6 +15,7 @@ import mimetypes
 import secrets
 import time
 import uuid
+from copy import deepcopy
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -415,6 +416,24 @@ def build_inkbox_mcp_server(
             return _error(str(exc))
 
     @tool(
+        "inkbox_reply_companion",
+        "Reply to the current Companion group using its fixed email reply-all or conversation target.",
+        {"text": str},
+    )
+    async def inkbox_reply_companion(args: Dict[str, Any]) -> Dict[str, Any]:
+        session = CURRENT_SESSION.get()
+        if session is None or not session.reply_meta.get("companion") or not session._turn_active:
+            return _error("No active Companion conversation.")
+        try:
+            await session.send_fn(
+                session.chat_id, str(args["text"]), session.mode, deepcopy(session.reply_meta),
+            )
+            session._current_channel_tool_delivery = True
+            return _result({"sent": True})
+        except Exception as exc:
+            return _error(str(exc))
+
+    @tool(
         "inkbox_send_sms",
         "Send an SMS/MMS from this agent's Inkbox phone number. Reply in a thread "
         "with conversation_id, or start one with to (E.164). To send images/files "
@@ -644,7 +663,7 @@ def build_inkbox_mcp_server(
             try:
                 call = identity.place_call(**call_kwargs)
             except TypeError:
-                raise RuntimeError("phone call voice stacks require inkbox SDK 0.5.9 or newer")
+                raise RuntimeError("phone call voice stacks require inkbox SDK 0.7.6 or newer")
             return {
                 "placed": True,
                 "id": str(getattr(call, "id", "")),
@@ -863,10 +882,23 @@ def build_inkbox_mcp_server(
         "inkbox_update_contact",
         "Update an existing contact by id (look it up first). Only the fields "
         "you pass change; emails / phones replace the whole list (strings, first "
-        "is primary).",
-        {"contact_id": str, "given_name": str, "family_name": str,
-         "preferred_name": str, "company_name": str, "job_title": str,
-         "notes": str, "emails": list, "phones": list},
+        "is primary). Omit email and phone lists when changing only names or notes.",
+        {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "string"},
+                "given_name": {"type": "string"},
+                "family_name": {"type": "string"},
+                "preferred_name": {"type": "string"},
+                "company_name": {"type": "string"},
+                "job_title": {"type": "string"},
+                "notes": {"type": "string"},
+                "emails": {"type": "array", "items": {"type": "string"}},
+                "phones": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["contact_id"],
+            "additionalProperties": False,
+        },
     )
     async def inkbox_update_contact(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
@@ -1162,6 +1194,7 @@ def build_inkbox_mcp_server(
     tools = [
         inkbox_whoami,
         inkbox_send_email,
+        inkbox_reply_companion,
         inkbox_send_sms,
         inkbox_send_imessage,
         inkbox_place_call,
@@ -1186,10 +1219,13 @@ def build_inkbox_mcp_server(
         inkbox_a2a_ask_caller,
         inkbox_a2a_fail,
     ]
-    server = create_sdk_mcp_server(name="inkbox", version="0.2.9", tools=tools)
+    from . import __version__
+
+    server = create_sdk_mcp_server(name="inkbox", version=__version__, tools=tools)
     tool_names = [
         "mcp__inkbox__inkbox_whoami",
         "mcp__inkbox__inkbox_send_email",
+        "mcp__inkbox__inkbox_reply_companion",
         "mcp__inkbox__inkbox_send_sms",
         "mcp__inkbox__inkbox_send_imessage",
         "mcp__inkbox__inkbox_place_call",

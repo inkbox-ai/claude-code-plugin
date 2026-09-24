@@ -32,6 +32,7 @@ class PendingInteraction:
     future: "asyncio.Future[str]"
     questions: List[Dict[str, Any]] = field(default_factory=list)
     tool_name: str = ""
+    sender: str = ""
     created_at: float = field(default_factory=time.time)
 
 

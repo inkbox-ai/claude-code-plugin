@@ -6,8 +6,7 @@ on:
   pull_request:
 
 jobs:
-  # Offline unit suite — inkbox is mocked in the tests, so install only what
-  # they import. Runs on every push/PR, drafts included.
+  # Offline tests exercise SDK pagination with a mocked transport.
   unit:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
@@ -22,8 +21,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: "latest"
+
       - name: Install test deps
-        run: tests/ci/retry_install.sh pip install pytest httpx aiohttp segno "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk
+        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox>=0.7.6,<1.0.0"
 
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.
@@ -55,7 +58,7 @@ jobs:
       - name: Install bridge + latest SDK
         run: |
           tests/ci/retry_install.sh uv pip install --system \
-            "inkbox==0.5.9" \
+            "inkbox>=0.7.6,<1.0.0" \
             -e . pytest
           tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 
