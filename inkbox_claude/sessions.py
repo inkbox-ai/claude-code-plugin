@@ -209,8 +209,45 @@ def _is_missing_resume_error(exc: Exception) -> bool:
     return "No conversation found with session ID" in _exception_text(exc)
 
 
+# What the Claude Code CLI answers with when its login is missing or broken.
+NOT_LOGGED_IN_TEXT = "Not logged in"
+
+
+class ClaudeNotLoggedInError(RuntimeError):
+    """A turn came back as Claude Code's canned "Not logged in" reply.
+
+    The CLI does not raise on a bad login: it streams an assistant message
+    flagged ``authentication_failed`` and an error result, both carrying the
+    text "Not logged in · Please run /login". The turn loop turns that into
+    this exception so it can reconnect instead of relaying the text.
+    """
+
+
+def _is_auth_failure_message(message: Any) -> bool:
+    """True for a streamed message that is the CLI's not-logged-in reply."""
+    if getattr(message, "error", None) == "authentication_failed":
+        return True
+    # Older SDKs drop the ``error`` field; the error result still carries it.
+    return bool(getattr(message, "is_error", False)) and str(
+        getattr(message, "result", "") or ""
+    ).startswith(NOT_LOGGED_IN_TEXT)
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    return isinstance(exc, ClaudeNotLoggedInError) or (
+        f"{NOT_LOGGED_IN_TEXT} · Please run /login" in _exception_text(exc)
+    )
+
+
 def _turn_error_notice(exc: Exception) -> str:
     """Build the text the human sees when a Claude turn cannot start/finish."""
+    if _is_auth_error(exc):
+        return (
+            "Claude Code on the bridge's machine says it isn't logged in, even "
+            "after I reconnected. Run `claude` in a terminal there and use /login "
+            "(texting /login here won't reach it). Your next message will "
+            "reconnect on its own, no /clear needed."
+        )
     if _is_missing_resume_error(exc):
         return (
             "Claude Code couldn't find the old conversation I tried to resume. "
@@ -878,6 +915,7 @@ class ContactSession:
         self._current_turn = turn
         typing_task: Optional[asyncio.Task] = None
         retried_missing_resume = False
+        retried_auth = False
         a2a_token = None
         if turn.a2a_context is not None:
             try:
@@ -915,7 +953,13 @@ class ContactSession:
                     chunks: list[str] = []
                     final: Optional[str] = None
                     completed = False
+                    not_logged_in = False
                     async for message in client.receive_response():
+                        if _is_auth_failure_message(message):
+                            # Don't relay the canned text, and don't adopt the
+                            # failed turn's session id over the real one.
+                            not_logged_in = True
+                            continue
                         if isinstance(message, AssistantMessage):
                             for block in message.content:
                                 if isinstance(block, TextBlock):
@@ -929,19 +973,27 @@ class ContactSession:
                                 self.on_session_id(self.chat_id, message.session_id)
                                 if turn.checkpoint is not None:
                                     turn.checkpoint("submitted")
+                    if not_logged_in:
+                        raise ClaudeNotLoggedInError(
+                            "Claude Code replied: Not logged in"
+                        )
                     if turn.checkpoint is not None and (not completed or not self.resume_session_id):
                         raise RuntimeError("Companion host completion could not be confirmed")
                     reply = (final or "\n\n".join(chunks)).strip()
                     break
                 except Exception as exc:
-                    if (
-                        turn.checkpoint is not None
-                        or retried_missing_resume
-                        or not self.resume_session_id
-                        or not _is_missing_resume_error(exc)
-                    ):
+                    if turn.checkpoint is not None:
                         raise
-                    retried_missing_resume = True
+                    stale_resume = (
+                        not retried_missing_resume
+                        and bool(self.resume_session_id)
+                        and _is_missing_resume_error(exc)
+                    )
+                    # A cached subprocess that hit a login blip keeps saying
+                    # "Not logged in" forever, so rebuild it once and retry.
+                    auth_retry = not retried_auth and _is_auth_error(exc)
+                    if not (stale_resume or auth_retry):
+                        raise
                     if typing_task is not None:
                         typing_task.cancel()
                         try:
@@ -950,7 +1002,17 @@ class ContactSession:
                             pass
                         typing_task = None
                     self._turn_active = False
-                    await self._clear_stale_resume()
+                    if stale_resume:
+                        retried_missing_resume = True
+                        await self._clear_stale_resume()
+                    else:
+                        retried_auth = True
+                        logger.warning(
+                            "[session %s] Claude Code reported not logged in; "
+                            "reconnecting and retrying once",
+                            self.chat_id,
+                        )
+                        await self.close()
         except Exception as exc:
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.
