@@ -211,6 +211,9 @@ def bootstrap(
         if voice_ai:
             _configure_voice(identity, client, voice_ai_instructions)
             actions.append("configured_voice_ai")
+        else:
+            _save("INKBOX_VOICE_STACK", VoiceStack.INKBOX_TTS_STT.value)
+            _save("INKBOX_REALTIME_ENABLED", "false")
         blocker = _configure_signing(identity, client, rotate_signing_key, not previous or previous == handle, actions)
         if blocker:
             return {"status": "requires_human", "identity": handle, "actions": actions, "human_actions": [blocker]}
