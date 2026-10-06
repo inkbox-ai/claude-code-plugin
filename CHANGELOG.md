@@ -18,6 +18,8 @@
 - Serialize permission prompts and treat fresh instructions as new work without
   consuming them as an obsolete permission answer. Preserve exact Slack actor
   and native-thread ownership for controls.
+- Persist native Stop targets and unresolved process fences across repeated restarts;
+  reject stale or ambiguous Slack connections before replies and status cleanup.
 - Reconnect a stale Claude login once without saving an error response session ID.
 - Drain native tool side effects during shutdown, preserve unrelated voice work
   when stopping native iMessage, and retain callback-first outbound failures.

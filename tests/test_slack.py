@@ -28,6 +28,13 @@ IDENTITY = "00000000-0000-4000-8000-000000000001"
 CONNECTION = "00000000-0000-4000-8000-000000000002"
 
 
+def connected_client():
+    result = Mock()
+    result.slack.list_connections.return_value = NS(connections=[NS(
+        id=CONNECTION, identity_id=IDENTITY, workspace_id="T_TEST", status="connected")])
+    return result
+
+
 def event(**overrides):
     result = {"id": "evt_1", "event_type": "slack.mention_received", "data": {
         "identity_id": IDENTITY, "connection_id": CONNECTION, "workspace_id": "T_TEST",
@@ -63,6 +70,7 @@ def gw(tmp_path, monkeypatch):
     monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
     result = InkboxGateway(BridgeConfig(slack_enabled=True))
     result._identity = NS(id=IDENTITY)
+    result._inkbox = connected_client()
     result.sessions = Sessions()
     return result
 
@@ -215,7 +223,7 @@ def test_watched_sessions_survive_manager_restart(tmp_path, monkeypatch):
       "thread_ts": "1234567880.000001"}, "1234567880.000001"),
 ])
 def test_replies_preserve_formatting_thread_and_idempotency(gw, overrides, reply_thread):
-    client = Mock()
+    client = connected_client()
     client.slack.send_message.return_value = NS(id="action-1", status="sent")
     gw._inkbox = client
     _, _, meta = inbound_message(event(**overrides), IDENTITY)
@@ -231,7 +239,7 @@ def test_replies_preserve_formatting_thread_and_idempotency(gw, overrides, reply
 
 @pytest.mark.parametrize("status", ["sending", "unknown", "failed"])
 def test_unconfirmed_send_is_not_automatically_retried(gw, status):
-    client = Mock()
+    client = connected_client()
     client.slack.send_message.return_value = NS(id="action-1", status=status)
     _, _, meta = inbound_message(event(), IDENTITY)
     with pytest.raises(RuntimeError, match="action-1"):
@@ -242,9 +250,9 @@ def test_unconfirmed_send_is_not_automatically_retried(gw, status):
 @pytest.mark.parametrize("via_tool", [False, True])
 @pytest.mark.parametrize("text,valid", [("x" * 12000, True), ("x" * 12001, False), ("hello\x00world", False)])
 def test_send_respects_api_text_boundary(via_tool, text, valid):
-    client = Mock()
+    client = connected_client()
     client.get_identity.return_value = NS(id=IDENTITY)
-    client.slack.list_connections.return_value = NS(connections=[NS(id=CONNECTION)])
+    client.slack.list_connections.return_value = NS(connections=[NS(id=CONNECTION, identity_id=IDENTITY, workspace_id="T_TEST", status="connected")])
     client.slack.send_message.return_value = NS(status="sent")
 
     def send():
@@ -266,7 +274,7 @@ def test_send_respects_api_text_boundary(via_tool, text, valid):
 
 
 def test_subscription_reconciliation_does_not_remove_other_receivers():
-    client = Mock()
+    client = connected_client()
     unrelated = NS(id="other", url="https://other.example/webhook", event_types=["slack.mention_received"])
     client.webhooks.subscriptions.list.return_value = [unrelated]
     reconcile_subscription(client, IDENTITY, "https://agent.example/webhook?channel=slack")
@@ -352,7 +360,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed,
 
 @pytest.mark.parametrize("split", [False, True])
 def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
-    client = Mock()
+    client = connected_client()
     url = "https://agent.example/webhook?channel=slack"
     first, *remaining = SLACK_SUBSCRIPTION_EVENTS
     rows = [NS(id="ours", url=url, status="active", event_types=["message.received", first])]
@@ -371,7 +379,7 @@ def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
 
 
 def test_paused_subscription_is_not_bypassed_by_new_registration():
-    client = Mock()
+    client = connected_client()
     url = "https://agent.example/webhook?channel=slack"
     client.webhooks.subscriptions.list.return_value = [
         NS(url=url, status="paused", event_types=["message.received", "slack.dm_received"])]
@@ -385,9 +393,9 @@ def test_paused_subscription_is_not_bypassed_by_new_registration():
 
 def test_tools_scope_reads_and_writes_to_configured_identity(monkeypatch):
     monkeypatch.setenv("INKBOX_SLACK_ENABLED", "1")
-    client = Mock()
+    client = connected_client()
     client.get_identity.return_value = NS(id=IDENTITY)
-    client.slack.list_connections.return_value = NS(connections=[NS(id=CONNECTION)])
+    client.slack.list_connections.return_value = NS(connections=[NS(id=CONNECTION, identity_id=IDENTITY, workspace_id="T_TEST", status="connected")])
     run_tool(client, "agent", "inkbox_slack_search", {"q": "release"})
     client.slack.search_messages.assert_called_once_with(identity_id=IDENTITY, q="release")
     with pytest.raises(ValueError, match="does not belong"):
@@ -467,7 +475,7 @@ def test_tools_and_replies_match_real_slack_sdk_wire(monkeypatch):
         send = next(r for r in requests if r.method == "POST")
         assert send.headers["Idempotency-Key"] == "test-1"
         assert json.loads(send.content) == {"conversation_id": "CTEST", "text": "Hello"}
-        send_reply(client, inbound_message(event(conversation_id="CTEST"), IDENTITY)[2], "Reply")
+        send_reply(client, inbound_message(event(conversation_id="CTEST", workspace_id="TTEST"), IDENTITY)[2], "Reply")
         assert json.loads(requests[-1].content)["thread_ts"] == "1234567890.000001"
     finally:
         client.close()
@@ -509,7 +517,7 @@ def stop_event(**overrides):
 
 
 def test_existing_message_subscription_extends_selection_for_native_stop(gw):
-    client = Mock()
+    client = connected_client()
     url = "https://agent.example/webhook"
     client.webhooks.subscriptions.list.return_value = [NS(
         id="ours", url=url, status="active", event_types=[event for event in SLACK_SUBSCRIPTION_EVENTS
@@ -520,3 +528,86 @@ def test_existing_message_subscription_extends_selection_for_native_stop(gw):
         "ours", event_types=list(SLACK_SUBSCRIPTION_EVENTS), scope="identity",
     )
     client.webhooks.subscriptions.create.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "identity", "workspace", "disconnected"])
+def test_stale_slack_connection_blocks_admission_and_reply(gw, change):
+    owned = gw._inkbox.slack.list_connections.return_value.connections
+    if change == "missing":
+        owned.clear()
+    elif change == "duplicate":
+        owned.append(copy.copy(owned[0]))
+    elif change == "identity":
+        owned[0].identity_id = "another-identity"
+    elif change == "workspace":
+        owned[0].workspace_id = "T_OTHER"
+    else:
+        owned[0].status = "disconnected"
+    with pytest.raises(PermissionError, match="uniquely active"):
+        asyncio.run(gw._on_slack_received(event()))
+    assert not gw.sessions.turns
+    with pytest.raises(PermissionError, match="uniquely active"):
+        asyncio.run(gw.send_to_contact("session", "must not send", "slack", inbound_message(event(), IDENTITY)[2]))
+    gw._inkbox.slack.send_message.assert_not_called()
+
+
+@pytest.mark.parametrize("companion", [False, True])
+def test_native_stop_receipt_cannot_cancel_later_work_after_restart(gw, companion):
+    async def run():
+        key, _, meta = inbound_message(event(), IDENTITY)
+        if companion:
+            key = "companion:channel-wide"
+        session = make_session([])
+        session.chat_id = key
+        first = _Turn("first", mode="slack", reply_meta=meta)
+        session._queue.put_nowait(first)
+        gw.sessions.sessions[key] = session
+        await gw._on_slack_received(stop_event())
+        assert session._queue.empty()
+        next_turn = _Turn("new work", mode="slack", reply_meta={**meta, "source_event_id": "next"})
+        session._queue.put_nowait(next_turn)
+        await gw._on_slack_received(stop_event())
+        assert list(session._queue._queue) == [next_turn]
+        gw._channel_stores["slack"].close()
+        gw._channel_stores.clear()
+        await gw._on_slack_received(stop_event())
+        assert list(session._queue._queue) == [next_turn]
+        import sqlite3
+        with sqlite3.connect(gw._channel_store("slack").path) as db:
+            targets = json.loads(db.execute("SELECT targets FROM controls").fetchone()[0])
+        assert targets == [{"chat_id": key, "source_event_ids": ["evt_1"]}]
+    asyncio.run(run())
+
+
+def test_native_stop_snapshot_does_not_cancel_other_actor_or_new_arrival(gw):
+    async def run():
+        key, _, meta = inbound_message(event(), IDENTITY)
+        session = make_session([])
+        session.chat_id = key
+        first = _Turn("running", mode="slack", reply_meta=meta)
+        other = _Turn("other actor", mode="slack", reply_meta={**meta, "actor_id": "U_BOB"})
+        fresh = _Turn("arrived during Stop", mode="slack", reply_meta={**meta, "source_event_id": "fresh"})
+        session._current_turn = first
+        session._turn_active = True
+        session._queue.put_nowait(other)
+        async def interrupt():
+            session._queue.put_nowait(fresh)
+        session._client = NS(interrupt=interrupt)
+        gw.sessions.sessions[key] = session
+        await gw._on_slack_received(stop_event())
+        assert list(session._queue._queue) == [other, fresh]
+    asyncio.run(run())
+
+
+def test_native_stop_preserves_companion_canonical_home_author_gate(gw):
+    async def run():
+        _, _, meta = inbound_message(event(), IDENTITY)
+        session = make_session([])
+        session.chat_id = "companion:channel-wide"
+        turn = _Turn("owned work", mode="slack", reply_meta={**meta, "sender": "THOME:U_ALICE"})
+        session._queue.put_nowait(turn)
+        gw.sessions.sessions[session.chat_id] = session
+        gw.cfg.allowed_users = ["THOME:U_ALICE"]
+        await gw._on_slack_received(stop_event())
+        assert session._queue.empty()
+    asyncio.run(run())

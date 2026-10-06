@@ -90,6 +90,9 @@ class IMessageState:
                     text TEXT NOT NULL, meta TEXT NOT NULL,
                     state TEXT NOT NULL, reply TEXT, batch_anchor TEXT
                 );
+                CREATE TABLE IF NOT EXISTS controls (
+                    event_id TEXT PRIMARY KEY, targets TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS outbound (
                     message_id TEXT PRIMARY KEY, route TEXT NOT NULL
                 );
@@ -114,7 +117,17 @@ class IMessageState:
     def interrupted(self):
         with self._db() as db:
             return [self._receipt(row) for row in db.execute(
-                "SELECT * FROM receipts WHERE state IN ('running','sending') ORDER BY rowid")]
+                "SELECT * FROM receipts WHERE state IN ('running','sending','uncertain') ORDER BY rowid")
+                if not json.loads(row["meta"]).get("host_fenced")]
+
+    def consume_control(self, event_id: str, targets: list[dict]) -> bool:
+        """Persist a Stop tombstone and its exact targets before interrupting anything."""
+        if not event_id:
+            raise ValueError("A control requires a stable event ID")
+        with self._db() as db:
+            result = db.execute("INSERT OR IGNORE INTO controls(event_id,targets) VALUES(?,?)",
+                                (event_id, _json(targets)))
+            return result.rowcount == 1
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:

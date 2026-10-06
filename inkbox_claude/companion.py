@@ -598,19 +598,6 @@ class CompanionReceiver:
                     candidates.append(f"{route['workspace_id']}:{actor}")
         return self.gateway._sender_allowed(*candidates)
 
-    async def stop_slack(self, meta: dict) -> bool:
-        matched = False
-        for chat_id, route in list(self.active_replies.items()):
-            if tuple(meta.get(k) for k in ("connection_id", "conversation_id", "thread_ts")) != tuple(route.get(k) for k in ("connection_id", "conversation_id", "thread_ts")):
-                continue
-            matched = True
-            if tuple(meta.get(k) for k in ("actor_id", "workspace_id")) != tuple(route.get(k) for k in ("actor_id", "workspace_id")):
-                continue
-            session = self.gateway.sessions.sessions.get(chat_id)
-            if session and self.gateway._sender_allowed(route.get("sender", ""), meta.get("actor_id", "")):
-                await session._abort_in_flight()
-        return matched
-
     def begin_send(self, chat_id: str) -> None:
         """Mark the external boundary after all local send preparation succeeded."""
         active = self.active_outputs.get(chat_id)

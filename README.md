@@ -308,11 +308,12 @@ Delivery failures for tracked conversations are logged and saved as
 `last_delivery_failure` in their checkpoints for operator review. They do not
 start an automatic retry turn or a private contact conversation.
 
-If a query's acceptance, completion, or send outcome is uncertain, the conversation is marked
-`paused`. Restarting does not resend it. Stop the bridge and inspect the Claude
-transcript using the checkpoint's logical input ID before reconciling the state.
-Keep unresolved outcomes paused; deleting checkpoints or resetting them to pending
-can repeat actions. An oversized or unavailable activation is marked `failed`;
+If a query's acceptance, completion, or send outcome is uncertain, the request is retained
+without replay. The conversation stays `paused` while the old native owner cannot be
+fenced; once fencing is proved, the uncertain request becomes `unconfirmed` and later
+fresh work can proceed. Stop the bridge and inspect the Claude transcript using the
+checkpoint's logical input ID before manually reconciling an unresolved outcome.
+Deleting checkpoints or resetting uncertain requests to pending can repeat actions. An oversized or unavailable activation is marked `failed`;
 after correcting a pre-submission failure, an operator may reset its state to
 `pending` while the bridge is stopped, then restart to revalidate it.
 
@@ -476,6 +477,9 @@ webhook signature enforcement is disabled.
 Ordinary channel mentions reply in a native thread; ordinary DMs reply inline.
 Companion keeps one channel-wide conversation across native threads, but replies,
 approval answers, and Stop stay attached to the current message's exact route.
+Native Stop receipts persist their exact actor/thread-owned targets before interruption;
+a redelivered Stop cannot cancel a later request. Current connection ownership, workspace
+and connected status are checked before admission, replies and indicator cleanup.
 A top-level Companion reply stays top-level. `INKBOX_GROUP_REPLY_MODE=mention`
 requires a native agent mention in a group; `INKBOX_COMPANION_RESPONSE_MODE=safe`
 requires current direct admission. These independent settings compose. Quiet
@@ -540,7 +544,8 @@ terminal saved answers may be reused after a host interruption. Otherwise an
 uncertain request is retained without automatic re-execution; later fresh work
 can proceed only after the old native host and side effects are fenced. An
 uncertain send is never automatically replayed. If ownership cannot be proved,
-readiness reports a blocked scope for operator inspection.
+readiness reports a blocked scope for operator inspection. That block survives repeated
+restarts until ownership fencing is positively confirmed.
 
 State lives under `INKBOX_CLAUDE_HOME` (default `~/.inkbox-claude`). Stop the bridge
 before backing up or moving it. Do not delete journals or session IDs to recover a

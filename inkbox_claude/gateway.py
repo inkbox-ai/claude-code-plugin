@@ -895,8 +895,10 @@ class InkboxGateway:
         if self.cfg.slack_enabled:
             from .slack_activity import SlackActivity
             from .sessions import _state_path
+            from .slack import validate_connection
             self._slack_activity = SlackActivity(self._inkbox.slack,
-                _state_path().parent / f"slack-activity-{self._identity.id}.json")
+                _state_path().parent / f"slack-activity-{self._identity.id}.json",
+                validate_route=lambda meta: validate_connection(self._inkbox.slack, str(self._identity.id), meta))
             await self._slack_activity.recover()
 
         # Sessions get the Inkbox tools so Claude can message proactively.
@@ -1694,10 +1696,13 @@ class InkboxGateway:
                     session._execution_blocked = True
                     blocked_chats.add(item["chat_id"])
                 else:
+                    store.mark({**item["meta"], "host_fenced": True}, "uncertain", chat_id=item["chat_id"])
                     session.buffer_context("Earlier work has an unconfirmed outcome. Do not repeat its actions automatically.",
                                            str(item["meta"].get("source_event_id") or item["meta"].get("imessage_event_id")))
             pending = store.replay_pending()
             for item in store.pending_replies():
+                if item["chat_id"] in blocked_chats:
+                    continue
                 meta = item["meta"]
                 if not self._sender_allowed(str(meta.get("sender") or ""), str(meta.get("actor_id") or "")):
                     store.mark(meta, "cancelled")
@@ -1729,15 +1734,24 @@ class InkboxGateway:
         if incoming is None:
             return web.json_response({"ok": True, "ignored": "slack-message"})
         chat_id, body, meta = incoming
-        if stop and self._companion is not None and await self._companion.stop_slack(meta):
-            return web.json_response({"ok": True})
-        if not self._sender_allowed(meta["sender"], meta["actor_id"]):
+        if not stop and not self._sender_allowed(meta["sender"], meta["actor_id"]):
             return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
+        from .slack import validate_connection
+        await asyncio.to_thread(validate_connection, self._inkbox.slack, str(self._identity.id), meta)
         session = self.sessions.sessions.get(chat_id)
         if stop:
-            route = session._reply_route()[1] if session else {}
-            if session and all(meta.get(k) == route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id")):
-                await session._abort_in_flight()
+            candidates = list(self.sessions.sessions.items())
+            targets = [(key, owned, [turn for turn in owned.slack_stop_targets(meta)
+                if self._sender_allowed(str((turn.reply_meta or {}).get("sender") or ""), meta["actor_id"], meta["sender"])])
+                for key, owned in candidates]
+            targets = [(key, owned, turns) for key, owned, turns in targets if turns]
+            snapshot = [{"chat_id": key, "source_event_ids": [
+                (turn.reply_meta or {}).get("source_event_id") for turn in turns
+            ]} for key, _, turns in targets]
+            if not self._channel_store("slack").consume_control(meta["source_event_id"], snapshot):
+                return web.json_response({"ok": True, "deduped": True})
+            for _, owned, turns in targets:
+                await owned._abort_in_flight(only_mode="slack", only_turns=turns)
             return web.json_response({"ok": True})
         if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
             return web.json_response({"ok": True, "ignored": "unengaged-thread"})
@@ -5005,10 +5019,12 @@ class InkboxGateway:
             return
 
         if mode == "slack":
-            from .slack import send_reply
+            from .slack import send_reply, validate_connection
             from .tools import _to_thread_drained
             if not self.cfg.slack_enabled:
                 raise PermissionError("Slack is disabled")
+            meta = {**meta, "identity_id": str(self._identity.id)}
+            await _to_thread_drained(validate_connection, self._inkbox.slack, str(self._identity.id), meta)
             if meta.get("companion"):
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
                 self._companion_receiver().begin_send(chat_id)

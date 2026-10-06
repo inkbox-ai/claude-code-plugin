@@ -538,3 +538,19 @@ def test_native_stop_cancels_pending_input_without_new_model_turn(tmp_path, monk
         assert client.calls == 1
         assert [item[1] for item in sent] == ["Approve?", "Stopped."]
     asyncio.run(scenario())
+
+
+def test_stale_connection_blocks_indicator_cleanup_after_restart(tmp_path):
+    from inkbox_claude.slack import validate_connection
+    async def run():
+        sdk = resource()
+        sdk.list_connections.return_value = NS(connections=[])
+        path = tmp_path / "activity.json"
+        path.write_text(json.dumps({"old": {**route(), "workspace_id": "T123", "state": "processing", "token": "saved"}}))
+        tracker = SlackActivity(sdk, path, validate_route=lambda meta: validate_connection(sdk, "identity", meta))
+        await tracker.recover()
+        await tracker.flush()
+        sdk.set_processing_status.assert_not_called()
+        sdk.remove_reaction.assert_not_called()
+        assert "old" in json.loads(path.read_text())
+    asyncio.run(run())

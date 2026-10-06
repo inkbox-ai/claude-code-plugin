@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 class SlackActivity:
-    def __init__(self, resource, state_path: Path):
+    def __init__(self, resource, state_path: Path, validate_route=None):
         self.resource = resource
+        self.validate_route = validate_route
         self.state_path = state_path
         self._active: dict[str, dict[str, str]] = {}
         self._records: dict[str, dict] = {}
@@ -114,6 +115,9 @@ class SlackActivity:
             return
         record = dict(zip(("connection_id", "conversation_id", timestamp_field), fields),
                       state=desired, token=uuid4().hex)
+        for field in ("identity_id", "workspace_id"):
+            if meta.get(field):
+                record[field] = meta[field]
         if not native:
             record["indicator"] = "reaction"
         self._schedule(key, record)
@@ -154,6 +158,8 @@ class SlackActivity:
                 f"{key}:{record['token']}:{state}:{method}:{value}".encode()
             ).hexdigest()
             try:
+                if self.validate_route is not None:
+                    await asyncio.to_thread(self.validate_route, record)
                 operation = await asyncio.to_thread(
                     getattr(self.resource, method),
                     record["connection_id"], record["conversation_id"], timestamp, value,

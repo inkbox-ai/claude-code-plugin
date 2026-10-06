@@ -617,9 +617,16 @@ class ContactSession:
                 if turn.checkpoint is None:
                     await self.notify_activity(turn.mode, turn.reply_meta or {}, "failed")
                 if turn.completion is not None:
-                    await self.close()
-                    if not turn.completion.done():
-                        turn.completion.set_exception(exc)
+                    try:
+                        await self.close()
+                        await self.receipt(turn.mode, {**(turn.reply_meta or {}), "host_fenced": True}, "uncertain")
+                    except Exception as fence_error:
+                        exc = fence_error
+                    finally:
+                        if not turn.completion.done():
+                            turn.completion.set_exception(exc)
+                    if getattr(self, "_execution_blocked", False):
+                        return
                     continue
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
@@ -628,6 +635,7 @@ class ContactSession:
                     continue
                 logger.exception("[session %s] turn failed", self.chat_id)
                 await self.close()
+                await self.receipt(turn.mode, {**(turn.reply_meta or {}), "host_fenced": True}, "uncertain")
                 try:
                     await self.send_fn(self.chat_id, _turn_error_notice(exc), turn.mode or self.mode, deepcopy(turn.reply_meta or self.reply_meta))
                 except Exception:
@@ -685,61 +693,60 @@ class ContactSession:
         await self._abort_in_flight(only_mode="imessage" if reply_mode == "imessage" and self.cfg.imessage_threaded_replies else None)
         await self._reply("Stopped." if had_work else "Nothing to stop — I'm idle.")
 
-    async def _abort_in_flight(self, only_mode=None) -> None:
-        """Cancel whatever the session is currently doing: a parked
-        escalation, a running turn, and any queued-but-unstarted messages.
+    def slack_stop_targets(self, meta):
+        """Snapshot exact actor/route-owned turns, never future requests on that route."""
+        fields = ("connection_id", "workspace_id", "conversation_id", "thread_ts", "actor_id")
+        candidates = [self._current_turn, self._batching_turn, self._deferred_turn, *list(self._queue._queue)]
+        return [turn for turn in candidates if turn is not None and turn.mode == "slack"
+                and all((turn.reply_meta or {}).get(k) == meta.get(k) for k in fields)]
 
-        Returns:
-            None
-        """
-        owns_active = only_mode is None or (self._current_turn is not None and self._current_turn.mode == only_mode)
-        if self._batching_turn is not None and (only_mode is None or self._batching_turn.mode == only_mode):
-            turn = self._batching_turn
+    async def _abort_in_flight(self, only_mode=None, only_turns=None) -> None:
+        """Cancel a snapshot of owned work; requests arriving during abort survive."""
+        def selected(turn):
+            return (turn is not None and (only_mode is None or turn.mode == only_mode)
+                    and (only_turns is None or any(turn is owned for owned in only_turns)))
+
+        active = self._current_turn
+        owns_active = selected(active) or (active is None and only_mode is None and only_turns is None)
+        pending = self.pending
+        dropped = []
+        if selected(self._batching_turn):
+            dropped.append(self._batching_turn)
             self._batching_turn = None
-            await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
-        if self._connecting_client is not None and owns_active:
-            await self.close()
-        # Unblock a parked permission/poll so its turn can unwind (None reads
-        # as "no answer" — the same as a timeout).
-        if owns_active and self.pending is not None and not self.pending.future.done():
-            self.pending.future.set_result(None)
+        if selected(self._deferred_turn):
+            dropped.append(self._deferred_turn)
+            self._deferred_turn = None
+        retained = []
+        while not self._queue.empty():
+            turn = self._queue.get_nowait()
+            (dropped if selected(turn) else retained).append(turn)
+        for turn in retained:
+            self._queue.put_nowait(turn)
+        # Everything selected is removed before the first suspension. A fresh
+        # request arriving during a slow native interrupt cannot join this Stop.
+        if owns_active and pending is not None and self.pending is pending and not pending.future.done():
+            pending.future.set_result(None)
             self.pending = None
-        # Interrupt a turn that's actively running, like pressing Esc.
-        if owns_active and self._turn_active and self._client is not None:
+        if self._connecting_client is not None and owns_active and self._current_turn is active:
+            self._interrupting = True
+            await self.close()
+        if owns_active and self._current_turn is active and self._turn_active and self._client is not None:
             self._interrupting = True
             try:
                 await self._client.interrupt()
             except Exception:
-                logger.debug("[session %s] interrupt failed", self.chat_id, exc_info=True)
-        # Discard messages queued but not yet started. Settle any capture-turn
-        # futures (consult / post-call / failure recovery) so their awaiters
-        # don't hang waiting on work we just dropped.
-        retained = []
-        while self._deferred_turn is not None or not self._queue.empty():
-            try:
-                turn = self._deferred_turn or self._queue.get_nowait()
-                self._deferred_turn = None
-                if only_mode is not None and turn.mode != only_mode:
-                    retained.append(turn)
-                    continue
-                await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
-                await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled")
-            except asyncio.QueueEmpty:
-                break
+                logger.debug("[session %s] interrupt failed; fencing native owner", self.chat_id, exc_info=True)
+                await self.close()
+        for turn in dropped:
+            await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
+            await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled")
             if turn.completion is not None and not turn.completion.done():
                 turn.completion.cancel()
             if turn.future is not None and not turn.future.done():
                 if turn.capture_tools:
-                    turn.future.set_result(CapturedTurnResult(
-                        text="",
-                        tool_deliveries=(),
-                        aborted=True,
-                    ))
+                    turn.future.set_result(CapturedTurnResult(text="", tool_deliveries=(), aborted=True))
                 else:
                     turn.future.set_result("")
-
-        for turn in retained:
-            self._queue.put_nowait(turn)
 
     async def _begin_resume(self) -> None:
         """List recent sessions and let the human pick one to reopen.
@@ -1489,24 +1496,32 @@ class ContactSession:
             self._host_owner = current_owner
         connecting = self._connecting_client
         self._connecting_client = None
+        owners = [self._host_owner] if self._host_owner else []
+        disconnect_unproved = bool(getattr(self, "_execution_blocked", False))
         if connecting is not None:
+            owner = process_identity(connecting)
+            if owner:
+                owners.append(owner)
             try:
                 await connecting.disconnect()
             except Exception:
-                pass
+                disconnect_unproved |= owner is None
         if self._client is not None:
             try:
                 await self._client.disconnect()
             except Exception:
-                pass
+                disconnect_unproved |= self._host_owner is None
             self._client = None
         if self._side_effects:
             await asyncio.gather(*list(self._side_effects), return_exceptions=True)
-        if self._host_owner:
-            from .runtime import fence_process
-            if not await asyncio.to_thread(fence_process, self._host_owner):
-                raise RuntimeError("The previous host execution could not be stopped")
-            self._host_owner = None
+        from .runtime import fence_process
+        for owner in owners:
+            if not await asyncio.to_thread(fence_process, owner):
+                disconnect_unproved = True
+        if disconnect_unproved:
+            self._execution_blocked = True
+            raise RuntimeError("The previous host execution could not be stopped")
+        self._host_owner = None
 
 
 class SessionManager:

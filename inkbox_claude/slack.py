@@ -107,6 +107,7 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         return None
     meta = {
         **{key: data[key] for key in fields},
+        "identity_id": identity_id,
         "thread_ts": root,
         "sender": f"{data['workspace_id']}:{data['actor_id']}",
         "conversation_kind": "direct" if direct else "group",
@@ -156,9 +157,24 @@ def inbound_stop(envelope: dict, identity_id: str) -> tuple[str, str, dict] | No
     return incoming
 
 
+def validate_connection(resource: Any, identity_id: str, meta: dict) -> None:
+    """Fail closed on stale, ambiguous, disconnected or cross-identity routes."""
+    def field(item, key):
+        return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+    connections = field(resource.list_connections(identity_id), "connections")
+    if not isinstance(connections, list):
+        raise PermissionError("Slack connection ownership could not be verified")
+    matches = [item for item in connections if str(field(item, "id")) == meta.get("connection_id")]
+    if (len(matches) != 1 or str(field(matches[0], "identity_id")) != identity_id
+            or not meta.get("workspace_id") or field(matches[0], "workspace_id") != meta["workspace_id"]
+            or field(matches[0], "status") != "connected"):
+        raise PermissionError("Slack connection is not uniquely active for this identity and workspace")
+
+
 def send_reply(client: Any, meta: dict, text: str) -> Any:
     if not text or len(text) > SLACK_MAX_TEXT_LENGTH or "\x00" in text:
         raise ValueError("Slack text must be 1–12000 characters without NUL characters")
+    validate_connection(slack_resource(client), str(meta.get("identity_id") or ""), meta)
     coordinates = [meta["connection_id"], meta["conversation_id"], meta.get("thread_ts")]
     key = hashlib.sha256(json.dumps(
         [meta["source_event_id"], coordinates, text], separators=(",", ":")

@@ -86,3 +86,99 @@ def test_readiness_is_auth_not_model_completion(monkeypatch,logged_in,code,expec
     ready,detail=local_readiness()
     assert ready is expected and 'never-print' not in detail
     if ready:assert 'not yet verified' in detail
+
+
+@pytest.mark.parametrize("initial_state", ["running", "sending", "uncertain"])
+def test_unknown_channel_owner_stays_blocked_across_repeated_restarts(monkeypatch, tmp_path, initial_state):
+    from inkbox_claude.gateway import InkboxGateway
+    from inkbox_claude.sessions import SessionManager
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    cfg = BridgeConfig(identity="agent", imessage_threaded_replies=True)
+    meta = {"imessage_event_id": "interrupted", "sender": "+15550001111"}
+    store = IMessageState(cfg)
+    store.admit("chat", "do not repeat", meta)
+    store.mark(meta, initial_state)
+    pending = {"imessage_event_id": "fresh", "sender": "+15550001111"}
+    store.admit("chat", "later request", pending)
+    saved = {"imessage_event_id": "saved", "sender": "+15550001111"}
+    store.admit("chat", "completed but not sent", saved)
+    store.mark(saved, "reply_pending", reply="saved answer")
+    calls = []
+    monkeypatch.setattr("inkbox_claude.runtime.fence_process", lambda owner: calls.append(owner) or False)
+    async def run():
+        for _ in range(2):
+            gw = InkboxGateway(cfg)
+            session = make_session([])
+            session.chat_id = "chat"
+            gw.sessions = NS(get=lambda key: session, sessions={"chat": session})
+            await gw._recover_channel_inputs()
+            assert session._execution_blocked
+            assert session._queue.empty()
+            assert gw._channel_store("imessage").summary()["uncertain"] == 1
+            assert gw._channel_store("imessage").summary()["pending"] == 1
+            assert gw._channel_store("imessage").summary()["reply_pending"] == 1
+            gw._channel_store("imessage").close()
+        assert calls == [None, None]
+    asyncio.run(run())
+
+
+def test_confirmed_channel_fence_is_durable_without_replaying_old_work(monkeypatch, tmp_path):
+    from inkbox_claude.gateway import InkboxGateway
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    cfg = BridgeConfig(identity="agent", imessage_threaded_replies=True)
+    meta = {"imessage_event_id": "interrupted", "sender": "+15550001111", "host_owner": {"pid": 1}}
+    store = IMessageState(cfg)
+    store.admit("chat", "do not repeat", meta)
+    store.mark(meta, "running")
+    calls = []
+    monkeypatch.setattr("inkbox_claude.runtime.fence_process", lambda owner: calls.append(owner) or True)
+    async def run():
+        for _ in range(2):
+            gw = InkboxGateway(cfg)
+            session = make_session([])
+            gw.sessions = NS(get=lambda key: session, sessions={"chat": session})
+            await gw._recover_channel_inputs()
+            assert not getattr(session, "_execution_blocked", False)
+            assert session._queue.empty()
+            assert gw._channel_store("imessage").summary()["uncertain"] == 1
+            gw._channel_store("imessage").close()
+        assert calls == [{"pid": 1}]
+    asyncio.run(run())
+
+
+def test_failed_disconnect_without_native_owner_blocks_later_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    async def run():
+        session = make_session([])
+        async def disconnect():
+            raise RuntimeError("native transport lost")
+        session._client = NS(disconnect=disconnect)
+        with pytest.raises(RuntimeError, match="could not be stopped"):
+            await session.close()
+        assert session._execution_blocked
+        with pytest.raises(RuntimeError, match="could not be stopped"):
+            await session.close()
+        with pytest.raises(PermissionError, match="could not be fenced"):
+            await session._ensure_client()
+    asyncio.run(run())
+
+
+def test_companion_completion_settles_when_native_owner_cannot_be_fenced(monkeypatch, tmp_path):
+    from inkbox_claude.sessions import _Turn
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    async def run():
+        session = make_session([])
+        async def disconnect():
+            raise RuntimeError("native transport lost")
+        async def fail(turn):
+            turn.submitted = True
+            raise RuntimeError("unknown query outcome")
+        session._client = NS(disconnect=disconnect)
+        session._run_turn = fail
+        completion = asyncio.get_running_loop().create_future()
+        session._queue.put_nowait(_Turn("request", mode="slack", completion=completion))
+        await session._drain()
+        assert completion.done() and session._execution_blocked
+        with pytest.raises(RuntimeError, match="could not be stopped"):
+            await completion
+    asyncio.run(run())
