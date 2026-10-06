@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.14
+
+### Added
+
+- Opt-in Slack tools and guided workspace/app installation, channel-wide Companion,
+  exact-route controls, inline reactions and native threaded work status.
+- Opt-in native iMessage source replies, durable ordinary-message receipts,
+  compatible burst collection, queued follow-ups, and bounded thread reads.
+- Identity-scoped Vault metadata, selected credentials and current 2FA codes with
+  lazy local unlocking, fresh access checks and no TOTP seed exposure.
+- Separate readiness diagnostics, native process ownership fencing, positive
+  saved-answer recovery and retained unconfirmed outcomes without replay.
+
+### Fixed
+
+- Serialize permission prompts and treat fresh instructions as new work without
+  consuming them as an obsolete permission answer. Preserve exact Slack actor
+  and native-thread ownership for controls.
+- Reconnect a stale Claude login once without saving an error response session ID.
+- Drain native tool side effects during shutdown, preserve unrelated voice work
+  when stopping native iMessage, and retain callback-first outbound failures.
+
+
 ## 0.2.13
 
 ### Added

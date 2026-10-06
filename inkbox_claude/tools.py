@@ -59,11 +59,28 @@ IMESSAGE_MAX_GROUP_RECIPIENTS = 8
 async def _to_thread_drained(function: Any, *args: Any, **kwargs: Any) -> Any:
     """Run a blocking side effect to completion even if its caller is canceled."""
     call = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(call)
-    except asyncio.CancelledError:
-        await asyncio.gather(call, return_exceptions=True)
-        raise
+    session = CURRENT_SESSION.get()
+    pending = getattr(session, "_side_effects", None)
+    if isinstance(pending, set):
+        pending.add(call)
+        call.add_done_callback(pending.discard)
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(call)
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+        except asyncio.CancelledError:
+            if call.done():
+                raise
+            # Repeated cancellation must not cancel the executor task and
+            # falsely release a journal owner while its blocking send continues.
+            cancelled = True
+        except Exception:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
 
 
 def _normalize_imessage_recipients(value: Any) -> Optional[List[str]]:
@@ -499,9 +516,16 @@ def build_inkbox_mcp_server(
         "inbound lines stay recipient-first. To attach an image/file, pass "
         "media_path as a local file path (uploaded automatically, max 10 MB). "
         "Text is limited to 18995 characters.",
-        {"conversation_id": str, "to": list, "text": str, "media_path": str},
+        {"type": "object", "properties": {"conversation_id": {"type": "string"},
+            "to": {"type": "array", "items": {"type": "string"}}, "text": {"type": "string"},
+            "media_path": {"type": "string"}}, "required": ["text"], "additionalProperties": False},
     )
     async def inkbox_send_imessage(args: Dict[str, Any]) -> Dict[str, Any]:
+        if any(key in args for key in ("reply_to_message_id", "plain_reply_fallback", "thread_id")):
+            return _error("Native reply routing is selected by the bridge")
+        session = CURRENT_SESSION.get()
+        turn = getattr(session, "_current_turn", None)
+        route = deepcopy(turn.reply_meta or {}) if turn and turn.mode == "imessage" else {}
         text = str(args.get("text") or "")
         conversation_id = str(args.get("conversation_id") or "").strip()
         to_list = _normalize_imessage_recipients(args.get("to"))
@@ -540,16 +564,41 @@ def build_inkbox_mcp_server(
             if media_path:
                 # One tool call for the agent; the upload→send two-step is internal.
                 kwargs["media_urls"] = [_upload_media_url(identity, media_path)]
+            if cfg.imessage_threaded_replies and conversation_id and route.get("conversation_id") == conversation_id:
+                from .imessage import auto_reply_kwargs, IMessageState
+                if session._current_turn is not turn or not session._turn_active:
+                    raise ValueError("The originating turn has ended")
+                from .imessage import validate_reply_target
+                kwargs.update(validate_reply_target(identity, route))
+                if session._current_turn is not turn or not session._turn_active or session._interrupting:
+                    raise ValueError("The originating turn has ended")
+                kwargs["idempotency_key"] = "claude:tool:" + __import__("hashlib").sha256(
+                    json.dumps([route.get("imessage_event_id"), conversation_id, kwargs], sort_keys=True).encode()
+                ).hexdigest()
             msg = identity.send_imessage(**kwargs)
-            return {"sent": True, "id": str(getattr(msg, "id", ""))}
+            if cfg.imessage_threaded_replies and route and route.get("conversation_id") == conversation_id:
+                IMessageState(cfg).record_outbound(msg, route, session.chat_id)
+                session._imessage_tool_outputs.append((turn, text, route.get("imessage_reply_target")))
+            result = {"sent": True, "id": str(getattr(msg, "id", ""))}
+            if cfg.imessage_threaded_replies:
+                result.update({key: _json_safe(getattr(msg, key, None)) for key in
+                    ("status", "reply_to_message_id", "thread_id", "thread_root_message_id")})
+            return result
 
         try:
-            result = await asyncio.to_thread(_run)
-            _mark_tool_delivery("imessage", conversation_id)
+            result = await _to_thread_drained(_run)
+            if not cfg.imessage_threaded_replies:
+                _mark_tool_delivery("imessage", conversation_id)
             return _result(result)
         except Exception as exc:
             _log_send_rejection("inkbox_send_imessage", exc)
-            return _error(str(exc))
+            fields = {}
+            if isinstance(getattr(exc, "status_code", None), int):
+                fields["status_code"] = exc.status_code
+            detail = getattr(exc, "detail", None)
+            if isinstance(detail, dict) and isinstance(detail.get("error"), str):
+                fields["error_code"] = detail["error"]
+            return _error(str(exc), **fields)
 
     @tool(
         "inkbox_place_call",
@@ -1219,35 +1268,10 @@ def build_inkbox_mcp_server(
         inkbox_a2a_ask_caller,
         inkbox_a2a_fail,
     ]
+    from .channel_tools import build_channel_tools
+    tools.extend(build_channel_tools(client, identity_handle, cfg))
     from . import __version__
 
     server = create_sdk_mcp_server(name="inkbox", version=__version__, tools=tools)
-    tool_names = [
-        "mcp__inkbox__inkbox_whoami",
-        "mcp__inkbox__inkbox_send_email",
-        "mcp__inkbox__inkbox_reply_companion",
-        "mcp__inkbox__inkbox_send_sms",
-        "mcp__inkbox__inkbox_send_imessage",
-        "mcp__inkbox__inkbox_place_call",
-        "mcp__inkbox__inkbox_list_calls",
-        "mcp__inkbox__inkbox_get_call_transcript",
-        "mcp__inkbox__inkbox_list_text_conversations",
-        "mcp__inkbox__inkbox_get_text_conversation",
-        "mcp__inkbox__inkbox_list_imessage_conversations",
-        "mcp__inkbox__inkbox_get_imessage_conversation",
-        "mcp__inkbox__inkbox_lookup_contact",
-        "mcp__inkbox__inkbox_list_contacts",
-        "mcp__inkbox__inkbox_get_contact",
-        "mcp__inkbox__inkbox_create_contact",
-        "mcp__inkbox__inkbox_update_contact",
-        "mcp__inkbox__inkbox_delete_contact",
-        "mcp__inkbox__inkbox_a2a_call",
-        "mcp__inkbox__inkbox_a2a_check",
-        "mcp__inkbox__inkbox_a2a_reply",
-        "mcp__inkbox__inkbox_list_a2a_tasks",
-        "mcp__inkbox__inkbox_list_a2a_messages",
-        "mcp__inkbox__inkbox_a2a_complete",
-        "mcp__inkbox__inkbox_a2a_ask_caller",
-        "mcp__inkbox__inkbox_a2a_fail",
-    ]
+    tool_names = ["mcp__inkbox__" + getattr(item, "name", getattr(item, "_inkbox_tool_name", "")) for item in tools]
     return server, tool_names

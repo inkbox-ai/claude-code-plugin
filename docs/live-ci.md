@@ -165,3 +165,28 @@
 ### Valid external authentication
 
 **Proves:** Valid external authentication reaches the session layer. **Flow:** 1. Submit a valid event. 2. Require acceptance. 3. Wait for the matching session marker.
+
+## Optional channel parity checks
+
+Offline CI runs the complete suite on Python 3.11–3.13 with published Inkbox
+0.7.14. Separate jobs exercise the base 0.7.11 SDK and native iMessage on 0.7.13;
+the native capability assertion prevents a fully skipped optional-feature check.
+The existing latest-Claude SDK/CLI contract job remains in place.
+
+The real-model channel E2E leg additionally runs
+`tests/contract/test_native_vault_host.py`. It drives a real Claude session through
+the bridge's in-process MCP server against synthetic encrypted Vault HTTP data,
+checks actual credential lookup/current-code use, and forbids password/seed output.
+It does not use or mutate a customer's Vault. Existing email/SMS/voice/A2A/external
+model tasks and assertions remain part of the full-stack orchestrator.
+
+Slack rendering and actual-device native iMessage threading still need separately
+authorized live acceptance: verify top-level inline eyes, thread-only working and
+waiting status, quiet Safe/Mention behavior, exact-thread Stop/approval rejection,
+source-targeted device replies, queued bursts, and no resend after uncertain
+submission. Offline SDK HTTP responses do not establish visual client behavior.
+
+Release evidence must name the final commit and distinguish unit/SDK/native-host
+proof from full live channel proof. Require two complete successful full-stack
+runs on the same final commit after review readiness; any code, workflow, or test
+change resets that sequence. Rerunning failed jobs alone is not a complete pass.

@@ -353,7 +353,7 @@ def test_recovery_only_retries_work_before_query(harness, checkpoint):
     asyncio.run(scenario())
 
 
-def test_query_timeout_pauses_without_retry(harness):
+def test_query_timeout_is_fenced_and_unconfirmed_without_retry(harness):
     async def scenario():
         envelope, pages = fixture()
         gw, _ = harness.build(pages)
@@ -365,7 +365,9 @@ def test_query_timeout_pauses_without_retry(harness):
 
         harness.hooks.query = fail
         await gw._handle_webhook(Request(envelope))
-        assert (await drained(gw))[0]["state"] == "paused"
+        record = (await drained(gw))[0]
+        assert record["state"] == "initialized"
+        assert record["events"][uid(12)]["state"] == "unconfirmed"
         await gw._handle_webhook(Request(envelope))
         assert len(harness.queries) == 1
         await gw._cleanup()
@@ -950,7 +952,9 @@ def test_uncertain_send_never_repeats_host_input(harness):
 
         harness.hooks.receive = receive
         await gw._handle_webhook(Request(envelope))
-        assert (await drained(gw))[0]["state"] == "paused"
+        record = (await drained(gw))[0]
+        assert record["state"] == "initialized"
+        assert record["events"][uid(12)]["state"] == "unconfirmed"
         transport.error = None
         await gw._handle_webhook(Request(envelope))
         await drained(gw)

@@ -73,7 +73,7 @@ jobs:
         run: |
           tests/ci/retry_install.sh uv pip install --system \
             \
-            -e . pytest
+            -e . "inkbox==0.7.14" pytest
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
@@ -139,6 +139,12 @@ jobs:
           AUT_INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
           AUT_WEBHOOK_URL: http://127.0.0.1:8767/webhook
         run: python3 -m pytest tests/live -v
+
+      - name: Real Claude native Vault contract
+        if: matrix.leg == 'real'
+        env:
+          INKBOX_RUN_NATIVE_HOST_TESTS: "1"
+        run: python3 -m pytest tests/contract/test_native_vault_host.py -v
 
       - name: Stop bridge gateway
         if: always()

@@ -2,6 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from uuid import UUID
 from unittest.mock import AsyncMock
 
 import pytest
@@ -112,7 +113,12 @@ def test_automatic_email_uses_real_sdk_reply_all_endpoint_and_original_uuid():
     asyncio.run(gw.send_to_contact("contact", "Reply", "email", {
         "message_id": uid(12), "to": "wrong@example.com", "subject": "Not a new email",
     }))
-    assert calls == [(f"/mailboxes/helper@example.com/messages/{uid(12)}/reply-all", {"json": {"body_text": "Reply"}})]
+    assert len(calls) == 1
+    path, kwargs = calls[0]
+    assert path == f"/mailboxes/helper@example.com/messages/{uid(12)}/reply-all"
+    assert kwargs["json"] == {"body_text": "Reply"}
+    assert kwargs["headers"]["Prefer"] == "idempotency-replay"
+    UUID(kwargs["headers"]["Idempotency-Key"])
     with pytest.raises(ValueError, match="stored inbound"):
         asyncio.run(gw.send_to_contact("contact", "Reply", "email", {"to": "sender@example.com"}))
     assert len(calls) == 1

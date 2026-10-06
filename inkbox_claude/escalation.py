@@ -33,6 +33,9 @@ class PendingInteraction:
     questions: List[Dict[str, Any]] = field(default_factory=list)
     tool_name: str = ""
     sender: str = ""
+    route: Dict[str, Any] = field(default_factory=dict)
+    owner: Any = None
+    generation: int = 0
     created_at: float = field(default_factory=time.time)
 
 

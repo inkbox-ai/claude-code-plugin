@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -77,6 +78,10 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     )
     from prompts import build_channel_prompt, frame_inbound, mentions_agent
 
+class ClaudeNotLoggedInError(RuntimeError):
+    """The native host needs refreshed authentication, not a cleared conversation."""
+
+
 logger = logging.getLogger(__name__)
 
 # gateway.send_to_contact(chat_id, text, mode, meta) signature.
@@ -116,6 +121,9 @@ class _Turn:
     checkpoint: Optional[Callable[..., None]] = None
     context_ids: tuple[str, ...] = ()
     authorize: Optional[Callable[[], Awaitable[None]]] = None
+    queued_at: float = 0
+    submitted: bool = False
+    attempts: int = 0.0
 
 
 @dataclass(frozen=True)
@@ -211,6 +219,8 @@ def _is_missing_resume_error(exc: Exception) -> bool:
 
 def _turn_error_notice(exc: Exception) -> str:
     """Build the text the human sees when a Claude turn cannot start/finish."""
+    if isinstance(exc, ClaudeNotLoggedInError):
+        return "Claude login needs refreshing. Run /login in a terminal on the bridge machine; your next message will reconnect without clearing this conversation."
     if _is_missing_resume_error(exc):
         return (
             "Claude Code couldn't find the old conversation I tried to resume. "
@@ -366,8 +376,17 @@ class ContactSession:
         health_fn: Optional[HealthFn] = None,
         on_send_rejected: Optional[SendRejectedFn] = None,
         system_prompt_extra: str = "",
+        activity_fn=None,
+        receipt_fn=None,
     ):
         self.chat_id = chat_id
+        self.activity_fn = activity_fn
+        self.receipt_fn = receipt_fn
+        self._escalation_lock = asyncio.Lock()
+        self._imessage_tool_outputs = []
+        self._deferred_turn = None
+        self._batching_turn = None
+        self._side_effects = set()
         self.cfg = cfg
         self.send_fn = send_fn
         self.typing_fn = typing_fn
@@ -404,6 +423,8 @@ class ContactSession:
         self.companion_approver = ""
         self._client_generation = 0
         self._connecting_client = None
+        self._host_owner = None
+        self._close_lock = asyncio.Lock()
         self._control_route: ContextVar[Any] = ContextVar("control_reply_route", default=None)
         owner = [cfg.base_url, identity_info.get("id") or cfg.identity, chat_id]
         context_id = hashlib.sha256(json.dumps(owner).encode()).hexdigest()
@@ -429,24 +450,39 @@ class ContactSession:
             None
         """
         meta = deepcopy(meta or {})
+        if mode == "imessage" and self.cfg.imessage_threaded_replies:
+            meta["imessage_threaded_replies"] = True
         raw_text = str(meta.get("raw_text", text))
         command = None if meta.get("reaction") else _control_command(raw_text)
-        is_group = mode in {"sms", "imessage"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
+        if pending_reply and mode == "slack":
+            pending_reply = all(meta.get(k) == self.pending.route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id"))
         if pending_reply:
             expected = self.pending.sender
             sender = str(meta.get("sender") or "")
             from .companion import same_author
             pending_reply = (not meta.get("reaction") and
-                             (not (is_group or meta.get("companion")) or (bool(expected) and same_author(mode, sender, expected)))
-                             and (not is_group or self.pending.kind != "permission" or parse_permission_reply(raw_text) is not None))
+                             (not (is_group or meta.get("companion")) or (bool(expected) and same_author(mode, sender, expected))))
+        if pending_reply and self.pending.kind == "permission" and not command and parse_permission_reply(raw_text) is None:
+            await self._abort_in_flight()
+            pending_reply = False
+        addressed = meta.get("slack_mentioned") if mode == "slack" else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
         quiet = (is_group and self.cfg.group_reply_mode == "mention" and not command
-                 and not pending_reply and not mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity))
+                 and not pending_reply and not addressed)
         if quiet:
-            self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("message_id") or ""))
+            self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("message_id") or meta.get("source_event_id") or ""))
+            await self.receipt(mode, meta, "done")
             return
 
+        if command and mode == "slack" and self._current_turn is not None:
+            route = self._current_turn.reply_meta or {}
+            if any(meta.get(k) != route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id")):
+                self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or ""))
+                await self.receipt(mode, meta, "done")
+                return
         if command:
+            await self.receipt(mode, meta, "done")
             token = self._control_route.set((mode, meta))
             try:
                 handlers = {"reset": self._reset_session, "stop": self._stop_turn,
@@ -457,11 +493,13 @@ class ContactSession:
                 self._control_route.reset(token)
             return
         if pending_reply:
+            await self.receipt(mode, meta, "done")
             self.pending.future.set_result(raw_text)
             return
         if not self._current_turn:
             self.mode, self.reply_meta = mode, deepcopy(meta)
-        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text), mode=mode, reply_meta=meta))
+        await self.notify_activity(mode, meta, "accepted")
+        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text), mode=mode, reply_meta=meta, queued_at=time.monotonic()))
 
         # Texting again while Claude is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
@@ -470,7 +508,7 @@ class ContactSession:
         # delivery-failure recovery) runs to completion and this message just
         # queues behind it.
         running_normal = self._current_turn is not None and self._current_turn.future is None
-        if self._turn_active and self._client is not None and running_normal:
+        if self._turn_active and self._client is not None and running_normal and not (mode == "imessage" and self.cfg.imessage_threaded_replies):
             logger.info("[session %s] new message interrupts the running turn", self.chat_id)
             self._interrupting = True
             try:
@@ -515,18 +553,73 @@ class ContactSession:
             return turn.mode or self.mode, turn.reply_meta
         return self.mode, self.reply_meta
 
+    async def notify_activity(self, mode, meta, state):
+        if self.activity_fn is not None:
+            await self.activity_fn(self.chat_id, mode, meta, state)
+
+    async def receipt(self, mode, meta, state, text=None):
+        if self.receipt_fn is not None:
+            return await self.receipt_fn(self.chat_id, mode, meta, state, text)
+
+    async def _batch(self, turn):
+        meta = turn.reply_meta or {}
+        if (turn.mode != "imessage" or not self.cfg.imessage_threaded_replies or turn.checkpoint
+                or turn.future or meta.get("companion") or meta.get("media") or meta.get("reaction")):
+            return turn
+        deadline = turn.queued_at + 2.0
+        quiet_until = turn.queued_at + .75
+        while True:
+            delay = min(deadline, quiet_until) - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self._batching_turn is None:
+                return turn
+            if self._queue.empty():
+                return turn
+            other = self._queue.get_nowait()
+            ometa = other.reply_meta or {}
+            from .imessage import compatible_key
+            if (other.mode != "imessage" or other.future or other.checkpoint or ometa.get("companion")
+                    or ometa.get("media") or ometa.get("reaction") or other.queued_at > deadline
+                    or compatible_key(meta) != compatible_key(ometa)):
+                self._deferred_turn = other
+                return turn
+            turn.text += "\n\n" + other.text
+            for field in ("imessage_event_ids", "imessage_sources"):
+                meta[field] = list(meta.get(field, [])) + list(ometa.get(field, []))
+            quiet_until = other.queued_at + .75
+            if time.monotonic() >= deadline:
+                return turn
+
     async def _drain(self) -> None:
-        while not self._queue.empty():
-            turn = await self._queue.get()
+        while self._deferred_turn is not None or not self._queue.empty():
+            turn = self._deferred_turn or await self._queue.get()
+            self._deferred_turn = None
+            self._batching_turn = turn
+            turn = await self._batch(turn)
+            if self._batching_turn is None:
+                continue
+            self._batching_turn = None
             try:
                 result = await self._run_turn(turn)
+                if turn.checkpoint is None:
+                    await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled" if self._interrupting else "completed")
                 if turn.completion is not None and not turn.completion.done():
                     turn.completion.set_result(result or "")
             except Exception as exc:
+                if not turn.submitted and turn.checkpoint is None and turn.attempts < 3 and not isinstance(exc, (PermissionError, ValueError)):
+                    turn.attempts += 1
+                    await self.close()
+                    await asyncio.sleep(min(2 ** (turn.attempts - 1), 4))
+                    self._deferred_turn = turn
+                    continue
+                await self.receipt(turn.mode, turn.reply_meta or {}, "uncertain")
+                if turn.checkpoint is None:
+                    await self.notify_activity(turn.mode, turn.reply_meta or {}, "failed")
                 if turn.completion is not None:
+                    await self.close()
                     if not turn.completion.done():
                         turn.completion.set_exception(exc)
-                    await self.close()
                     continue
                 # An interrupt aborts the turn on purpose — the next queued
                 # message takes over, so it is not an error to report.
@@ -586,26 +679,33 @@ class ContactSession:
         """
         had_work = (
             self._turn_active or self.pending is not None or not self._queue.empty()
+            or self._batching_turn is not None or self._deferred_turn is not None
         )
-        await self._abort_in_flight()
+        reply_mode, _ = self._reply_route()
+        await self._abort_in_flight(only_mode="imessage" if reply_mode == "imessage" and self.cfg.imessage_threaded_replies else None)
         await self._reply("Stopped." if had_work else "Nothing to stop — I'm idle.")
 
-    async def _abort_in_flight(self) -> None:
+    async def _abort_in_flight(self, only_mode=None) -> None:
         """Cancel whatever the session is currently doing: a parked
         escalation, a running turn, and any queued-but-unstarted messages.
 
         Returns:
             None
         """
-        if self._connecting_client is not None:
+        owns_active = only_mode is None or (self._current_turn is not None and self._current_turn.mode == only_mode)
+        if self._batching_turn is not None and (only_mode is None or self._batching_turn.mode == only_mode):
+            turn = self._batching_turn
+            self._batching_turn = None
+            await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
+        if self._connecting_client is not None and owns_active:
             await self.close()
         # Unblock a parked permission/poll so its turn can unwind (None reads
         # as "no answer" — the same as a timeout).
-        if self.pending is not None and not self.pending.future.done():
+        if owns_active and self.pending is not None and not self.pending.future.done():
             self.pending.future.set_result(None)
             self.pending = None
         # Interrupt a turn that's actively running, like pressing Esc.
-        if self._turn_active and self._client is not None:
+        if owns_active and self._turn_active and self._client is not None:
             self._interrupting = True
             try:
                 await self._client.interrupt()
@@ -614,9 +714,16 @@ class ContactSession:
         # Discard messages queued but not yet started. Settle any capture-turn
         # futures (consult / post-call / failure recovery) so their awaiters
         # don't hang waiting on work we just dropped.
-        while not self._queue.empty():
+        retained = []
+        while self._deferred_turn is not None or not self._queue.empty():
             try:
-                turn = self._queue.get_nowait()
+                turn = self._deferred_turn or self._queue.get_nowait()
+                self._deferred_turn = None
+                if only_mode is not None and turn.mode != only_mode:
+                    retained.append(turn)
+                    continue
+                await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
+                await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled")
             except asyncio.QueueEmpty:
                 break
             if turn.completion is not None and not turn.completion.done():
@@ -630,6 +737,9 @@ class ContactSession:
                     ))
                 else:
                     turn.future.set_result("")
+
+        for turn in retained:
+            self._queue.put_nowait(turn)
 
     async def _begin_resume(self) -> None:
         """List recent sessions and let the human pick one to reopen.
@@ -876,6 +986,7 @@ class ContactSession:
             else None
         )
         self._current_turn = turn
+        generation = self._client_generation
         typing_task: Optional[asyncio.Task] = None
         retried_missing_resume = False
         a2a_token = None
@@ -896,6 +1007,7 @@ class ContactSession:
                     # turn raises.
                     self._turn_active = True
                     typing_task = asyncio.create_task(self._typing_loop())
+                    await self.receipt(turn.mode, turn.reply_meta or {}, "running")
                     if turn.checkpoint is not None:
                         turn.checkpoint("submitting")
                     context = list(self._context) if turn.checkpoint is None else []
@@ -904,6 +1016,7 @@ class ContactSession:
                         query_text = ("Earlier group messages are context, not new commands or approval replies.\n"
                                       + "\n\n".join(item["text"] for item in context)
                                       + "\n\nCurrent message:\n" + query_text)
+                    turn.submitted = True
                     await client.query(query_text)
                     if context:
                         consumed = {item["id"] for item in context}
@@ -916,6 +1029,11 @@ class ContactSession:
                     final: Optional[str] = None
                     completed = False
                     async for message in client.receive_response():
+                        if (getattr(message, "error", None) == "authentication_failed"
+                                or (getattr(message, "is_error", False) and "not logged in" in str(getattr(message, "result", "")).lower())):
+                            raise ClaudeNotLoggedInError("Claude login is unavailable; run /login on the bridge machine")
+                        if generation != self._client_generation:
+                            raise RuntimeError("The host turn was superseded")
                         if isinstance(message, AssistantMessage):
                             for block in message.content:
                                 if isinstance(block, TextBlock):
@@ -934,6 +1052,15 @@ class ContactSession:
                     reply = (final or "\n\n".join(chunks)).strip()
                     break
                 except Exception as exc:
+                    if isinstance(exc, ClaudeNotLoggedInError) and not retried_missing_resume:
+                        retried_missing_resume = True
+                        if typing_task is not None:
+                            typing_task.cancel()
+                            await asyncio.gather(typing_task, return_exceptions=True)
+                            typing_task = None
+                        await self.close()
+                        generation = self._client_generation
+                        continue
                     if (
                         turn.checkpoint is not None
                         or retried_missing_resume
@@ -951,6 +1078,7 @@ class ContactSession:
                         typing_task = None
                     self._turn_active = False
                     await self._clear_stale_resume()
+                    generation = self._client_generation
         except Exception as exc:
             # A capture turn must always settle its waiter — surface the error
             # there. A normal turn re-raises so _drain shows the human a notice.
@@ -969,6 +1097,11 @@ class ContactSession:
             if a2a_token is not None:
                 A2A_TURN_CONTEXT.reset(a2a_token)
             self._turn_active = False
+            pending = self.pending
+            if pending is not None and pending.owner is turn:
+                if not pending.future.done():
+                    pending.future.set_result(None)
+                self.pending = None
             self._current_turn = None
             self._current_hosted_sms_context = None
             if typing_task is not None:
@@ -978,9 +1111,15 @@ class ContactSession:
                 except asyncio.CancelledError:
                     pass
 
+        if turn.mode == "imessage" and self.cfg.imessage_threaded_replies:
+            duplicate = any(owner is turn and text == reply and target == (turn.reply_meta or {}).get("imessage_reply_target")
+                            for owner, text, target in self._imessage_tool_outputs)
+            self._imessage_tool_outputs = [item for item in self._imessage_tool_outputs if item[0] is not turn]
+            if duplicate:
+                reply = ""
         if turn.checkpoint is not None:
-            reply = "" if self._current_channel_tool_delivery else reply
-            turn.checkpoint("generated", reply=reply)
+            reply = "" if self._current_channel_tool_delivery or self._interrupting else reply
+            turn.checkpoint("generated", reply=reply, cancelled=self._interrupting)
             return reply
 
         # Route the result. Capture turns hand the text back to their waiter and
@@ -1001,6 +1140,7 @@ class ContactSession:
                     )
             return
         if self._interrupting:
+            await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
             return
         if self._current_channel_tool_delivery:
             logger.info(
@@ -1009,8 +1149,11 @@ class ContactSession:
                 self.mode,
             )
             return
-        if reply:
+        if reply and reply.strip() != "[SILENT]":
+            await self.receipt(turn.mode, turn.reply_meta or {}, "reply_pending", reply)
             await self._deliver_reply(turn, reply)
+        else:
+            await self.receipt(turn.mode, turn.reply_meta or {}, "done")
 
     async def _clear_stale_resume(self) -> None:
         """Forget a stale Claude resume id and reset conversation-scoped state."""
@@ -1044,8 +1187,11 @@ class ContactSession:
         """
         mode, meta = turn.mode or self.mode, deepcopy(turn.reply_meta or self.reply_meta)
         try:
-            await self.send_fn(self.chat_id, reply, mode, meta)
+            await self.send_fn(self.chat_id, reply, mode, {**meta, "final_reply": True})
+            await self.receipt(mode, meta, "done")
         except Exception as exc:
+            if mode == "slack" or (mode == "imessage" and self.cfg.imessage_threaded_replies):
+                raise
             logger.warning("Reply send rejected (%s)", type(exc).__name__)
             if self.on_send_rejected is not None:
                 await self.on_send_rejected(self.chat_id, mode, meta, reply, exc)
@@ -1132,6 +1278,8 @@ class ContactSession:
             return
 
     async def _ensure_client(self) -> ClaudeSDKClient:
+        if getattr(self, "_execution_blocked", False):
+            raise PermissionError("Previous native host ownership could not be fenced; inspect the retained receipt before resuming")
         if self._client is not None:
             return self._client
         if not CLAUDE_SDK_AVAILABLE:
@@ -1197,6 +1345,8 @@ class ContactSession:
             if self._connecting_client is client:
                 self._connecting_client = None
         self._client = client
+        from .runtime import process_identity
+        self._host_owner = process_identity(client)
         logger.info(
             "[session %s] Claude Code session started (resume=%s)",
             self.chat_id, self.resume_session_id or "fresh",
@@ -1251,7 +1401,15 @@ class ContactSession:
             )
         )
 
-    async def _escalate(
+    async def _escalate(self, kind, prompt_text, questions=None, tool_name=""):
+        generation = self._client_generation
+        owner = self._current_turn
+        async with self._escalation_lock:
+            if generation != self._client_generation or owner is not self._current_turn or self._interrupting:
+                return None
+            return await self._escalate_once(kind, prompt_text, questions, tool_name)
+
+    async def _escalate_once(
         self,
         kind: str,
         prompt_text: str,
@@ -1273,7 +1431,9 @@ class ContactSession:
         reply_mode, route = self._reply_route()
         if route.get("companion") and self.cfg.group_reply_mode == "mention":
             prompt_text += "\nInclude @agent in your reply" + (" or put my address in To." if reply_mode == "email" else ".")
-        self.pending = PendingInteraction(
+        pending = PendingInteraction(
+            owner=self._current_turn, generation=self._client_generation,
+            route=deepcopy(route),
             kind=kind,
             sender=self.companion_approver if route.get("companion") else str(route.get("sender") or ""),
             prompt_text=prompt_text,
@@ -1281,15 +1441,20 @@ class ContactSession:
             questions=list(questions or []),
             tool_name=tool_name,
         )
+        self.pending = pending
         try:
+            await self.notify_activity(reply_mode, route, "waiting")
             await self._reply(prompt_text)
             return await asyncio.wait_for(
-                self.pending.future, timeout=self.cfg.permission_timeout_s
+                pending.future, timeout=self.cfg.permission_timeout_s
             )
         except asyncio.TimeoutError:
             return None
         finally:
-            self.pending = None
+            if self.pending is pending:
+                self.pending = None
+            if not self._interrupting:
+                await self.notify_activity(reply_mode, route, "resumed")
 
     async def _reply(self, text: str) -> None:
         mode, meta = self._reply_route()
@@ -1309,7 +1474,19 @@ class ContactSession:
         await self.close()
 
     async def close(self) -> None:
+        async with self._close_lock:
+            await self._close_owned()
+
+    async def _close_owned(self) -> None:
+        pending = self.pending
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(None)
+        self.pending = None
         self._client_generation += 1
+        from .runtime import process_identity
+        current_owner = process_identity(self._client) if self._client is not None else None
+        if current_owner:
+            self._host_owner = current_owner
         connecting = self._connecting_client
         self._connecting_client = None
         if connecting is not None:
@@ -1323,6 +1500,13 @@ class ContactSession:
             except Exception:
                 pass
             self._client = None
+        if self._side_effects:
+            await asyncio.gather(*list(self._side_effects), return_exceptions=True)
+        if self._host_owner:
+            from .runtime import fence_process
+            if not await asyncio.to_thread(fence_process, self._host_owner):
+                raise RuntimeError("The previous host execution could not be stopped")
+            self._host_owner = None
 
 
 class SessionManager:
@@ -1338,8 +1522,12 @@ class SessionManager:
         typing_fn: Optional[TypingFn] = None,
         health_fn: Optional[HealthFn] = None,
         on_send_rejected: Optional[SendRejectedFn] = None,
+        activity_fn=None,
+        receipt_fn=None,
     ):
         self.cfg = cfg
+        self.activity_fn = activity_fn
+        self.receipt_fn = receipt_fn
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
@@ -1374,6 +1562,9 @@ class SessionManager:
         if self._session_ids.pop(chat_id, None) is not None:
             self._persist()
 
+    def has_session(self, chat_id: str) -> bool:
+        return chat_id in self.sessions or chat_id in self._session_ids
+
     def get(self, chat_id: str, system_prompt_extra: str = "") -> ContactSession:
         """Fetch or lazily create the session for one remote party.
 
@@ -1390,6 +1581,8 @@ class SessionManager:
         if session is None:
             session = ContactSession(
                 chat_id=chat_id,
+                activity_fn=self.activity_fn,
+                receipt_fn=self.receipt_fn,
                 cfg=self.cfg,
                 send_fn=self.send_fn,
                 mcp_server=self.mcp_server,
@@ -1408,7 +1601,4 @@ class SessionManager:
 
     async def close_all(self) -> None:
         for session in self.sessions.values():
-            if session.chat_id.startswith("companion:"):
-                await session.stop_companion()
-            else:
-                await session.close()
+            await session.stop_companion()
