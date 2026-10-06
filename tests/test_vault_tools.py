@@ -73,7 +73,7 @@ def test_totp_returns_rfc_code_and_expiry_without_credentials(vault, monkeypatch
     _, refreshed = call(server, "inkbox_get_totp_code", secret_id=LOGIN_ID)
     assert refreshed["code"] == "14050471"
     assert refreshed["seconds_remaining"] == 29
-    assert sum(r.url.path.endswith("/unlock") for r in api.requests) == 1
+    assert sum(r.url.path.endswith("/unlock") for r in api.requests) == 2
     assert sum(r.url.path.endswith(f"/secrets/{LOGIN_ID}") for r in api.requests) == 2
 
 
@@ -192,3 +192,38 @@ def test_cached_unlock_cannot_bypass_fresh_identity_access(vault, monkeypatch):
     assert "code" not in data
     result, data = call(server, "inkbox_list_vault_secrets", secret_type="login")
     assert not result.get("isError") and data == []
+
+
+@pytest.mark.parametrize("name", ["inkbox_get_vault_secret", "inkbox_get_totp_code"])
+@pytest.mark.parametrize("key", [None, "Wrong-example-key-42!"])
+def test_sdk_global_unlocked_state_cannot_bypass_current_plugin_key(vault, monkeypatch, name, key):
+    server,api=vault
+    server.vault.unlock(VAULT_KEY)
+    if key is not None:monkeypatch.setenv("INKBOX_CLAUDE_VAULT_KEY",key)
+    result,data=call(server,name,secret_id=LOGIN_ID)
+    assert result["isError"]
+    assert "code" not in data and "payload" not in data
+    assert VAULT_KEY not in json.dumps(result) and "synthetic-password" not in json.dumps(result)
+
+
+def test_rotated_or_removed_plugin_key_invalidates_previous_plugin_unlock(vault, monkeypatch):
+    server,_=vault
+    monkeypatch.setenv("INKBOX_CLAUDE_VAULT_KEY",VAULT_KEY)
+    result,_=call(server,"inkbox_get_vault_secret",secret_id=LOGIN_ID)
+    assert not result.get("isError")
+    monkeypatch.setenv("INKBOX_CLAUDE_VAULT_KEY","Wrong-example-key-42!")
+    result,_=call(server,"inkbox_get_vault_secret",secret_id=LOGIN_ID)
+    assert result["isError"]
+    monkeypatch.delenv("INKBOX_CLAUDE_VAULT_KEY")
+    result,data=call(server,"inkbox_get_totp_code",secret_id=LOGIN_ID)
+    assert result["isError"] and "INKBOX_CLAUDE_VAULT_KEY" in data["error"]
+
+
+def test_acl_for_a_different_secret_cannot_grant_selected_secret(vault, monkeypatch):
+    server,api=vault
+    monkeypatch.setenv("INKBOX_CLAUDE_VAULT_KEY",VAULT_KEY)
+    api.details[LOGIN_ID]["access"][0]["vault_secret_id"]=TOKEN_ID
+    result,_=call(server,"inkbox_get_vault_secret",secret_id=LOGIN_ID)
+    assert result["isError"]
+    result,metadata=call(server,"inkbox_list_vault_secrets",secret_type="login")
+    assert not result.get("isError") and metadata==[]

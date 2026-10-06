@@ -124,7 +124,9 @@ class _Turn:
     queued_at: float = 0
     submitted: bool = False
     execution_observed: bool = False
-    attempts: int = 0.0
+    attempts: int = 0
+    burst_source_count: int = 1
+    burst_text_chars: int = 0
 
 
 @dataclass(frozen=True)
@@ -500,7 +502,7 @@ class ContactSession:
         if not self._current_turn:
             self.mode, self.reply_meta = mode, deepcopy(meta)
         await self.notify_activity(mode, meta, "accepted")
-        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text), mode=mode, reply_meta=meta, queued_at=time.monotonic()))
+        await self._queue.put(_Turn(text=frame_inbound(mode, meta, text), mode=mode, reply_meta=meta, queued_at=time.monotonic(), burst_text_chars=len(text)))
 
         # Texting again while Claude is mid-turn behaves like hitting Esc and
         # typing a new message: interrupt the running turn so the worker drops
@@ -582,9 +584,13 @@ class ContactSession:
             from .imessage import compatible_key
             if (other.mode != "imessage" or other.future or other.checkpoint or ometa.get("companion")
                     or ometa.get("media") or ometa.get("reaction") or other.queued_at > deadline
+                    or turn.burst_source_count + other.burst_source_count > 8
+                    or (turn.burst_text_chars or len(turn.text)) + (other.burst_text_chars or len(other.text)) + 2 > 4000
                     or compatible_key(meta) != compatible_key(ometa)):
                 self._deferred_turn = other
                 return turn
+            turn.burst_source_count += other.burst_source_count
+            turn.burst_text_chars = (turn.burst_text_chars or len(turn.text)) + (other.burst_text_chars or len(other.text)) + 2
             turn.text += "\n\n" + other.text
             for field in ("imessage_event_ids", "imessage_sources"):
                 meta[field] = list(meta.get(field, [])) + list(ometa.get(field, []))
@@ -736,7 +742,7 @@ class ContactSession:
             try:
                 await self._client.interrupt()
             except Exception:
-                logger.debug("[session %s] interrupt failed; fencing native owner", self.chat_id, exc_info=True)
+                logger.debug("Native interrupt failed; fencing the owned host")
                 await self.close()
         for turn in dropped:
             await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")

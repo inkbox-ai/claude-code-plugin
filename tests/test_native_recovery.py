@@ -270,3 +270,23 @@ def test_fencing_a_different_owner_does_not_release_old_quarantine(monkeypatch, 
             await session.close()
         assert session._execution_blocked and session._blocked_owner_keys == {(10, 1.0)}
     asyncio.run(run())
+
+
+def test_interrupt_failure_log_omits_private_route_and_provider_detail(monkeypatch, tmp_path, caplog):
+    import logging
+    from inkbox_claude.sessions import _Turn
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    caplog.set_level(logging.DEBUG, logger="inkbox_claude.sessions")
+    async def run():
+        session=make_session([])
+        session.chat_id="private-contact@example.com"
+        session._current_turn=_Turn("private request",mode="sms")
+        session._turn_active=True
+        async def interrupt():raise RuntimeError("sensitive provider transcript")
+        async def disconnect():pass
+        session._client=NS(interrupt=interrupt,disconnect=disconnect)
+        await session._abort_in_flight()
+        assert "fencing the owned host" in caplog.text
+        assert session.chat_id not in caplog.text
+        assert "sensitive provider transcript" not in caplog.text
+    asyncio.run(run())

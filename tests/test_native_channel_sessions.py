@@ -270,3 +270,31 @@ def test_late_auth_failure_never_requeries_after_execution(monkeypatch, progress
         assert saved==[]
         assert effects == (["accepted send"] if progress == "native_tool" else [])
     asyncio.run(run())
+
+
+def test_native_burst_splits_source_nine_without_losing_deferred_tail():
+    async def run():
+        sent=[]
+        session=make_native(sent, imessage_threaded_replies=True)
+        for number in range(1,11):
+            await session.handle_inbound(f"part-{number}", "imessage", source(number))
+        await session._worker
+        assert len(session._client.queries)==2
+        assert [row[3]["imessage_reply_target"] for row in sent]==["message-1","message-9"]
+        assert [row[3]["imessage_event_ids"] for row in sent]==[
+            [f"event-{number}" for number in range(1,9)], ["event-9","event-10"]]
+    asyncio.run(run())
+
+
+def test_native_burst_splits_over_4000_characters_without_losing_tail():
+    async def run():
+        sent=[]
+        session=make_native(sent, imessage_threaded_replies=True)
+        for number, text in enumerate(["a"*2000,"b"*2000,"tail"],1):
+            await session.handle_inbound(text,"imessage",source(number))
+        await session._worker
+        assert len(session._client.queries)==2
+        assert [row[3]["imessage_event_ids"] for row in sent]==[["event-1"],["event-2","event-3"]]
+        assert "a"*2000 in session._client.queries[0] and "b"*2000 not in session._client.queries[0]
+        assert "b"*2000 in session._client.queries[1] and "tail" in session._client.queries[1]
+    asyncio.run(run())

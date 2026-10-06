@@ -272,3 +272,58 @@ def test_real_sdk_gateway_routes_and_correlates_native_queued_reply(sdk):
     assert stored["reply_to_message_id"] == SOURCE_ID
     assert stored["thread_id"] == THREAD_ID
     assert stored["status"] == "pending"
+
+
+@pytest.mark.parametrize("destination", [{"conversation_id": "other-conversation"}, {"to": ["+15550002222"]}])
+def test_active_native_destination_override_is_rejected_before_upload_or_send(sdk, monkeypatch, destination):
+    from unittest.mock import Mock
+    active_source(monkeypatch)
+    upload=Mock()
+    monkeypatch.setattr("inkbox_claude.tools._upload_media_url",upload)
+    result,_=tool(sdk, text="Answer",media_path="must-not-read-local-file",**destination)
+    assert result["isError"]
+    upload.assert_not_called()
+    assert not posts(sdk)
+
+
+@pytest.mark.parametrize("when", ["before_upload", "after_upload"])
+def test_active_native_cancellation_cannot_upload_or_send_after_ownership_is_lost(sdk, monkeypatch, when):
+    from unittest.mock import Mock
+    session,_=active_source(monkeypatch)
+    def uploading(*args):
+        session._interrupting=True
+        return "https://example.com/synthetic-media"
+    upload=Mock(side_effect=uploading)
+    monkeypatch.setattr("inkbox_claude.tools._upload_media_url",upload)
+    if when == "before_upload":session._interrupting=True
+    result,_=tool(sdk,conversation_id=CONVERSATION_ID,text="Answer",media_path="synthetic-path")
+    assert result["isError"] and not posts(sdk)
+    assert upload.call_count == (0 if when == "before_upload" else 1)
+
+
+def test_triggerless_proactive_imessage_keeps_ordinary_sdk_send(sdk):
+    result,_=tool(sdk,to=["+15550002222"],text="Explicit proactive message")
+    assert not result.get("isError")
+    body=json.loads(posts(sdk)[0].content)
+    assert body["to"]=="+15550002222"
+    assert "reply_to_message_id" not in body
+
+
+@pytest.mark.parametrize("name,args", [
+    ("inkbox_get_imessage_thread", {"message_id": SOURCE_ID}),
+    ("inkbox_get_imessage_conversation_thread", {"conversation_id": "other", "thread_id": THREAD_ID}),
+])
+def test_active_native_thread_reads_cannot_expand_to_another_conversation(sdk, monkeypatch, name, args):
+    active_source(monkeypatch)
+    sdk.source["conversation_id"]="other"
+    result,_=tool(sdk,name,**args)
+    assert result["isError"]
+    assert not any("/thread" in request.url.path for request in sdk.requests)
+
+
+def test_companion_cannot_expand_supplied_native_history(sdk, monkeypatch):
+    session,_=active_source(monkeypatch)
+    session._current_turn.reply_meta["companion"]=True
+    result,_=tool(sdk,"inkbox_get_imessage_thread",message_id=SOURCE_ID)
+    assert result["isError"]
+    assert not any("/imessage/" in request.url.path for request in sdk.requests)

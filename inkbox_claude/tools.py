@@ -532,6 +532,22 @@ def build_inkbox_mcp_server(
         text = str(args.get("text") or "")
         conversation_id = str(args.get("conversation_id") or "").strip()
         to_list = _normalize_imessage_recipients(args.get("to"))
+        native = bool(cfg.imessage_threaded_replies and turn and turn.mode == "imessage" and route)
+        def assert_native_owner():
+            if not native:
+                return
+            if session._current_turn is not turn or not session._turn_active or session._interrupting:
+                raise ValueError("The originating turn has ended")
+            if route.get("companion"):
+                raise ValueError("Use the bound Companion reply tool for this turn")
+            if to_list is not None or conversation_id != route.get("conversation_id"):
+                raise ValueError("Native replies must stay in the originating conversation")
+            if not route.get("imessage_reply_target"):
+                raise ValueError("The originating native reply source is unavailable")
+        try:
+            assert_native_owner()
+        except ValueError as exc:
+            return _error(str(exc))
         if bool(to_list) == bool(conversation_id):
             return _error("Specify exactly one of `to` or `conversation_id`.")
         if to_list is not None and not to_list:
@@ -557,29 +573,27 @@ def build_inkbox_mcp_server(
             )
 
         def _run():
+            assert_native_owner()
             identity = _identity()
             kwargs: Dict[str, Any] = {"text": text}
             if conversation_id:
                 kwargs["conversation_id"] = conversation_id
             else:
                 kwargs["to"] = to_list[0] if len(to_list) == 1 else to_list
+            if native:
+                from .imessage import IMessageState, validate_reply_target
+                kwargs.update(validate_reply_target(identity, route))
+            assert_native_owner()
             media_path = str(args.get("media_path") or "").strip()
             if media_path:
-                # One tool call for the agent; the upload→send two-step is internal.
                 kwargs["media_urls"] = [_upload_media_url(identity, media_path)]
-            if cfg.imessage_threaded_replies and conversation_id and route.get("conversation_id") == conversation_id:
-                from .imessage import auto_reply_kwargs, IMessageState
-                if session._current_turn is not turn or not session._turn_active:
-                    raise ValueError("The originating turn has ended")
-                from .imessage import validate_reply_target
-                kwargs.update(validate_reply_target(identity, route))
-                if session._current_turn is not turn or not session._turn_active or session._interrupting:
-                    raise ValueError("The originating turn has ended")
+            assert_native_owner()
+            if native:
                 kwargs["idempotency_key"] = "claude:tool:" + __import__("hashlib").sha256(
                     json.dumps([route.get("imessage_event_id"), conversation_id, kwargs], sort_keys=True).encode()
                 ).hexdigest()
             msg = identity.send_imessage(**kwargs)
-            if cfg.imessage_threaded_replies and route and route.get("conversation_id") == conversation_id:
+            if native:
                 IMessageState(cfg).record_outbound(msg, route, session.chat_id)
                 session._imessage_tool_outputs.append((turn, text, route.get("imessage_reply_target")))
             result = {"sent": True, "id": str(getattr(msg, "id", ""))}

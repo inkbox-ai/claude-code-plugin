@@ -504,12 +504,16 @@ Every message-triggered reply targets its admitted source. Short compatible burs
 collect after 750 ms of quiet, capped at two seconds, and target their first source.
 Further messages queue behind active work instead of interrupting it. Media,
 reactions, different senders, and different native reply contexts do not combine.
+Bursts are limited to eight sources and 4000 combined text characters; overflow stays
+queued with its own source anchor. Inbound native send/read tools cannot switch the
+source conversation, upload before route validation, or expand Companion history.
 Stop affects owned iMessage work, not an unrelated voice consult for the contact.
 
 Native IDs remain opaque and nullable. The bridge performs identity-scoped source
 and thread preflight reads before targeted sending. Only the API may fall back to
 a plain same-conversation message. A failed targeted send never causes a second,
-unthreaded send. An explicit unrelated-conversation tool send inherits no target.
+unthreaded send. An active inbound native turn cannot change its destination or
+use `to`; triggerless proactive sends retain ordinary SDK behavior.
 The model cannot override the bridge's target/fallback policy. Companion uses its
 existing ordered durable receipt owner rather than ordinary burst collection.
 
@@ -519,8 +523,9 @@ The agent can list identity-accessible secret metadata, retrieve one selected
 credential, or obtain a current login 2FA code. Set **`INKBOX_CLAUDE_VAULT_KEY`**
 locally to enable lazy unlocking. Never put it in a conversation or tool argument.
 Metadata and unrelated tools remain available with a missing or wrong bridge key.
-Secret reads recheck the configured identity's access; cached unlock state does
-not bypass revocation. Credential output omits TOTP seeds; code output contains
+Every credential/code invocation validates the current bridge-local key and freshly
+checks the selected secret's identity access before and after decryption. Cached or
+SDK-global unlocked state cannot bypass a missing/changed key or revoked access. Credential output omits TOTP seeds; code output contains
 only the current code and its validity timing.
 
 Migrate any **SDK-global** `INKBOX_VAULT_KEY` or `vault_key` in `~/.inkbox/config`
