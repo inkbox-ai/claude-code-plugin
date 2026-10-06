@@ -24,36 +24,64 @@ def process_identity(client):
 
 
 def fence_process(identity):
-    """Fence recorded process identities, including children orphaned by exit."""
+    """Fence a still-observable owner; an old orphan snapshot is not proof."""
     if not identity:
         return False
     processes = {}
     try:
-        for entry in [identity, *identity.get("children", [])]:
+        parent = psutil.Process(identity["pid"])
+        if parent.create_time() != identity["created"]:
+            return False
+        # Freeze the parent and descendants while discovering them, preventing
+        # a normal tool child from forking between discovery and termination.
+        parent.suspend()
+        processes[parent.pid] = parent
+        for entry in identity.get("children", []):
             try:
-                process = psutil.Process(entry["pid"])
-                if process.create_time() != entry["created"]:
-                    continue
-                processes[process.pid] = process
-                for child in process.children(recursive=True):
+                child = psutil.Process(entry["pid"])
+                if child.create_time() == entry["created"]:
+                    child.suspend()
                     processes[child.pid] = child
             except psutil.NoSuchProcess:
                 continue
+        for _ in range(16):
+            added = False
+            for owner in list(processes.values()):
+                try:
+                    children = owner.children(recursive=True)
+                except psutil.NoSuchProcess:
+                    continue
+                for child in children:
+                    if child.pid not in processes:
+                        try:
+                            child.suspend()
+                            processes[child.pid] = child
+                            added = True
+                        except psutil.NoSuchProcess:
+                            continue
+            if not added:
+                break
+        else:
+            return False
         for process in processes.values():
-            try:
-                process.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        _, alive = psutil.wait_procs(list(processes.values()), timeout=3)
-        for process in alive:
             try:
                 process.kill()
             except psutil.NoSuchProcess:
                 pass
-        _, alive = psutil.wait_procs(alive, timeout=3)
-        return not alive
-    except (psutil.AccessDenied, KeyError, TypeError):
+        _, alive = psutil.wait_procs(list(processes.values()), timeout=3)
+        return not any(process.is_running() and process.status() not in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
+                       for process in alive)
+    except (psutil.Error, KeyError, TypeError):
+        # Missing/reused parent means it could have spawned unrecorded children
+        # before disappearing. Keep the scope quarantined, even with no children
+        # in its old snapshot. Never kill an unrelated reused PID.
         return False
+    finally:
+        for process in processes.values():
+            try:
+                process.resume()
+            except psutil.Error:
+                pass
 
 
 def saved_answer(directory: Path | None, session_id: str, submission_id: str):

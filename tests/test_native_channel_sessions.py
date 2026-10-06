@@ -219,7 +219,7 @@ def test_structured_auth_failure_reconnects_once_without_persisting_error_sessio
             async def receive_response(self):
                 failed=clients.index(self)==0
                 yield ResultMessage(subtype="error_during_execution" if failed else "success",
-                    duration_ms=1,duration_api_ms=1,is_error=failed,num_turns=1,
+                    duration_ms=1,duration_api_ms=1,is_error=failed,num_turns=0 if failed else 1,
                     session_id="error-session" if failed else "selected-session",
                     result="Not logged in" if failed else "Recovered answer")
         monkeypatch.setattr(module,"ClaudeSDKClient",Host)
@@ -230,4 +230,43 @@ def test_structured_auth_failure_reconnects_once_without_persisting_error_sessio
         assert saved==["selected-session"]
         assert [row[1] for row in sent]==["Recovered answer"]
         await session.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("companion", [False, True])
+@pytest.mark.parametrize("progress", ["assistant", "native_tool", "result_turn_count"])
+def test_late_auth_failure_never_requeries_after_execution(monkeypatch, progress, companion):
+    from inkbox_claude import sessions as module
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    from inkbox_claude.tools import CURRENT_SESSION, _to_thread_drained
+    async def run():
+        clients=[];effects=[];saved=[]
+        session=make_session([])
+        session.on_session_id=lambda chat,value:saved.append(value)
+        class Host(Client):
+            def __init__(self, options):
+                super().__init__();clients.append(self)
+            async def connect(self):pass
+            async def receive_response(self):
+                if progress == "assistant":
+                    yield AssistantMessage(content=[TextBlock(text="Started the task")], model="native")
+                elif progress == "native_tool":
+                    token=CURRENT_SESSION.set(session)
+                    try: await _to_thread_drained(lambda: effects.append("accepted send"))
+                    finally: CURRENT_SESSION.reset(token)
+                yield ResultMessage(subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
+                    is_error=True, num_turns=1 if progress == "result_turn_count" else 0,
+                    session_id="error-session", result="Not logged in")
+        monkeypatch.setattr(module,"ClaudeSDKClient",Host)
+        if companion:
+            async def authorize(): pass
+            with pytest.raises(RuntimeError, match="outcome is unconfirmed"):
+                await session.run_companion("perform the task", "sms", {"sender": "owner"}, lambda state: None, authorize)
+        else:
+            await session.handle_inbound("perform the task","sms",{"sender":"owner"})
+        await session._worker
+        assert len(clients)==1
+        assert sum(len(client.queries) for client in clients)==1
+        assert saved==[]
+        assert effects == (["accepted send"] if progress == "native_tool" else [])
     asyncio.run(run())

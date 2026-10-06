@@ -36,7 +36,7 @@ def test_fence_only_stops_owned_native_process():
         client=NS(_transport=NS(_process=NS(pid=child.pid)))
         identity=process_identity(client)
         assert identity['pid']==child.pid
-        assert fence_process({**identity,'created':identity['created']-100})
+        assert not fence_process({**identity,'created':identity['created']-100})
         assert child.poll() is None
         assert fence_process(identity)
         child.wait(timeout=3)
@@ -182,3 +182,51 @@ def test_companion_completion_settles_when_native_owner_cannot_be_fenced(monkeyp
         with pytest.raises(RuntimeError, match="could not be stopped"):
             await completion
     asyncio.run(run())
+
+
+def test_missing_native_parent_cannot_prove_no_unrecorded_orphan_tools():
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    created = psutil.Process(child.pid).create_time()
+    child.wait(timeout=3)
+    assert not fence_process({"pid": child.pid, "created": created, "children": []})
+
+
+def test_close_fences_native_parent_before_disconnect_erases_ownership(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    async def run():
+        child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
+        try:
+            session = make_session([])
+            async def disconnect():
+                assert child.poll() is not None
+            session._client = NS(_transport=NS(_process=NS(pid=child.pid)), disconnect=disconnect)
+            await session.close()
+            assert child.poll() is not None
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+    asyncio.run(run())
+
+
+def test_live_native_owner_discovers_late_tool_children_before_fencing(tmp_path):
+    import time
+    child_file = tmp_path / "tool.pid"
+    code = "import subprocess,sys,time,pathlib; child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);pathlib.Path(sys.argv[1]).write_text(str(child.pid));time.sleep(60)"
+    parent = subprocess.Popen([sys.executable, "-c", code, str(child_file)])
+    child = None
+    try:
+        owner = {"pid": parent.pid, "created": psutil.Process(parent.pid).create_time(), "children": []}
+        deadline = time.monotonic() + 5
+        while not child_file.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert child_file.exists()
+        child = psutil.Process(int(child_file.read_text()))
+        assert fence_process(owner)
+        parent.wait(timeout=3)
+        assert not child.is_running() or child.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
+    finally:
+        if parent.poll() is None:
+            parent.kill();parent.wait()
+        if child is not None and child.is_running():
+            child.kill()

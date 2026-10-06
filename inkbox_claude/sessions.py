@@ -123,6 +123,7 @@ class _Turn:
     authorize: Optional[Callable[[], Awaitable[None]]] = None
     queued_at: float = 0
     submitted: bool = False
+    execution_observed: bool = False
     attempts: int = 0.0
 
 
@@ -1036,9 +1037,16 @@ class ContactSession:
                     final: Optional[str] = None
                     completed = False
                     async for message in client.receive_response():
-                        if (getattr(message, "error", None) == "authentication_failed"
-                                or (getattr(message, "is_error", False) and "not logged in" in str(getattr(message, "result", "")).lower())):
+                        auth_failed = (getattr(message, "error", None) == "authentication_failed"
+                            or (getattr(message, "is_error", False) and "not logged in" in str(getattr(message, "result", "")).lower()))
+                        if auth_failed:
+                            # A login rejection is retryable only before any host
+                            # execution. A late auth failure can follow tool effects.
+                            if turn.execution_observed or getattr(message, "num_turns", 0) != 0:
+                                raise RuntimeError("Claude authentication failed after possible execution; outcome is unconfirmed")
                             raise ClaudeNotLoggedInError("Claude login is unavailable; run /login on the bridge machine")
+                        if isinstance(message, (AssistantMessage, ResultMessage)):
+                            turn.execution_observed = True
                         if generation != self._client_generation:
                             raise RuntimeError("The host turn was superseded")
                         if isinstance(message, AssistantMessage):
@@ -1049,7 +1057,7 @@ class ContactSession:
                             if turn.checkpoint is not None:
                                 completed = not message.is_error and message.subtype == "success"
                             final = message.result
-                            if message.session_id and self.on_session_id:
+                            if message.session_id and not message.is_error and self.on_session_id:
                                 self.resume_session_id = message.session_id
                                 self.on_session_id(self.chat_id, message.session_id)
                                 if turn.checkpoint is not None:
@@ -1059,7 +1067,7 @@ class ContactSession:
                     reply = (final or "\n\n".join(chunks)).strip()
                     break
                 except Exception as exc:
-                    if isinstance(exc, ClaudeNotLoggedInError) and not retried_missing_resume:
+                    if isinstance(exc, ClaudeNotLoggedInError) and not retried_missing_resume and not turn.execution_observed:
                         retried_missing_resume = True
                         if typing_task is not None:
                             typing_task.cancel()
@@ -1070,6 +1078,7 @@ class ContactSession:
                         continue
                     if (
                         turn.checkpoint is not None
+                        or turn.execution_observed
                         or retried_missing_resume
                         or not self.resume_session_id
                         or not _is_missing_resume_error(exc)
@@ -1365,6 +1374,8 @@ class ContactSession:
     # ------------------------------------------------------------------
 
     async def _can_use_tool(self, tool_name: str, input_data: Dict[str, Any], context: Any):
+        if self._current_turn is not None:
+            self._current_turn.execution_observed = True
         if self.reply_meta.get("companion") and not self.companion_approver:
             return PermissionResultDeny(message="This conversation has no verified sender to approve tools.")
         # AskUserQuestion → numbered poll on the human's channel.
@@ -1496,28 +1507,28 @@ class ContactSession:
             self._host_owner = current_owner
         connecting = self._connecting_client
         self._connecting_client = None
-        owners = [self._host_owner] if self._host_owner else []
+        clients = [client for client in (connecting, self._client) if client is not None]
+        owners = [process_identity(client) for client in clients]
+        if self._host_owner and self._host_owner not in owners:
+            owners.append(self._host_owner)
         disconnect_unproved = bool(getattr(self, "_execution_blocked", False))
-        if connecting is not None:
-            owner = process_identity(connecting)
-            if owner:
-                owners.append(owner)
-            try:
-                await connecting.disconnect()
-            except Exception:
-                disconnect_unproved |= owner is None
-        if self._client is not None:
-            try:
-                await self._client.disconnect()
-            except Exception:
-                disconnect_unproved |= self._host_owner is None
-            self._client = None
-        if self._side_effects:
-            await asyncio.gather(*list(self._side_effects), return_exceptions=True)
+        fenced = set()
         from .runtime import fence_process
         for owner in owners:
-            if not await asyncio.to_thread(fence_process, owner):
-                disconnect_unproved = True
+            if owner is not None and (owner["pid"], owner["created"]) not in fenced:
+                if await asyncio.to_thread(fence_process, owner):
+                    fenced.add((owner["pid"], owner["created"]))
+                else:
+                    disconnect_unproved = True
+        for client, owner in zip(clients, owners):
+            try:
+                await client.disconnect()
+            except Exception:
+                if owner is None or (owner["pid"], owner["created"]) not in fenced:
+                    disconnect_unproved = True
+        self._client = None
+        if self._side_effects:
+            await asyncio.gather(*list(self._side_effects), return_exceptions=True)
         if disconnect_unproved:
             self._execution_blocked = True
             raise RuntimeError("The previous host execution could not be stopped")

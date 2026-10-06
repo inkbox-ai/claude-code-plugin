@@ -20,7 +20,10 @@
   and native-thread ownership for controls.
 - Persist native Stop targets and unresolved process fences across repeated restarts;
   reject stale or ambiguous Slack connections before replies and status cleanup.
-- Reconnect a stale Claude login once without saving an error response session ID.
+- Reconnect a stale Claude login once only before any execution, never replaying
+  an auth failure after assistant/tool progress or saving an error response session ID.
+- Quarantine vanished/reused native parent processes instead of treating an old
+  descendant snapshot as proof that orphaned tools stopped.
 - Drain native tool side effects during shutdown, preserve unrelated voice work
   when stopping native iMessage, and retain callback-first outbound failures.
 

@@ -60,6 +60,9 @@ async def _to_thread_drained(function: Any, *args: Any, **kwargs: Any) -> Any:
     """Run a blocking side effect to completion even if its caller is canceled."""
     call = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     session = CURRENT_SESSION.get()
+    turn = getattr(session, "_current_turn", None)
+    if turn is not None:
+        turn.execution_observed = True
     pending = getattr(session, "_side_effects", None)
     if isinstance(pending, set):
         pending.add(call)

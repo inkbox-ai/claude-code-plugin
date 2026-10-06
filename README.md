@@ -534,8 +534,10 @@ bridge does not rewrite global SDK settings or monkeypatch SDK internals.
 Claude CLI authentication, initialized session storage, and blocked conversation
 owners. `inkbox-claude doctor` uses the same bounded native auth check. Neither
 endpoint claims a model task or external reply was completed; use a live acceptance
-check for that proof. If Claude reports a stale login, the bridge reconnects once
-without discarding the selected session and then gives local login guidance.
+check for that proof. If Claude reports a stale login before any execution, the bridge reconnects once
+without discarding the selected session and then gives local login guidance. An auth
+failure after assistant/tool progress or a nonzero host-turn count is uncertain and
+is never retried as a login refresh.
 
 Ordinary Slack/native-iMessage receipts and completed answers are persisted before
 acknowledgement or send. Companion journals, quiet context, Claude session IDs,
@@ -545,7 +547,10 @@ uncertain request is retained without automatic re-execution; later fresh work
 can proceed only after the old native host and side effects are fenced. An
 uncertain send is never automatically replayed. If ownership cannot be proved,
 readiness reports a blocked scope for operator inspection. That block survives repeated
-restarts until ownership fencing is positively confirmed.
+restarts until ownership fencing is positively confirmed. A missing or reused native
+parent PID is not proof of cleanup: its older child snapshot may omit later orphaned
+tools, so that scope stays quarantined. A live owned process is fenced before SDK
+disconnect removes its observable identity.
 
 State lives under `INKBOX_CLAUDE_HOME` (default `~/.inkbox-claude`). Stop the bridge
 before backing up or moving it. Do not delete journals or session IDs to recover a
