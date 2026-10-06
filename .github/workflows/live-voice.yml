@@ -43,8 +43,6 @@ jobs:
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       VOICE_DRIVER_STATE: /tmp/voice_driver_state.json
-      VOICE_DIAGNOSTIC_DRIVER: ${{ runner.temp }}/voice-driver-diagnostic.jsonl
-      VOICE_DIAGNOSTIC_TEST: ${{ runner.temp }}/voice-test-diagnostic.jsonl
 
     steps:
       - uses: actions/checkout@v7
@@ -85,6 +83,8 @@ jobs:
 
       - name: Configure speech mode (${{ matrix.scenario }})
         run: |
+          echo "VOICE_DIAGNOSTIC_DRIVER=$RUNNER_TEMP/voice-driver-diagnostic.jsonl" >> "$GITHUB_ENV"
+          echo "VOICE_DIAGNOSTIC_TEST=$RUNNER_TEMP/voice-test-diagnostic.jsonl" >> "$GITHUB_ENV"
           echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
             echo "INKBOX_VOICE_STACK=openai_realtime" >> "$GITHUB_ENV"
