@@ -28,6 +28,7 @@ DETAILS = frozenset({
     "a2a_stale", "a2a_stopped", "a2a_inactive",
 })
 TOOLS = frozenset({
+    "inkbox_lookup_contact",
     "inkbox_create_contact", "inkbox_update_contact", "inkbox_delete_contact",
     "inkbox_get_contact", "inkbox_list_contacts", "inkbox_send_email", "inkbox_send_sms",
     "inkbox_send_imessage", "inkbox_start_call", "AskUserQuestion", "Bash", "Read",
@@ -125,7 +126,8 @@ class Trace:
                 data, ignored = result
                 detail = {"stale-a2a-event": "a2a_stale", "task-inactive": "a2a_inactive",
                           "task-canceled": "a2a_stopped", "task-failed": "a2a_stopped",
-                          "task-completed": "a2a_stopped", "task-rejected": "a2a_stopped"}.get(ignored, "none" if ignored is None else "other")
+                          "task-completed": "a2a_stopped", "task-rejected": "a2a_stopped",
+                          "task-input_required": "a2a_stopped", "task-auth_required": "a2a_stopped"}.get(ignored, "none" if ignored is None else "other")
                 self.emit(phase, "observed", session=session, detail=detail,
                           facts={"admitted": data is not None and ignored is None})
             elif phase == "a2a_ingress":
@@ -140,8 +142,8 @@ class Trace:
             if not isinstance(message, SystemMessage) or message.subtype != "init":
                 return
             tools = message.data.get("tools")
-            # Unknown/missing host schema is unavailable evidence, not six false
-            # availability assertions. Never serialize an arbitrary tool name.
+            # Unknown/missing host schema is unavailable evidence. These bits
+            # report init-list presence, not callability under deferred discovery.
             if type(tools) is not list or any(type(name) is not str for name in tools):
                 return
             self.emit("native_tools", "observed", facts={"contact_tools": {

@@ -110,12 +110,14 @@ def test_tool_observation_uses_fixed_names_not_arguments_or_unknown_names(tmp_pa
     trace = diagnostics.Trace(path)
     trace.wrap(Session, "hook", "tool", session_method=True)
     session = Session()
-    for name in ("mcp__inkbox__inkbox_delete_contact", f"mcp__inkbox__{SECRET}"):
+    for name in ("mcp__inkbox__inkbox_delete_contact", "mcp__inkbox__inkbox_lookup_contact",
+                 f"mcp__inkbox__{SECRET}"):
         data = {"tool_name": name, "tool_input": {"contact_id": SECRET}, "result": SECRET}
         assert asyncio.run(session.hook(data)) is data
     rows = records(path)
     assert rows[0]["tool"] == "inkbox_delete_contact"
-    assert "tool" not in rows[2]
+    assert rows[2]["tool"] == "inkbox_lookup_contact"
+    assert "tool" not in rows[4]
 
 
 def test_trace_io_failure_does_not_change_real_call(tmp_path):
@@ -224,7 +226,7 @@ print('installed')
     assert result.stdout.strip() == "installed"
 
 
-def test_real_native_init_reports_only_known_availability_and_preserves_messages(tmp_path):
+def test_real_native_init_reports_only_known_list_presence_and_preserves_messages(tmp_path):
     from claude_agent_sdk import SystemMessage
 
     known = diagnostics.CONTACT_TOOLS
@@ -252,9 +254,9 @@ def test_real_native_init_reports_only_known_availability_and_preserves_messages
 
     received = asyncio.run(receive())
     assert all(a is b for a, b in zip(received, messages, strict=True))
-    available = [r for r in records(path) if r["phase"] == "native_tools"]
-    assert len(available) == 1
-    assert available[0]["contact_tools"] == {name: name != "inkbox_delete_contact" for name in known}
+    observed = [r for r in records(path) if r["phase"] == "native_tools"]
+    assert len(observed) == 1
+    assert observed[0]["contact_tools"] == {name: name != "inkbox_delete_contact" for name in known}
 
 
 def test_native_init_observation_failure_cannot_change_delivery(tmp_path):
@@ -271,7 +273,9 @@ def test_native_init_observation_failure_cannot_change_delivery(tmp_path):
 
 
 @pytest.mark.parametrize("ignored,detail", [(None, "none"), ("stale-a2a-event", "a2a_stale"),
-                                           ("task-completed", "a2a_stopped"), (SECRET, "other")])
+                                           ("task-completed", "a2a_stopped"),
+                                           ("task-input_required", "a2a_stopped"),
+                                           ("task-auth_required", "a2a_stopped"), (SECRET, "other")])
 def test_a2a_admission_observer_preserves_exact_return_and_projects_only_outcome(tmp_path, ignored, detail):
     result = ({"private_task": SECRET}, ignored)
 
@@ -372,7 +376,7 @@ def test_failed_observer_startup_preserves_exact_gateway_exception(tmp_path, mon
     assert SECRET not in capsys.readouterr().err
 
 
-def test_availability_report_reprojects_fixed_boolean_schema(tmp_path, capsys):
+def test_init_list_presence_report_reprojects_fixed_boolean_schema(tmp_path, capsys):
     path = tmp_path / "trace"
     known = {name: True for name in diagnostics.CONTACT_TOOLS}
     path.write_text("\n".join(json.dumps({"phase": "native_tools", "status": "observed",
