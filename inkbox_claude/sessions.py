@@ -561,6 +561,7 @@ class ContactSession:
         """Retain a quiet message without generation, tools, typing or interrupts."""
         source_id = source_id or hashlib.sha256(text.encode()).hexdigest()
         if any(item["id"] == source_id for item in self._context):
+            self._save_context()
             return
         self._context.append({"id": source_id, "text": text})
         self._save_context()
@@ -716,6 +717,14 @@ class ContactSession:
                 pass
             if (not turn.cancelled and not self._shutting_down and generation == self._client_generation
                     and not getattr(self, "_execution_blocked", False)):
+                # Burst collection may already own the next incompatible input.
+                # Put it ahead of later arrivals before reserving the retry slot.
+                if self._deferred_turn is not None:
+                    following = [self._deferred_turn]
+                    while not self._queue.empty():
+                        following.append(self._queue.get_nowait())
+                    for pending in following:
+                        self._queue.put_nowait(pending)
                 self._deferred_turn = turn
         finally:
             if self._retrying_turn is turn:

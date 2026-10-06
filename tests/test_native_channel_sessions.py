@@ -108,6 +108,36 @@ def test_queued_followup_does_not_interrupt_active_native_imessage():
     asyncio.run(run())
 
 
+def test_retry_preserves_incompatible_followups_in_order(monkeypatch):
+    monkeypatch.setattr("inkbox_claude.sessions.CHANNEL_RETRY_INITIAL_DELAY", .001)
+    monkeypatch.setattr("inkbox_claude.sessions.CHANNEL_RETRY_MAX_DELAY", .002)
+
+    async def run():
+        sent = []
+        session = make_native(sent, imessage_threaded_replies=True)
+        host = session._client
+        attempts = 0
+
+        async def ensure():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise ConnectionError("Host temporarily unavailable")
+            session._client = host
+            return host
+
+        monkeypatch.setattr(session, "_ensure_client", ensure)
+        for number in range(1, 4):
+            await session.handle_inbound(f"Request {number}", "imessage",
+                                         source(number, sender=f"sender-{number}", conversation_kind="group"))
+        await asyncio.wait_for(session._worker, 4)
+        assert len(host.queries) == 3
+        assert all(f"Request {number}" in query for number, query in enumerate(host.queries, 1))
+        assert [row[3]["imessage_reply_target"] for row in sent] == ["message-1", "message-2", "message-3"]
+        assert session._queue.empty() and session._deferred_turn is None
+    asyncio.run(run())
+
+
 def test_stop_during_burst_cancels_unstarted_work():
     async def run():
         sent=[]

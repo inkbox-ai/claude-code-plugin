@@ -35,6 +35,12 @@
   quietly while approval is pending, and preserve unrelated queued consultations.
 - Retain quiet iMessage failure notices durably without changing accepted sends
   into rejected tool results; independent explicit sends never inherit reply routing.
+- Persist native iMessage reaction turns before processing, reply to the reacted-to
+  message, and prevent duplicate work after restart.
+- Preserve incompatible iMessage follow-ups across retries and retain native Slack
+  Stop targets across restart without cancelling later work.
+- Keep unconfirmed-outcome context after shutdown and route callback-first delivery
+  notices to the accepted send's conversation once its destination is known.
 - Reset execution proof when a retry acquires a new host, retain exact positive
   fence proof across transient journal failures, and keep uncertain saved-answer
   sends out of pre-submission retry and terminal-failure paths.

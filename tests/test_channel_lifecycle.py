@@ -92,6 +92,60 @@ def test_positive_fence_cannot_release_another_chat_or_reused_process():
 
 
 @pytest.mark.parametrize("mode", ["slack", "imessage"])
+def test_shutdown_fenced_outcome_context_survives_restart_once(mode, monkeypatch):
+    async def run():
+        cfg = BridgeConfig(identity="test-agent", slack_enabled=True, imessage_threaded_replies=True)
+        gw = InkboxGateway(cfg)
+        session = make_session([])
+        session.cfg = cfg
+        gw.sessions = NS(get=lambda _chat: session, sessions={session.chat_id: session})
+        meta = {"source_event_id": "old", "imessage_event_id": "old", "host_fenced": True}
+        store = gw._channel_store(mode)
+        store.admit(session.chat_id, "Earlier request", meta)
+        store.mark(meta, "uncertain")
+        monkeypatch.setattr("inkbox_claude.runtime.fence_process", lambda _owner: pytest.fail("Do not refence a proven stopped owner"))
+        await gw._recover_channel_inputs()
+        assert len(session._context) == 1
+        assert "unconfirmed outcome" in session._context[0]["text"]
+        assert session._worker is None and session._queue.empty()
+        session._context.clear()
+        session._save_context()
+        for owned in gw._channel_stores.values():
+            owned.close()
+        restarted = InkboxGateway(cfg)
+        fresh = make_session([])
+        restarted.sessions = NS(get=lambda _chat: fresh, sessions={fresh.chat_id: fresh})
+        await restarted._recover_channel_inputs()
+        assert fresh._context == []
+        assert restarted._channel_store(mode).summary()["uncertain"] == 1
+        for owned in restarted._channel_stores.values():
+            owned.close()
+    asyncio.run(run())
+
+
+def test_uncertain_notice_failed_flush_is_not_acknowledged(monkeypatch):
+    async def run():
+        gw = InkboxGateway(BridgeConfig(identity="test-agent", slack_enabled=True))
+        session = make_session([])
+        gw.sessions = NS(get=lambda _chat: session, sessions={session.chat_id: session})
+        store = gw._channel_store("slack")
+        meta = {"source_event_id": "old", "host_fenced": True}
+        store.admit(session.chat_id, "Earlier request", meta)
+        store.mark(meta, "uncertain")
+        save = session._save_context
+        monkeypatch.setattr(session, "_save_context", lambda: (_ for _ in ()).throw(OSError("write unavailable")))
+        with pytest.raises(OSError):
+            await gw._recover_channel_inputs()
+        assert len(store.pending_uncertain_notices()) == 1
+        monkeypatch.setattr(session, "_save_context", save)
+        await gw._recover_channel_inputs()
+        assert len(json.loads(session._context_path.read_text())) == 1
+        assert store.pending_uncertain_notices() == []
+        store.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["slack", "imessage"])
 @pytest.mark.parametrize("can_fence", [False, True])
 def test_auth_retry_replaces_fence_proof_before_second_host_executes(monkeypatch, mode, can_fence):
     from claude_agent_sdk import ResultMessage

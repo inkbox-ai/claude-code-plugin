@@ -143,9 +143,28 @@ class IMessageState:
         if not event_id:
             raise ValueError("A control requires a stable event ID")
         with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
             result = db.execute("INSERT OR IGNORE INTO controls(event_id,targets) VALUES(?,?)",
                                 (event_id, _json(targets)))
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                return False
+            # A crash after this commit must not replay queued work or a saved
+            # answer that was already selected by the acknowledged Stop.
+            for target in targets:
+                for source in target["source_event_ids"]:
+                    db.execute("UPDATE receipts SET state='cancelled' WHERE chat_id=? AND event_id=? "
+                               "AND state IN ('pending','reply_pending')", (target["chat_id"], source))
+            return True
+
+    def was_stopped(self, chat_id: str, source_event_id: str) -> bool:
+        """Match only the work captured by a durable native Stop, including Companion."""
+        with self._db() as db:
+            return db.execute(
+                "SELECT 1 FROM controls, json_each(controls.targets) AS target, "
+                "json_each(target.value, '$.source_event_ids') AS source "
+                "WHERE json_extract(target.value, '$.chat_id')=? AND source.value=? LIMIT 1",
+                (chat_id, source_event_id),
+            ).fetchone() is not None
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
@@ -200,6 +219,21 @@ class IMessageState:
                 seen.add(anchor)
                 result.append(self._receipt(row))
         return result
+
+    def pending_uncertain_notices(self) -> list[dict[str, Any]]:
+        with self._db() as db:
+            return [self._receipt(row) for row in db.execute(
+                "SELECT * FROM receipts WHERE state='uncertain' "
+                "AND json_extract(meta, '$.host_fenced')=1 "
+                "AND COALESCE(json_extract(meta, '$.uncertain_notice_buffered'),0)=0 ORDER BY rowid"
+            )]
+
+    def mark_uncertain_notice_buffered(self, meta: dict, chat_id: str) -> None:
+        with self._db() as db:
+            for event_id in _event_ids(meta):
+                db.execute("UPDATE receipts SET meta=json_set(meta, '$.uncertain_notice_buffered', 1) "
+                           "WHERE event_id=? AND chat_id=? AND state='uncertain'",
+                           (event_id, chat_id))
 
     def mark(self, meta: dict[str, Any], state: str, reply: Any = None, chat_id: str | None = None) -> None:
         if state not in _STATES:
@@ -264,8 +298,12 @@ class IMessageState:
     @staticmethod
     def _stage_failure_notice(db, message_id, route):
         if route and route.get("chat_id"):
-            db.execute("INSERT OR IGNORE INTO delivery_notices(message_id,chat_id,meta) VALUES(?,?,?)",
-                       (message_id, route["chat_id"], _json({"conversation_id": (route.get("meta") or {}).get("conversation_id")})))
+            db.execute("INSERT INTO delivery_notices(message_id,chat_id,meta) VALUES(?,?,?) "
+                       "ON CONFLICT(message_id) DO UPDATE SET chat_id=excluded.chat_id, meta=excluded.meta, "
+                       "buffered=CASE WHEN delivery_notices.chat_id=excluded.chat_id "
+                       "THEN delivery_notices.buffered ELSE 0 END WHERE ?",
+                       (message_id, route["chat_id"], _json({"conversation_id": (route.get("meta") or {}).get("conversation_id")}),
+                        not route.get("unknown_route", False)))
 
     def mark_delivery_failed(self, message_id: str, fallback_route=None) -> None:
         """Record late failure without changing the completed model work or its route."""
@@ -279,7 +317,8 @@ class IMessageState:
                 route = {"chat_id": None, "meta": {}, "message_id": str(message_id),
                          "status": "failed", "unknown_route": True}
                 db.execute("INSERT INTO outbound(message_id,route) VALUES(?,?)", (str(message_id), _json(route)))
-            self._stage_failure_notice(db, str(message_id), route if route.get("chat_id") else fallback_route)
+            self._stage_failure_notice(db, str(message_id), route if route.get("chat_id") else
+                                       {**fallback_route, "unknown_route": True} if fallback_route else None)
 
     def pending_failure_notices(self, chat_id=None) -> list[dict]:
         with self._db() as db:

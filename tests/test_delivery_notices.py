@@ -133,6 +133,28 @@ def test_route_missing_at_callback_is_filled_by_accepted_output():
     asyncio.run(run())
 
 
+def test_callback_first_notice_reaches_later_authoritative_contact_route_once():
+    async def run():
+        gw = gateway()
+        await gw._on_imessage_delivery_failed(failure())
+        assert len(gw.sessions.get("imessage:conversation-one")._context) == 1
+        store = gw._channel_store("imessage")
+        store.record_outbound(NS(id="outbound-one", status="pending"),
+                              {"conversation_id": "conversation-one"}, "resolved-contact")
+        gw._retain_imessage_failure_notices()
+        target = gw.sessions.get("resolved-contact")
+        assert len(target._context) == 1
+        assert "conversation-one" in target._context[0]["text"]
+        assert target._worker is None and target._client is None
+        target._context.clear()
+        target._save_context()
+        await gw._on_imessage_delivery_failed(failure())
+        assert target._context == []
+        assert store.pending_failure_notices() == []
+        store.close()
+    asyncio.run(run())
+
+
 def test_notice_buffer_is_bounded_and_preserves_other_quiet_input():
     async def run():
         gw = gateway()

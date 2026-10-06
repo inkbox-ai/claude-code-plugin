@@ -31,6 +31,46 @@ def test_durable_duplicate_receipts_preserve_first_admitted_route():
     assert restarted.replay_pending() == [{"chat_id": "chat-1", "text": "original text", "meta": meta}]
 
 
+@pytest.mark.parametrize("phase", ["pending", "reply_pending", "running", "sending"])
+def test_stop_is_durable_before_in_memory_abort_and_keeps_uncertain_ownership(phase):
+    cfg = BridgeConfig(identity="test-agent")
+    state = IMessageState(cfg, channel="slack")
+    old = {"source_event_id": "old"}
+    state.admit("chat-1", "Old work", old)
+    state.mark(old, phase, reply="Saved answer" if phase == "reply_pending" else None)
+    state.admit("chat-2", "Other work", {"source_event_id": "other"})
+    assert state.consume_control("stop", [{"chat_id": "chat-1", "source_event_ids": ["old"]}])
+    # Restart immediately, before a session has processed the Stop at all.
+    restarted = IMessageState(cfg, channel="slack")
+    assert restarted.was_stopped("chat-1", "old")
+    assert not restarted.was_stopped("chat-2", "old")
+    assert [item["text"] for item in restarted.replay_pending()] == ["Other work"]
+    assert restarted.pending_replies() == []
+    assert restarted.summary()["cancelled"] == (1 if phase in {"pending", "reply_pending"} else 0)
+    assert len(restarted.interrupted()) == (1 if phase in {"running", "sending"} else 0)
+    restarted.admit("chat-1", "Fresh work", {"source_event_id": "fresh"})
+    assert not restarted.consume_control("stop", [{"chat_id": "chat-1", "source_event_ids": ["fresh"]}])
+    assert not restarted.was_stopped("chat-1", "fresh")
+    assert [item["text"] for item in restarted.replay_pending()] == ["Other work", "Fresh work"]
+
+
+def test_stop_tombstone_and_queued_cancellation_commit_together():
+    state = IMessageState(BridgeConfig(identity="test-agent"), channel="slack")
+    state.admit("chat", "Work", {"source_event_id": "source"})
+    with state._db() as db:
+        db.execute("CREATE TRIGGER fail_cancel BEFORE UPDATE ON receipts "
+                   "BEGIN SELECT RAISE(ABORT, 'write unavailable'); END")
+    targets = [{"chat_id": "chat", "source_event_ids": ["source"]}]
+    with pytest.raises(sqlite3.IntegrityError, match="write unavailable"):
+        state.consume_control("stop", targets)
+    assert not state.was_stopped("chat", "source")
+    assert len(state.replay_pending()) == 1
+    with state._db() as db:
+        db.execute("DROP TRIGGER fail_cancel")
+    assert state.consume_control("stop", targets)
+    assert state.replay_pending() == []
+
+
 def test_trigger_anchors_survive_restart_without_combining_unsubmitted_fragments():
     state = IMessageState(BridgeConfig(identity="test-agent"))
     first, second = metadata("first"), metadata("second")

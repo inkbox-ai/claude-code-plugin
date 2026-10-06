@@ -136,3 +136,97 @@ def test_ordinary_slack_companion_accepts_documented_author_aliases(harness, cli
         assert len(harness.queries) == 1
         await gw._cleanup()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["pending", "generated", "submitted"])
+def test_native_stop_snapshot_survives_companion_restart(harness, client, receipt, monkeypatch, phase):
+    async def run():
+        initial, pages = fixture()
+        gw, _ = harness.build(pages, slack_enabled=True)
+        gw._identity.id = UUID(IDENTITY)
+        gw._inkbox.slack = client.slack
+        receiver = gw._companion_receiver()
+        monkeypatch.setattr(receiver, "schedule", Mock())
+        envelope = deepcopy(receipt)
+        envelope["companion"] = {**initial["companion"], "channel": "slack", "phase": "ordinary"}
+        envelope["companion"].pop("activation_id")
+        envelope["data"].update(message_kinds=["channel", "mention"], sender_access="direct")
+        assert (await gw._handle_webhook(Request(envelope))).status == 200
+        key, record = next(iter(receiver.records.items()))
+        stored = record["events"][SOURCE]
+        stored.update(state=phase, reply="Saved answer", host_fenced=True,
+                      reply_meta=stored["message"]["slack_route"], submitted_meta=stored["message"]["slack_route"])
+        receiver.save(key)
+        gw._channel_store("slack").consume_control("native-stop", [{
+            "chat_id": record["session_key"], "source_event_ids": [envelope["id"]],
+        }])
+        await gw._cleanup()
+        restarted, _ = harness.build(pages, slack_enabled=True)
+        restarted._identity.id = UUID(IDENTITY)
+        restarted._inkbox.slack = client.slack
+        monkeypatch.setattr("inkbox_claude.runtime.saved_answer", lambda *_args: pytest.fail("Stopped work must not recover a send"))
+        restarted._companion_receiver().recover()
+        [recovered] = await drained(restarted)
+        assert recovered["events"][SOURCE]["state"] == ("unconfirmed" if phase == "submitted" else "discarded")
+        assert harness.queries == []
+        client.slack.send_message.assert_not_called()
+        # The tombstone covers only its captured input, not later work in this scope.
+        fresh = deepcopy(envelope)
+        fresh["id"] = "fresh-event"
+        fresh["companion"]["sequence"] = 2
+        fresh["data"]["message_ts"] = "1791000000.000004"
+        archived = client.slack.list_archived_messages.return_value.messages[0]
+        archived.id = UUID(uid(13))
+        archived.message_ts = fresh["data"]["message_ts"]
+        assert (await restarted._handle_webhook(Request(fresh, request_id="fresh-request"))).status == 200
+        await drained(restarted)
+        assert len(harness.queries) == 1
+        await restarted._cleanup()
+    asyncio.run(run())
+
+
+def test_active_native_stop_clears_companion_working_status(harness, client, receipt):
+    async def run():
+        initial, pages = fixture()
+        gw, _ = harness.build(pages, slack_enabled=True)
+        gw._identity.id = UUID(IDENTITY)
+        gw._inkbox.slack = client.slack
+        statuses = []
+
+        async def activity(_chat, _mode, meta, state):
+            statuses.append((meta["source_event_id"], state))
+
+        gw.sessions.activity_fn = activity
+        started, released = asyncio.Event(), asyncio.Event()
+
+        async def connected(host):
+            async def interrupt():
+                released.set()
+            host.interrupt = interrupt
+
+        async def receive(_host):
+            started.set()
+            await released.wait()
+
+        harness.hooks.connect, harness.hooks.receive = connected, receive
+        envelope = deepcopy(receipt)
+        envelope["companion"] = {**initial["companion"], "channel": "slack", "phase": "ordinary"}
+        envelope["companion"].pop("activation_id")
+        envelope["data"].update(message_kinds=["channel", "mention"], sender_access="direct", thread_ts="1791000000.000000")
+        client.slack.list_archived_messages.return_value.messages[0].thread_ts = envelope["data"]["thread_ts"]
+        try:
+            assert (await gw._handle_webhook(Request(envelope))).status == 200
+            await asyncio.wait_for(started.wait(), 2)
+            stop = {"id": "active-stop", "event_type": "slack.session_stopped", "data": {
+                **envelope["data"], "event": {"type": "agent_session_stopped"},
+            }}
+            assert (await gw._on_slack_received(stop)).status == 200
+            [record] = await drained(gw)
+            assert (envelope["id"], "accepted") in statuses
+            assert statuses[-1] == (envelope["id"], "cancelled")
+            assert record["events"][SOURCE]["state"] == "discarded"
+            client.slack.send_message.assert_not_called()
+        finally:
+            released.set()
+            await gw._cleanup()
+    asyncio.run(run())

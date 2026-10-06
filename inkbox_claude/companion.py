@@ -526,7 +526,7 @@ class CompanionReceiver:
                 continue
             if not event.get("host_fenced") and not event.get("host_terminal") and not await asyncio.to_thread(fence_process, event.get("host_owner")):
                 return
-            reply = None if event["state"] == "sending" else await asyncio.to_thread(saved_answer,
+            reply = None if event["state"] == "sending" or self.was_stopped(record, event) else await asyncio.to_thread(saved_answer,
                 _transcript_dir(self.gateway.cfg.project_dir), record.get("host_session_id", ""), event["submission_id"])
             if reply is not None and event.get("submitted_meta"):
                 event.update(state="generated", reply=reply, reply_meta=event["submitted_meta"])
@@ -719,6 +719,13 @@ class CompanionReceiver:
     async def deliver(self, key: str, event: dict) -> None:
         """Send a checkpointed model result without repeating its model turn."""
         record = self.records[key]
+        if self.was_stopped(record, event):
+            event["state"] = "discarded"
+            self.save(key)
+            await self.gateway.sessions.get(record["session_key"]).notify_activity(
+                MODES[record["scope"]["channel"]], event["reply_meta"], "cancelled",
+            )
+            return
         chat_id = record["session_key"]
         meta = event["reply_meta"]
         self.active_replies[chat_id] = deepcopy(meta)
@@ -817,6 +824,10 @@ class CompanionReceiver:
                         self.save(key)
                     return False
                 event = min(events, key=lambda item: item["scope"]["sequence"])
+                if self.was_stopped(record, event):
+                    event["state"] = "discarded"
+                    self.save(key)
+                    continue
                 if event["state"] == "generated":
                     await self.deliver(key, event)
                     continue
@@ -938,6 +949,14 @@ class CompanionReceiver:
             logger.warning("Companion work %s: %s", key, record["error"])
             return retry
         return False
+
+    def was_stopped(self, record: dict, event: dict) -> bool:
+        if record["scope"]["channel"] != "slack":
+            return False
+        route = event["message"].get("slack_route", {})
+        return self.gateway._channel_store("slack").was_stopped(
+            record["session_key"], route.get("source_event_id", ""),
+        )
 
     async def answer_pending(self, key: str, event_id: str) -> None:
         """Only the prompted sender may answer, under current receipt gates."""

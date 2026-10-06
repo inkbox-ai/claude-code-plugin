@@ -1719,8 +1719,13 @@ class InkboxGateway:
                     blocked_chats.add(item["chat_id"])
                 else:
                     store.mark({**item["meta"], "host_fenced": True}, "uncertain", chat_id=item["chat_id"])
-                    session.buffer_context("Earlier work has an unconfirmed outcome. Do not repeat its actions automatically.",
-                                           str(item["meta"].get("source_event_id") or item["meta"].get("imessage_event_id")))
+            for item in store.pending_uncertain_notices():
+                session = self.sessions.get(item["chat_id"])
+                event_id = (item["meta"].get("source_event_id") or item["meta"].get("imessage_event_id")
+                            or item["meta"].get("message_id"))
+                session.buffer_context("Earlier work has an unconfirmed outcome. Do not repeat its actions automatically.",
+                                       f"unconfirmed:{mode}:{event_id}")
+                store.mark_uncertain_notice_buffered(item["meta"], item["chat_id"])
             pending = store.replay_pending()
             for item in store.pending_replies():
                 if item["chat_id"] in blocked_chats:
@@ -2966,7 +2971,25 @@ class InkboxGateway:
                         "contact": contact,
                         "contact_memories": memories,
                     }
-                    await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+                    if self.cfg.imessage_threaded_replies:
+                        from .imessage import source_metadata
+                        receipt_id = f"reaction:{reaction_id}" if reaction_id else str(envelope.get("id") or "")
+                        if not target_message_id or not receipt_id:
+                            self._dedup_commit(event_key)
+                            return web.json_response({"ok": True, "ignored": "reaction-without-source"})
+                        # The reaction owns the receipt; the reacted-to message
+                        # owns the native reply target, never the reaction ID.
+                        meta.update(source_metadata({"id": target_message_id}, receipt_id))
+                        meta["message_id"] = reaction_id or receipt_id
+                        if not self._channel_store("imessage").admit(chat_id, body, meta):
+                            self._dedup_commit(event_key)
+                            return web.json_response({"ok": True, "deduped": True})
+                    try:
+                        await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+                    except Exception:
+                        if self.cfg.imessage_threaded_replies:
+                            self._channel_store("imessage").forget_pending(meta)
+                        raise
                     response = web.json_response({"ok": True})
         except Exception:
             self._dedup_rollback(event_key)

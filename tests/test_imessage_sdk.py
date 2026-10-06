@@ -3,6 +3,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import httpx
@@ -19,6 +20,7 @@ from inkbox_claude.tools import build_inkbox_mcp_server, CURRENT_SESSION
 from tests.native_mcp import call_mcp
 from tests.test_sessions import make_session
 from inkbox_claude.sessions import _Turn
+from tests.test_native_channel_sessions import Client
 import os
 
 
@@ -51,6 +53,8 @@ def message(**changes):
 @pytest.fixture
 def sdk(monkeypatch, tmp_path):
     """Use real SDK clients/serializers with synthetic credentials and no network."""
+    from aiohttp import web
+    monkeypatch.setattr("inkbox_claude.gateway.web", web)
     monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
     token = CURRENT_SESSION.set(None)
     monkeypatch.setenv("INKBOX_IMESSAGE_THREADED_REPLIES", "true")
@@ -429,3 +433,153 @@ def test_companion_cannot_expand_supplied_native_history(sdk, monkeypatch):
     result,_=tool(sdk,"inkbox_get_imessage_thread",message_id=SOURCE_ID)
     assert result["isError"]
     assert not any("/imessage/" in request.url.path for request in sdk.requests)
+
+def reaction_gateway(sdk):
+    cfg = BridgeConfig(identity="agent", base_url="https://example.com",
+                       allow_all_users=True, imessage_threaded_replies=True)
+    gw = InkboxGateway(cfg)
+    gw._identity = sdk.client.get_identity("agent")
+    gw._resolve_contact_full = AsyncMock(return_value={"id": "contact-1"})
+    gw._lookup_imessage_conversation_summary = AsyncMock(return_value=None)
+    session = make_session([])
+    session.cfg, session.send_fn, session.receipt_fn = cfg, gw.send_to_contact, gw._channel_receipt
+    host = session._client = Client()
+
+    def get(chat_id):
+        assert chat_id == session.chat_id
+        return session
+
+    gw.sessions = SimpleNamespace(sessions={session.chat_id: session}, get=get)
+    return gw, session, host
+
+
+def reaction_event(**changes):
+    return {"id": "reaction-event", "data": {"reaction": {
+        "id": "reaction-one", "direction": "inbound", "remote_number": "+15555550123",
+        "conversation_id": CONVERSATION_ID, "target_message_id": SOURCE_ID,
+        "reaction": "question", **changes,
+    }}}
+
+
+def close_channel_stores(gw):
+    for store in gw._channel_stores.values():
+        store.close()
+
+
+def test_native_reaction_sends_to_target_once_across_restart(sdk):
+    async def run():
+        gw, session, host = reaction_gateway(sdk)
+        try:
+            await gw._on_imessage_reaction_received(reaction_event())
+            await session._worker
+            assert len(host.queries) == 1
+            sends = [request for request in sdk.requests if request.method == "POST"]
+            assert len(sends) == 1
+            assert json.loads(sends[0].content)["reply_to_message_id"] == SOURCE_ID
+            assert json.loads(sends[0].content)["text"] == "Answer"
+            assert gw._channel_store("imessage").summary()["done"] == 1
+            duplicate = await gw._on_imessage_reaction_received(reaction_event())
+            assert json.loads(duplicate.text)["deduped"]
+            assert len(host.queries) == 1
+        finally:
+            close_channel_stores(gw)
+        restarted, fresh, fresh_host = reaction_gateway(sdk)
+        try:
+            duplicate = await restarted._on_imessage_reaction_received({**reaction_event(), "id": "redelivered-event"})
+            assert json.loads(duplicate.text)["deduped"]
+            assert fresh_host.queries == [] and fresh._worker is None
+            assert len([request for request in sdk.requests if request.method == "POST"]) == 1
+        finally:
+            close_channel_stores(restarted)
+    asyncio.run(run())
+
+
+def test_native_reaction_admission_failure_can_retry_without_losing_target(sdk):
+    async def run():
+        gw, session, _host = reaction_gateway(sdk)
+        session.handle_inbound = AsyncMock(side_effect=RuntimeError("Admission unavailable"))
+        event = reaction_event()
+        event.pop("id")  # The stable reaction ID is sufficient when the envelope omits one.
+        try:
+            with pytest.raises(RuntimeError, match="Admission unavailable"):
+                await gw._on_imessage_reaction_received(event)
+            assert gw._channel_store("imessage").replay_pending() == []
+            session.handle_inbound.side_effect = None
+            await gw._on_imessage_reaction_received(event)
+            [receipt] = gw._channel_store("imessage").replay_pending()
+            assert receipt["meta"]["imessage_reply_target"] == SOURCE_ID
+            assert receipt["meta"]["imessage_event_id"] == "reaction:reaction-one"
+            assert receipt["meta"]["reaction"] == "question"
+        finally:
+            close_channel_stores(gw)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("missing", ["target_message_id", "receipt_id"])
+def test_native_reaction_without_stable_source_does_not_start_work(sdk, missing):
+    async def run():
+        gw, session, host = reaction_gateway(sdk)
+        event = reaction_event()
+        if missing == "receipt_id":
+            event.pop("id")
+            event["data"]["reaction"].pop("id")
+        else:
+            event["data"]["reaction"].pop(missing)
+        try:
+            response = await gw._on_imessage_reaction_received(event)
+            assert json.loads(response.text)["ignored"] == "reaction-without-source"
+            assert session._worker is None and host.queries == []
+            assert not any(request.method == "POST" for request in sdk.requests)
+        finally:
+            close_channel_stores(gw)
+    asyncio.run(run())
+
+
+def test_native_reaction_waits_behind_active_work_without_interrupt(sdk):
+    async def run():
+        gw, session, host = reaction_gateway(sdk)
+        host.gate = asyncio.Event()
+        meta = {"conversation_id": CONVERSATION_ID, "sender": "+15555550123",
+                **source_metadata(message(), "original-event")}
+        store = gw._channel_store("imessage")
+        try:
+            store.admit(session.chat_id, "Original request", meta)
+            await session.handle_inbound("Original request", "imessage", meta)
+            await asyncio.wait_for(host.started.wait(), 2)
+            await gw._on_imessage_reaction_received(reaction_event())
+            assert len(host.queries) == 1 and host.interrupts == 0
+            assert store.summary()["pending"] == 1 and store.summary()["running"] == 1
+            host.gate.set()
+            await asyncio.wait_for(session._worker, 2)
+            assert len(host.queries) == 2 and host.interrupts == 0
+            assert store.summary()["done"] == 2
+            sends = [request for request in sdk.requests if request.method == "POST"]
+            assert len(sends) == 2
+            assert all(json.loads(request.content)["reply_to_message_id"] == SOURCE_ID for request in sends)
+        finally:
+            host.gate.set()
+            close_channel_stores(gw)
+    asyncio.run(run())
+
+
+def test_quiet_group_reactions_do_not_replace_or_duplicate_source_context(sdk):
+    async def run():
+        gw, session, host = reaction_gateway(sdk)
+        session.cfg.group_reply_mode = "mention"
+        session.chat_id = f"imessage:{CONVERSATION_ID}"
+        gw.sessions.sessions = {session.chat_id: session}
+        gw._lookup_imessage_conversation_summary.return_value = {"is_group": True}
+        original = message(remote_number="+15555550123", content="Quiet conversation")
+        try:
+            await gw._on_imessage_received({"id": "source-event", "data": {"message": original}})
+            await gw._on_imessage_reaction_received(reaction_event())
+            assert len(session._context) == 2
+            assert session._context[0]["id"] != session._context[1]["id"]
+            await gw._on_imessage_reaction_received(reaction_event(id="another-reaction", reaction="like"))
+            assert len(session._context) == 3
+            assert gw._channel_store("imessage").summary()["done"] == 3
+            assert host.queries == [] and session._worker is None
+            assert not any(request.method == "POST" for request in sdk.requests)
+        finally:
+            close_channel_stores(gw)
+    asyncio.run(run())
