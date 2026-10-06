@@ -230,3 +230,43 @@ def test_live_native_owner_discovers_late_tool_children_before_fencing(tmp_path)
             parent.kill();parent.wait()
         if child is not None and child.is_running():
             child.kill()
+
+
+def test_later_positive_fence_releases_only_the_same_known_blocked_owner(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    async def run():
+        child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
+        try:
+            session = make_session([])
+            async def disconnect():
+                raise RuntimeError("temporary native disconnect failure")
+            session._client = NS(_transport=NS(_process=NS(pid=child.pid)), disconnect=disconnect)
+            monkeypatch.setattr("inkbox_claude.runtime.fence_process", lambda owner: False)
+            with pytest.raises(RuntimeError, match="could not be stopped"):
+                await session.close()
+            assert session._execution_blocked and child.poll() is None
+            expected = (child.pid, psutil.Process(child.pid).create_time())
+            assert session._blocked_owner_keys == {expected}
+            monkeypatch.setattr("inkbox_claude.runtime.fence_process", fence_process)
+            await session.close()
+            assert not session._execution_blocked
+            assert child.poll() is not None
+            assert not session._blocked_owner_keys
+        finally:
+            if child.poll() is None:
+                child.kill();child.wait()
+    asyncio.run(run())
+
+
+def test_fencing_a_different_owner_does_not_release_old_quarantine(monkeypatch, tmp_path):
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    async def run():
+        session = make_session([])
+        session._execution_blocked = True
+        session._blocked_owner_keys = {(10, 1.0)}
+        session._host_owner = {"pid": 11, "created": 2.0, "children": []}
+        monkeypatch.setattr("inkbox_claude.runtime.fence_process", lambda owner: True)
+        with pytest.raises(RuntimeError, match="could not be stopped"):
+            await session.close()
+        assert session._execution_blocked and session._blocked_owner_keys == {(10, 1.0)}
+    asyncio.run(run())

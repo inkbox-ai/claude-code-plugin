@@ -1511,7 +1511,12 @@ class ContactSession:
         owners = [process_identity(client) for client in clients]
         if self._host_owner and self._host_owner not in owners:
             owners.append(self._host_owner)
-        disconnect_unproved = bool(getattr(self, "_execution_blocked", False))
+        blocked = bool(getattr(self, "_execution_blocked", False))
+        prior_blocked_owners = getattr(self, "_blocked_owner_keys", None) if blocked else set()
+        # A known old owner may be released after a later positive fence. An
+        # unknown owner has no such proof path and must remain quarantined.
+        unknown_owner = blocked and not prior_blocked_owners
+        failed_owners = set()
         fenced = set()
         from .runtime import fence_process
         for owner in owners:
@@ -1519,19 +1524,25 @@ class ContactSession:
                 if await asyncio.to_thread(fence_process, owner):
                     fenced.add((owner["pid"], owner["created"]))
                 else:
-                    disconnect_unproved = True
+                    failed_owners.add((owner["pid"], owner["created"]))
         for client, owner in zip(clients, owners):
             try:
                 await client.disconnect()
             except Exception:
-                if owner is None or (owner["pid"], owner["created"]) not in fenced:
-                    disconnect_unproved = True
+                if owner is None:
+                    unknown_owner = True
+                elif (owner["pid"], owner["created"]) not in fenced:
+                    failed_owners.add((owner["pid"], owner["created"]))
         self._client = None
         if self._side_effects:
             await asyncio.gather(*list(self._side_effects), return_exceptions=True)
-        if disconnect_unproved:
+        failed_owners.update((prior_blocked_owners or set()) - fenced)
+        if unknown_owner or failed_owners:
             self._execution_blocked = True
+            self._blocked_owner_keys = None if unknown_owner else failed_owners
             raise RuntimeError("The previous host execution could not be stopped")
+        self._execution_blocked = False
+        self._blocked_owner_keys = set()
         self._host_owner = None
 
 
