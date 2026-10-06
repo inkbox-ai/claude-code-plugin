@@ -29,6 +29,15 @@
 - Automatically resume durable Slack and native iMessage work after temporary
   pre-submission or read-only delivery checks recover, preserving saved answers
   and working status without replaying an uncertain model task or send.
+- Preserve exact positive shutdown fences across restart; keep cleanup running
+  for other conversations when a host outcome remains unconfirmed.
+- Recognize native Slack mentions in permission replies, retain bystander input
+  quietly while approval is pending, and preserve unrelated queued consultations.
+- Retain quiet iMessage failure notices durably without changing accepted sends
+  into rejected tool results; independent explicit sends never inherit reply routing.
+- Reset execution proof when a retry acquires a new host, retain exact positive
+  fence proof across transient journal failures, and keep uncertain saved-answer
+  sends out of pre-submission retry and terminal-failure paths.
 
 
 ## 0.2.13

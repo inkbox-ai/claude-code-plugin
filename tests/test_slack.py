@@ -67,6 +67,8 @@ class Sessions:
 
 @pytest.fixture
 def gw(tmp_path, monkeypatch):
+    from aiohttp import web
+    monkeypatch.setattr("inkbox_claude.gateway.web", web)
     monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
     result = InkboxGateway(BridgeConfig(slack_enabled=True))
     result._identity = NS(id=IDENTITY)
@@ -543,8 +545,8 @@ def test_stale_slack_connection_blocks_admission_and_reply(gw, change):
         owned[0].workspace_id = "T_OTHER"
     else:
         owned[0].status = "disconnected"
-    with pytest.raises(PermissionError, match="uniquely active"):
-        asyncio.run(gw._on_slack_received(event()))
+    response = asyncio.run(gw._on_slack_received(event()))
+    assert json.loads(response.text)["ignored"] == "slack-connection-unavailable"
     assert not gw.sessions.turns
     with pytest.raises(PermissionError, match="uniquely active"):
         asyncio.run(gw.send_to_contact("session", "must not send", "slack", inbound_message(event(), IDENTITY)[2]))
@@ -576,6 +578,24 @@ def test_native_stop_receipt_cannot_cancel_later_work_after_restart(gw, companio
         with sqlite3.connect(gw._channel_store("slack").path) as db:
             targets = json.loads(db.execute("SELECT targets FROM controls").fetchone()[0])
         assert targets == [{"chat_id": key, "source_event_ids": ["evt_1"]}]
+    asyncio.run(run())
+
+
+def test_native_stop_acknowledges_blocked_fence_without_claiming_success(gw):
+    from unittest.mock import AsyncMock
+
+    async def run():
+        key, _, meta = inbound_message(event(), IDENTITY)
+        session = make_session([])
+        session.chat_id = key
+        session._current_turn = _Turn("Owned work", mode="slack", reply_meta=meta)
+        session._connecting_client = NS(disconnect=AsyncMock(side_effect=RuntimeError("native disconnect unavailable")))
+        gw.sessions.sessions[key] = session
+        response = await gw._on_slack_received(stop_event())
+        assert response.status == 200 and json.loads(response.text)["paused"] is True
+        assert session._execution_blocked
+        again = await gw._on_slack_received(stop_event())
+        assert json.loads(again.text)["deduped"] is True
     asyncio.run(run())
 
 

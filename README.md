@@ -505,17 +505,23 @@ collect after 750 ms of quiet, capped at two seconds, and target their first sou
 Further messages queue behind active work instead of interrupting it. Media,
 reactions, different senders, and different native reply contexts do not combine.
 Bursts are limited to eight sources and 4000 combined text characters; overflow stays
-queued with its own source anchor. Inbound native send/read tools cannot switch the
-source conversation, upload before route validation, or expand Companion history.
+queued with its own source anchor. Source-bound send/read tools cannot change the
+native reply target, upload before route validation, or expand Companion history.
 Stop affects owned iMessage work, not an unrelated voice consult for the contact.
 
 Native IDs remain opaque and nullable. The bridge performs identity-scoped source
 and thread preflight reads before targeted sending. Only the API may fall back to
 a plain same-conversation message. A failed targeted send never causes a second,
-unthreaded send. An active inbound native turn cannot change its destination or
-use `to`; triggerless proactive sends retain ordinary SDK behavior.
+unthreaded send. A deliberately requested send to a different conversation or `to`
+uses ordinary SDK routing, without inheriting the inbound native source or
+suppressing its answer. It still requires the originating turn to remain active.
+Triggerless proactive sends retain ordinary SDK behavior.
 The model cannot override the bridge's target/fallback policy. Companion uses its
 existing ordered durable receipt owner rather than ordinary burst collection.
+With native replies enabled, asynchronous delivery failures are retained as bounded,
+quiet context, including callbacks that precede the accepted-send response. They do
+not start model work or authorize a resend. Accepted sends remain accepted if local
+delivery tracking is temporarily unavailable.
 
 ### Vault and 2FA
 
@@ -550,7 +556,9 @@ and hosted-SMS reservations remain intact across upgrade. Temporary transport
 failures positively identified before host submission or during read-only reply
 preflight retry automatically with capped backoff, keeping the original route and
 working indication. A saved answer retries delivery preparation only, not the
-model task; Stop cancels its owned retry. Only positively matched
+model task; Stop cancels its owned retry. A nonretryable check before the send
+checkpoint retains the answer for explicit recovery without sending or retrying it.
+Only positively matched
 terminal saved answers may be reused after a host interruption. Otherwise an
 uncertain request is retained without automatic re-execution; later fresh work
 can proceed only after the old native host and side effects are fenced. An
@@ -560,6 +568,13 @@ restarts until ownership fencing is positively confirmed. A missing or reused na
 parent PID is not proof of cleanup: its older child snapshot may omit later orphaned
 tools, so that scope stays quarantined. A live owned process is fenced before SDK
 disconnect removes its observable identity.
+Successful shutdown fences are persisted for the exact stopped owner, allowing fresh
+work after restart without replaying its interrupted request. A failed proof write
+retains the exact fence for a later persistence retry without releasing unrelated
+unconfirmed owners. Failed reset or resume controls leave the conversation paused
+and preserve the existing session and context. Revoked or terminally
+failed Companion records remain deduplication tombstones and do not by themselves
+make the bridge unready.
 
 State lives under `INKBOX_CLAUDE_HOME` (default `~/.inkbox-claude`). Stop the bridge
 before backing up or moving it. Do not delete journals or session IDs to recover a

@@ -532,17 +532,18 @@ def build_inkbox_mcp_server(
         text = str(args.get("text") or "")
         conversation_id = str(args.get("conversation_id") or "").strip()
         to_list = _normalize_imessage_recipients(args.get("to"))
-        native = bool(cfg.imessage_threaded_replies and turn and turn.mode == "imessage" and route)
+        owned = bool((cfg.imessage_threaded_replies or route.get("imessage_threaded_replies")) and turn and turn.mode == "imessage" and route)
+        native = bool(owned and to_list is None and conversation_id == route.get("conversation_id"))
         def assert_native_owner():
-            if not native:
+            if not owned:
                 return
+            if not cfg.imessage_threaded_replies:
+                raise ValueError("Native iMessage replies are disabled")
             if session._current_turn is not turn or not session._turn_active or session._interrupting:
                 raise ValueError("The originating turn has ended")
-            if route.get("companion"):
+            if native and route.get("companion"):
                 raise ValueError("Use the bound Companion reply tool for this turn")
-            if to_list is not None or conversation_id != route.get("conversation_id"):
-                raise ValueError("Native replies must stay in the originating conversation")
-            if not route.get("imessage_reply_target"):
+            if native and not route.get("imessage_reply_target"):
                 raise ValueError("The originating native reply source is unavailable")
         try:
             assert_native_owner()
@@ -593,10 +594,16 @@ def build_inkbox_mcp_server(
                     json.dumps([route.get("imessage_event_id"), conversation_id, kwargs], sort_keys=True).encode()
                 ).hexdigest()
             msg = identity.send_imessage(**kwargs)
+            warning = None
             if native:
-                IMessageState(cfg).record_outbound(msg, route, session.chat_id)
                 session._imessage_tool_outputs.append((turn, text, route.get("imessage_reply_target")))
+                try:
+                    IMessageState(cfg).record_outbound(msg, route, session.chat_id)
+                except Exception:
+                    warning = "Message accepted; local delivery tracking is unavailable. Do not resend."
             result = {"sent": True, "id": str(getattr(msg, "id", ""))}
+            if warning:
+                result["warning"] = warning
             if cfg.imessage_threaded_replies:
                 result.update({key: _json_safe(getattr(msg, key, None)) for key in
                     ("status", "reply_to_message_id", "thread_id", "thread_root_message_id")})
@@ -604,6 +611,12 @@ def build_inkbox_mcp_server(
 
         try:
             result = await _to_thread_drained(_run)
+            if native:
+                from .imessage import IMessageState, retain_failure_notices
+                try:
+                    retain_failure_notices(IMessageState(cfg), session)
+                except Exception:
+                    result["warning"] = "Message accepted; a delivery notice remains pending locally. Do not resend."
             if not cfg.imessage_threaded_replies:
                 _mark_tool_delivery("imessage", conversation_id)
             return _result(result)

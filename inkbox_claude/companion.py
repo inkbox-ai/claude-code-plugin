@@ -374,7 +374,11 @@ class CompanionReceiver:
         scope, message, sender = decode(envelope)
         if len(json.dumps(message).encode()) > self.gateway.cfg.companion_max_bytes:
             raise ValueError("Companion input exceeds the configured byte limit")
-        if scope["phase"] == "ordinary" and not self.gateway._sender_allowed(sender):
+        candidates = [sender]
+        if scope["channel"] == "slack":
+            route = message["slack_route"]
+            candidates.extend([route["actor_id"], f"{route['workspace_id']}:{route['actor_id']}"])
+        if scope["phase"] == "ordinary" and not self.gateway._sender_allowed(*candidates):
             raise PermissionError("Companion sender is not locally allowed")
         if scope["phase"] != "ordinary" and not callable(
             getattr(
@@ -511,7 +515,7 @@ class CompanionReceiver:
             self.save(key)
             logger.warning("Companion delivery failed for scope %s; inspect its checkpoint", key)
 
-    async def recover_uncertain(self, key: str, *, fenced=False) -> None:
+    async def recover_uncertain(self, key: str) -> None:
         from .runtime import fence_process, saved_answer
         from .sessions import _transcript_dir
         record = self.records[key]
@@ -520,7 +524,7 @@ class CompanionReceiver:
         for event in record["events"].values():
             if event["state"] not in {"submitting", "submitted", "sending"}:
                 continue
-            if not fenced and not await asyncio.to_thread(fence_process, event.get("host_owner")):
+            if not event.get("host_fenced") and not event.get("host_terminal") and not await asyncio.to_thread(fence_process, event.get("host_owner")):
                 return
             reply = None if event["state"] == "sending" else await asyncio.to_thread(saved_answer,
                 _transcript_dir(self.gateway.cfg.project_dir), record.get("host_session_id", ""), event["submission_id"])
@@ -749,12 +753,14 @@ class CompanionReceiver:
                 raise PermissionError("Companion submission is no longer active")
             event["state"] = state
             if state == "submitting":
+                event.pop("host_fenced", None)
+                event.pop("host_terminal", None)
                 event["host_owner"] = session._host_owner
                 event["submitted_meta"] = deepcopy(meta)
             if session.resume_session_id:
                 record["host_session_id"] = session.resume_session_id
             if state == "generated":
-                event.update(reply=result["reply"], reply_meta=deepcopy(meta), cancelled=bool(result.get("cancelled")))
+                event.update(reply=result["reply"], reply_meta=deepcopy(meta), cancelled=bool(result.get("cancelled")), host_terminal=True)
                 record["context"] = []
                 record.pop("retry_count", None)
             self.save(key)
@@ -870,10 +876,15 @@ class CompanionReceiver:
                     session = self.gateway.sessions.get(record["session_key"])
                     self.active_replies[record["session_key"]] = deepcopy(meta)
                     try:
-                        await session.handle_inbound(control, MODES[scope["channel"]], meta)
+                        control_result = await session.handle_inbound(control, MODES[scope["channel"]], meta)
                     finally:
                         self.active_replies.pop(record["session_key"], None)
                     if _control_command(control) == "reset":
+                        if control_result is False:
+                            event["state"] = "completed"
+                            record.update(state="paused", error="control_cleanup_unconfirmed")
+                            self.save(key)
+                            return False
                         record["context"] = []
                         record.pop("host_session_id", None)
                     event["state"] = "completed"
@@ -896,9 +907,14 @@ class CompanionReceiver:
                 self.save(key)
                 session = self.gateway.sessions.sessions.get(record["session_key"])
                 if session is not None:
-                    await session.close()
-                    await self.recover_uncertain(key, fenced=True)
-                    return False
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass  # Keep the uncertain journal and continue indicator cleanup.
+                    else:
+                        await self.recover_uncertain(key)
+                        if record["state"] != "paused":
+                            return False
             elif isinstance(exc, ValueError) or getattr(exc, "status_code", None) == 413:
                 record.update(state="failed", error=str(exc) if isinstance(exc, ValueError) else "activation_unavailable")
             elif any(event["state"] == "generated" for event in record["events"].values()) and not retryable_read(exc):
@@ -944,11 +960,11 @@ class CompanionReceiver:
             return
         if session.pending is not pending or pending.future.done():
             return
-        text = self.control_text(text)
+        text = self.control_text(text, event)
         from .escalation import parse_permission_reply
         from .sessions import _control_command
         if _control_command(text) or (pending.kind == "permission" and parse_permission_reply(text) is None):
-            await session._abort_in_flight()
+            await session._abort_in_flight(only_turns=[pending.owner or session._current_turn])
             return
         event["state"] = "completed"
         self.save(key)
@@ -963,10 +979,10 @@ class CompanionReceiver:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        for record in self.records.values():
-            session = self.gateway.sessions.sessions.get(record["session_key"])
-            if session is not None:
-                await session.stop_companion()
+        sessions = {self.gateway.sessions.sessions.get(record["session_key"]) for record in self.records.values()}
+        results = await asyncio.gather(*(session.stop_companion() for session in sessions if session is not None), return_exceptions=True)
+        if any(isinstance(result, BaseException) for result in results):
+            logger.warning("Some Companion conversations retain an unconfirmed host outcome")
         self.active_replies.clear()
         self._closed = True
         fcntl.flock(self._owner_fd, fcntl.LOCK_UN)

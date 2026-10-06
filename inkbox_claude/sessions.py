@@ -387,10 +387,12 @@ class ContactSession:
         system_prompt_extra: str = "",
         activity_fn=None,
         receipt_fn=None,
+        fence_fn=None,
     ):
         self.chat_id = chat_id
         self.activity_fn = activity_fn
         self.receipt_fn = receipt_fn
+        self.fence_fn = fence_fn
         self._escalation_lock = asyncio.Lock()
         self._imessage_tool_outputs = []
         self._deferred_turn = None
@@ -436,12 +438,13 @@ class ContactSession:
         self._client_generation = 0
         self._connecting_client = None
         self._host_owner = None
+        self._pending_fenced_owners: set[tuple] = set()
         self._close_lock = asyncio.Lock()
         self._control_route: ContextVar[Any] = ContextVar("control_reply_route", default=None)
         owner = [cfg.base_url, identity_info.get("id") or cfg.identity, chat_id]
         context_id = hashlib.sha256(json.dumps(owner).encode()).hexdigest()
         self._context_path = _state_path().parent / "group-context" / f"{context_id}.json"
-        self._context: list[dict[str, str]] = (
+        self._context: list[dict[str, Any]] = (
             json.loads(self._context_path.read_text()) if self._context_path.exists() else []
         )
 
@@ -450,7 +453,7 @@ class ContactSession:
     # Inbound routing
     # ------------------------------------------------------------------
 
-    async def handle_inbound(self, text: str, mode: str, meta: Dict[str, Any]) -> None:
+    async def handle_inbound(self, text: str, mode: str, meta: Dict[str, Any]) -> Optional[bool]:
         """Route one inbound message: answer a pending escalation, or queue a turn.
 
         Args:
@@ -459,12 +462,15 @@ class ContactSession:
             meta (dict): Reply-routing metadata (conversation ids, subject, ...).
 
         Returns:
-            None
+            Whether a reset completed, for reset controls; otherwise None.
         """
         meta = deepcopy(meta or {})
         if mode == "imessage" and self.cfg.imessage_threaded_replies:
             meta["imessage_threaded_replies"] = True
         raw_text = str(meta.get("raw_text", text))
+        bot = meta.get("slack_bot_user_id") if mode == "slack" else None
+        if bot and raw_text.lstrip().startswith(f"<@{bot}>"):
+            raw_text = raw_text.lstrip()[len(bot) + 3:].strip()
         command = None if meta.get("reaction") else _control_command(raw_text)
         is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
@@ -476,8 +482,12 @@ class ContactSession:
             from .companion import same_author
             pending_reply = (not meta.get("reaction") and
                              (not (is_group or meta.get("companion")) or (bool(expected) and same_author(mode, sender, expected))))
+        if mode == "slack" and is_group and self.pending is not None and not self.pending.future.done() and not pending_reply:
+            self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or meta.get("message_id") or ""))
+            await self.receipt(mode, meta, "done")
+            return
         if pending_reply and self.pending.kind == "permission" and not command and parse_permission_reply(raw_text) is None:
-            await self._abort_in_flight()
+            await self._abort_in_flight(only_turns=[self.pending.owner or self._current_turn])
             pending_reply = False
         addressed = meta.get("slack_mentioned") if mode == "slack" else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
         quiet = (is_group and self.cfg.group_reply_mode == "mention" and not command
@@ -501,10 +511,9 @@ class ContactSession:
                 handlers = {"reset": self._reset_session, "stop": self._stop_turn,
                             "resume": self._begin_resume, "status": self._report_status,
                             "usage": self._report_usage, "health": self._report_health}
-                await handlers[command]()
+                return await handlers[command]()
             finally:
                 self._control_route.reset(token)
-            return
         if pending_reply:
             await self.receipt(mode, meta, "done")
             self.pending.future.set_result(raw_text)
@@ -521,7 +530,7 @@ class ContactSession:
         # delivery-failure recovery) runs to completion and this message just
         # queues behind it.
         running_normal = self._current_turn is not None and self._current_turn.future is None
-        if self._turn_active and self._client is not None and running_normal and not (mode == "imessage" and self.cfg.imessage_threaded_replies):
+        if self._turn_active and self._client is not None and running_normal and not self._interrupting and not (mode == "imessage" and self.cfg.imessage_threaded_replies):
             logger.info("[session %s] new message interrupts the running turn", self.chat_id)
             self._interrupting = True
             try:
@@ -554,6 +563,17 @@ class ContactSession:
         if any(item["id"] == source_id for item in self._context):
             return
         self._context.append({"id": source_id, "text": text})
+        self._save_context()
+
+    def buffer_delivery_notice(self, text: str, source_id: str) -> None:
+        """Bound quiet delivery outcomes independently of ordinary conversation input."""
+        if any(item["id"] == source_id for item in self._context):
+            self._save_context()
+            return
+        notices = [item for item in self._context if item.get("delivery_notice")]
+        expired = {item["id"] for item in notices[:-31]} if len(notices) >= 32 else set()
+        self._context = [item for item in self._context if item["id"] not in expired]
+        self._context.append({"id": source_id, "text": text[:1024], "delivery_notice": True})
         self._save_context()
 
     def _reply_route(self) -> tuple[str, Dict[str, Any]]:
@@ -634,23 +654,26 @@ class ContactSession:
                 from .imessage import SafeReplyPreflightError
                 ordinary_channel = (turn.checkpoint is None and turn.future is None
                     and (turn.mode == "slack" or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)))
-                safe_start = (ordinary_channel and not turn.submitted and not turn.execution_observed
+                safe_start = (ordinary_channel and turn.saved_reply is None and not turn.submitted and not turn.execution_observed
                               and retryable_read(exc))
                 safe_reply = (ordinary_channel and turn.saved_reply is not None
                               and isinstance(exc, SafeReplyPreflightError))
-                if safe_start or safe_reply:
-                    await self._wait_channel_retry(turn, close_host=safe_start)
-                    continue
-                if not turn.submitted and turn.checkpoint is None and turn.attempts < 3 and not isinstance(exc, (PermissionError, ValueError)):
-                    await self._wait_channel_retry(turn, close_host=True)
-                    continue
-                await self.receipt(turn.mode, turn.reply_meta or {}, "uncertain")
+                retry_start = (turn.saved_reply is None and not turn.submitted and turn.checkpoint is None
+                               and turn.attempts < 3 and not isinstance(exc, (PermissionError, ValueError)))
+                if safe_start or safe_reply or retry_start:
+                    try:
+                        await self._wait_channel_retry(turn, close_host=not safe_reply)
+                    except Exception as retry_error:
+                        exc = retry_error
+                    else:
+                        continue
+                outcome = "uncertain" if turn.submitted or turn.execution_observed or turn.saved_reply is not None else "failed"
+                await self.receipt(turn.mode, turn.reply_meta or {}, outcome)
                 if turn.checkpoint is None:
                     await self.notify_activity(turn.mode, turn.reply_meta or {}, "failed")
                 if turn.completion is not None:
                     try:
                         await self.close()
-                        await self.receipt(turn.mode, {**(turn.reply_meta or {}), "host_fenced": True}, "uncertain")
                     except Exception as fence_error:
                         exc = fence_error
                     finally:
@@ -665,14 +688,18 @@ class ContactSession:
                     logger.info("[session %s] turn interrupted by a new message", self.chat_id)
                     continue
                 logger.exception("[session %s] turn failed", self.chat_id)
-                await self.close()
-                await self.receipt(turn.mode, {**(turn.reply_meta or {}), "host_fenced": True}, "uncertain")
+                try:
+                    await self.close()
+                except Exception as fence_error:
+                    exc = fence_error
                 if ordinary_channel and turn.saved_reply is not None:
                     continue  # Preserve the answer; do not start an untracked second send.
                 try:
                     await self.send_fn(self.chat_id, _turn_error_notice(exc), turn.mode or self.mode, deepcopy(turn.reply_meta or self.reply_meta))
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
+                if getattr(self, "_execution_blocked", False):
+                    return
 
     async def _wait_channel_retry(self, turn: _Turn, *, close_host: bool) -> None:
         """Keep one cancellable queue owner while retrying proven pre-effect work."""
@@ -721,24 +748,29 @@ class ContactSession:
     # Control commands (/clear, /new, /stop)
     # ------------------------------------------------------------------
 
-    async def _reset_session(self) -> None:
+    async def _reset_session(self) -> bool:
         """Start a fresh conversation: drop the resumed Claude session id and
         tear down the client so the next turn opens a brand-new session.
 
         Returns:
-            None
+            True only after the old host and context were cleared.
         """
-        await self._abort_in_flight()
+        try:
+            await self._abort_in_flight()
+            await self.close()
+        except Exception:
+            await self._reply("Could not start a fresh conversation. This conversation remains paused.")
+            return False
         # Forget the resumed conversation everywhere — in memory, the live
         # client, the persisted map, and any session-scoped tool grants.
         self.resume_session_id = None
-        await self.close()
         if self.on_clear is not None:
             self.on_clear(self.chat_id)
         self.always_allowed.clear()
         self._context.clear()
         self._save_context()
         await self._reply("Started a fresh conversation — previous context cleared.")
+        return True
 
     async def _stop_turn(self) -> None:
         """Interrupt the running turn (if any) and drop anything queued,
@@ -753,7 +785,13 @@ class ContactSession:
             or self._retrying_turn is not None or self._delivery_turn is not None
         )
         reply_mode, _ = self._reply_route()
-        await self._abort_in_flight(only_mode="imessage" if reply_mode == "imessage" and self.cfg.imessage_threaded_replies else None)
+        try:
+            await self._abort_in_flight(only_mode="imessage" if reply_mode == "imessage" and self.cfg.imessage_threaded_replies else None)
+        except Exception:
+            if not getattr(self, "_execution_blocked", False) and not self._pending_fenced_owners:
+                raise
+            await self._reply("Stop could not be confirmed. This conversation remains paused.")
+            return
         await self._reply("Stopped." if had_work else "Nothing to stop — I'm idle.")
 
     def slack_stop_targets(self, meta):
@@ -791,24 +829,9 @@ class ContactSession:
             (dropped if selected(turn) else retained).append(turn)
         for turn in retained:
             self._queue.put_nowait(turn)
-        # Everything selected is removed before the first suspension. A fresh
-        # request arriving during a slow native interrupt cannot join this Stop.
-        if owns_active and pending is not None and self.pending is pending and not pending.future.done():
-            pending.future.set_result(None)
-            self.pending = None
-        if self._connecting_client is not None and owns_active and self._current_turn is active:
-            self._interrupting = True
-            await self.close()
-        if owns_active and self._current_turn is active and self._turn_active and self._client is not None:
-            self._interrupting = True
-            try:
-                await self._client.interrupt()
-            except Exception:
-                logger.debug("Native interrupt failed; fencing the owned host")
-                await self.close()
         for turn in dropped:
-            await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
-            await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled")
+            turn.cancelled = True
+            turn.retry_wake.set()
             if turn.completion is not None and not turn.completion.done():
                 turn.completion.cancel()
             if turn.future is not None and not turn.future.done():
@@ -816,6 +839,39 @@ class ContactSession:
                     turn.future.set_result(CapturedTurnResult(text="", tool_deliveries=(), aborted=True))
                 else:
                     turn.future.set_result("")
+        # Everything selected is removed before the first suspension. A fresh
+        # request arriving during a slow native interrupt cannot join this Stop.
+        if owns_active and pending is not None and self.pending is pending and not pending.future.done():
+            pending.future.set_result(None)
+            self.pending = None
+        fence_error = None
+        if self._connecting_client is not None and owns_active and self._current_turn is active:
+            self._interrupting = True
+            try:
+                await self.close()
+            except Exception as exc:
+                fence_error = exc
+        if owns_active and self._current_turn is active and self._turn_active and self._client is not None:
+            self._interrupting = True
+            try:
+                await self._client.interrupt()
+            except Exception:
+                logger.debug("Native interrupt failed; fencing the owned host")
+                try:
+                    await self.close()
+                except Exception as exc:
+                    fence_error = exc
+        for turn in dropped:
+            try:
+                await self.receipt(turn.mode, turn.reply_meta or {}, "cancelled")
+            except Exception as exc:
+                fence_error = fence_error or exc
+            try:
+                await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled")
+            except Exception as exc:
+                fence_error = fence_error or exc
+        if fence_error is not None:
+            raise fence_error
 
     async def _begin_resume(self) -> None:
         """List recent sessions and let the human pick one to reopen.
@@ -850,7 +906,11 @@ class ContactSession:
             chosen = sessions[index]
             # Swap in the chosen session and tear down the client so the next
             # turn continues it; persist it so it survives bridge restarts.
-            await self.close()
+            try:
+                await self.close()
+            except Exception:
+                await self._reply("Could not resume that conversation. This conversation remains paused.")
+                return
             self.resume_session_id = chosen["id"]
             if self.on_session_id is not None:
                 self.on_session_id(self.chat_id, chosen["id"])
@@ -1381,6 +1441,10 @@ class ContactSession:
             return
 
     async def _ensure_client(self) -> ClaudeSDKClient:
+        if self._pending_fenced_owners:
+            # Retry the durable proof before handing fresh work to another host.
+            async with self._close_lock:
+                self._persist_host_fences()
         if getattr(self, "_execution_blocked", False):
             raise PermissionError("Previous native host ownership could not be fenced; inspect the retained receipt before resuming")
         if self._client is not None:
@@ -1406,6 +1470,7 @@ class ContactSession:
             identity_handle=self.identity_info.get("handle", ""),
             email_address=self.identity_info.get("email", ""),
             phone_number=self.identity_info.get("phone", ""),
+            channels="email, SMS, iMessage, Slack, and voice calls" if self.cfg.slack_enabled else "email, SMS, iMessage, and voice calls",
         )
         if self.system_prompt_extra:
             prompt_append = f"{prompt_append}\n\n{self.system_prompt_extra}"
@@ -1535,7 +1600,8 @@ class ContactSession:
         loop = asyncio.get_running_loop()
         reply_mode, route = self._reply_route()
         if route.get("companion") and self.cfg.group_reply_mode == "mention":
-            prompt_text += "\nInclude @agent in your reply" + (" or put my address in To." if reply_mode == "email" else ".")
+            prompt_text += ("\nMention the bot in your reply." if reply_mode == "slack" else
+                            "\nInclude @agent in your reply" + (" or put my address in To." if reply_mode == "email" else "."))
         pending = PendingInteraction(
             owner=self._current_turn, generation=self._client_generation,
             route=deepcopy(route),
@@ -1607,12 +1673,13 @@ class ContactSession:
         # unknown owner has no such proof path and must remain quarantined.
         unknown_owner = blocked and not prior_blocked_owners
         failed_owners = set()
-        fenced = set()
+        fenced = set(self._pending_fenced_owners)
         from .runtime import fence_process
         for owner in owners:
             if owner is not None and (owner["pid"], owner["created"]) not in fenced:
                 if await asyncio.to_thread(fence_process, owner):
                     fenced.add((owner["pid"], owner["created"]))
+                    self._pending_fenced_owners.add((owner["pid"], owner["created"]))
                 else:
                     failed_owners.add((owner["pid"], owner["created"]))
         for client, owner in zip(clients, owners):
@@ -1624,16 +1691,32 @@ class ContactSession:
                 elif (owner["pid"], owner["created"]) not in fenced:
                     failed_owners.add((owner["pid"], owner["created"]))
         self._client = None
+        failed_owners.update((prior_blocked_owners or set()) - fenced)
+        # Retain every unresolved owner before persistence can raise: the
+        # clients above have already been detached and cannot rediscover it.
+        self._execution_blocked = bool(unknown_owner or failed_owners)
+        self._blocked_owner_keys = None if unknown_owner else failed_owners
+        self._pending_fenced_owners.update(fenced)
         if self._side_effects:
             await asyncio.gather(*list(self._side_effects), return_exceptions=True)
-        failed_owners.update((prior_blocked_owners or set()) - fenced)
+        self._persist_host_fences()
         if unknown_owner or failed_owners:
-            self._execution_blocked = True
-            self._blocked_owner_keys = None if unknown_owner else failed_owners
             raise RuntimeError("The previous host execution could not be stopped")
         self._execution_blocked = False
         self._blocked_owner_keys = set()
         self._host_owner = None
+
+    def _persist_host_fences(self) -> None:
+        """Persist exact proof without closing a new host or changing its generation."""
+        fenced = set(self._pending_fenced_owners)
+        if fenced and self.fence_fn is not None:
+            self.fence_fn(self.chat_id, fenced)
+        self._pending_fenced_owners.difference_update(fenced)
+        owner = self._host_owner
+        if (owner and (owner["pid"], owner["created"]) in fenced
+                and self._client is None and self._connecting_client is None
+                and not getattr(self, "_execution_blocked", False)):
+            self._host_owner = None
 
 
 class SessionManager:
@@ -1651,10 +1734,12 @@ class SessionManager:
         on_send_rejected: Optional[SendRejectedFn] = None,
         activity_fn=None,
         receipt_fn=None,
+        fence_fn=None,
     ):
         self.cfg = cfg
         self.activity_fn = activity_fn
         self.receipt_fn = receipt_fn
+        self.fence_fn = fence_fn
         self.send_fn = send_fn
         self.typing_fn = typing_fn
         self.health_fn = health_fn
@@ -1710,6 +1795,7 @@ class SessionManager:
                 chat_id=chat_id,
                 activity_fn=self.activity_fn,
                 receipt_fn=self.receipt_fn,
+                fence_fn=self.fence_fn,
                 cfg=self.cfg,
                 send_fn=self.send_fn,
                 mcp_server=self.mcp_server,
@@ -1727,5 +1813,6 @@ class SessionManager:
         return session
 
     async def close_all(self) -> None:
-        for session in self.sessions.values():
-            await session.stop_companion()
+        results = await asyncio.gather(*(session.stop_companion() for session in self.sessions.values()), return_exceptions=True)
+        if any(isinstance(result, BaseException) for result in results):
+            logger.warning("Some conversations remain paused because shutdown could not confirm their host stopped")

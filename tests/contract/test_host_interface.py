@@ -95,6 +95,35 @@ def test_inkbox_mcp_server_builds_against_installed_sdk():
     assert expected <= set(tool_names)
 
 
+def test_native_client_exposes_exact_process_identity_without_model_execution(tmp_path):
+    import asyncio
+    import psutil
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+    from inkbox_claude.runtime import process_identity
+
+    cli = shutil.which("claude")
+    if cli is None:
+        pytest.skip("Claude CLI is unavailable")
+
+    async def run():
+        client = ClaudeSDKClient(options=ClaudeAgentOptions(
+            cli_path=cli, cwd=str(tmp_path), setting_sources=[], mcp_servers={},
+            env={"CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
+                 "ANTHROPIC_API_KEY": "synthetic-contract-key", "ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1"},
+        ))
+        try:
+            await asyncio.wait_for(client.connect(), 20)
+            owner = process_identity(client)
+            assert owner is not None
+            process = psutil.Process(owner["pid"])
+            assert process.create_time() == owner["created"]
+            assert process.is_running()
+        finally:
+            await client.disconnect()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("field,value", [("notes", "Updated note"), ("given_name", "Ada")])
 def test_contact_update_accepts_partial_fields_through_real_mcp_schema(field, value):
     import asyncio

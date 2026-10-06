@@ -100,6 +100,10 @@ class IMessageState:
                 CREATE TABLE IF NOT EXISTS outbound (
                     message_id TEXT PRIMARY KEY, route TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS delivery_notices (
+                    message_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,
+                    meta TEXT NOT NULL, buffered INTEGER NOT NULL DEFAULT 0
+                );
             """)
 
     def acquire_owner(self):
@@ -123,6 +127,16 @@ class IMessageState:
             return [self._receipt(row) for row in db.execute(
                 "SELECT * FROM receipts WHERE state IN ('running','sending','uncertain') ORDER BY rowid")
                 if not json.loads(row["meta"]).get("host_fenced")]
+
+    def record_host_fence(self, chat_id: str, owners: set[tuple]) -> None:
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("SELECT * FROM receipts WHERE chat_id=? AND state IN ('running','sending','uncertain')", (chat_id,)).fetchall():
+                meta = json.loads(row["meta"])
+                owner = meta.get("host_owner") or {}
+                if (owner.get("pid"), owner.get("created")) in owners:
+                    meta["host_fenced"] = True
+                    db.execute("UPDATE receipts SET state='uncertain',meta=? WHERE event_id=?", (_json(meta), row["event_id"]))
 
     def consume_control(self, event_id: str, targets: list[dict]) -> bool:
         """Persist a Stop tombstone and its exact targets before interrupting anything."""
@@ -206,7 +220,7 @@ class IMessageState:
                 # A completed answer remains safely retryable until the send
                 # checkpoint; a failed read-only preflight cannot have sent it.
                 next_state = "reply_pending" if state == "uncertain" and row["state"] == "reply_pending" else state
-                if state == "cancelled" and row["state"] == "sending":
+                if state in {"cancelled", "failed"} and row["state"] == "sending":
                     next_state = "uncertain"
                 db.execute(
                     "UPDATE receipts SET meta=?,state=?,reply=?,batch_anchor=? WHERE event_id=?",
@@ -239,13 +253,21 @@ class IMessageState:
                 # response. Fill its missing route without undoing that failure.
                 route["status"] = json.loads(row["route"])["status"]
                 db.execute("UPDATE outbound SET route=? WHERE message_id=?", (_json(route), route["message_id"]))
+                if route["status"] == "failed":
+                    self._stage_failure_notice(db, route["message_id"], route)
 
     def lookup_outbound(self, message_id: str) -> dict[str, Any] | None:
         with self._db() as db:
             row = db.execute("SELECT route FROM outbound WHERE message_id=?", (str(message_id),)).fetchone()
         return json.loads(row["route"]) if row else None
 
-    def mark_delivery_failed(self, message_id: str) -> None:
+    @staticmethod
+    def _stage_failure_notice(db, message_id, route):
+        if route and route.get("chat_id"):
+            db.execute("INSERT OR IGNORE INTO delivery_notices(message_id,chat_id,meta) VALUES(?,?,?)",
+                       (message_id, route["chat_id"], _json({"conversation_id": (route.get("meta") or {}).get("conversation_id")})))
+
+    def mark_delivery_failed(self, message_id: str, fallback_route=None) -> None:
         """Record late failure without changing the completed model work or its route."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -257,6 +279,17 @@ class IMessageState:
                 route = {"chat_id": None, "meta": {}, "message_id": str(message_id),
                          "status": "failed", "unknown_route": True}
                 db.execute("INSERT INTO outbound(message_id,route) VALUES(?,?)", (str(message_id), _json(route)))
+            self._stage_failure_notice(db, str(message_id), route if route.get("chat_id") else fallback_route)
+
+    def pending_failure_notices(self, chat_id=None) -> list[dict]:
+        with self._db() as db:
+            rows = db.execute("SELECT * FROM delivery_notices WHERE buffered=0" + (" AND chat_id=?" if chat_id else ""),
+                              (chat_id,) if chat_id else ()).fetchall()
+        return [{**dict(row), "meta": json.loads(row["meta"])} for row in rows]
+
+    def mark_failure_notice_buffered(self, message_id: str) -> None:
+        with self._db() as db:
+            db.execute("UPDATE delivery_notices SET buffered=1 WHERE message_id=?", (message_id,))
 
     def summary(self) -> dict[str, int]:
         counts = dict.fromkeys(sorted(_STATES), 0)
@@ -269,6 +302,18 @@ class IMessageState:
             ).fetchone()[0]
         return counts
 
+
+
+def retain_failure_notices(store, session) -> None:
+    """Flush quiet outcomes before acknowledging them, with durable deduplication."""
+    for notice in store.pending_failure_notices(session.chat_id):
+        message_id = notice["message_id"]
+        text = ("Delivery status only, not a new request: iMessage " + message_id[:256]
+                + " failed in conversation " + str(notice["meta"].get("conversation_id") or "")[:256]
+                + ". Do not automatically resend or switch to an unthreaded reply.")
+        source = "delivery-failed:" + hashlib.sha256(message_id.encode()).hexdigest()
+        session.buffer_delivery_notice(text, source)
+        store.mark_failure_notice_buffered(message_id)
 
 
 def validate_reply_target(identity, meta):

@@ -92,6 +92,25 @@ def test_safe_start_survives_more_than_three_failures_without_new_input(sdk, mon
     asyncio.run(run())
 
 
+def test_accepted_reply_stays_done_when_quiet_notice_flush_fails(sdk, monkeypatch):
+    from tests.test_imessage_sdk import OUTBOUND_ID
+
+    async def run():
+        gw, session, host, store, meta, activity = harness(sdk)
+        store.mark_delivery_failed(OUTBOUND_ID, {"chat_id": session.chat_id, "meta": meta})
+        monkeypatch.setattr(session, "buffer_delivery_notice", lambda *_args: (_ for _ in ()).throw(OSError("disk unavailable")))
+        await session.handle_inbound("Original request", "imessage", meta)
+        await asyncio.wait_for(session._worker, 2)
+        assert len(host.queries) == 1 and len(writes(sdk)) == 1
+        assert store.summary()["done"] == 1 and store.summary()["uncertain"] == 0
+        assert len(store.pending_failure_notices()) == 1
+        assert store.lookup_outbound(OUTBOUND_ID)["status"] == "failed"
+        assert [state for _, state in activity] == ["accepted", "completed"]
+        await session.stop_companion()
+        store.close()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("restarted", [False, True])
 def test_saved_answer_retries_only_preflight_through_actual_sdk(sdk, monkeypatch, restarted):
     async def run():
@@ -129,6 +148,47 @@ def test_saved_answer_retries_only_preflight_through_actual_sdk(sdk, monkeypatch
         assert [state for _, state in activity] == ["accepted", "completed"]
         await session.stop_companion()
         store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["imessage", "slack"])
+def test_recovered_answer_survives_nonretryable_read_before_send(sdk, monkeypatch, mode):
+    async def run():
+        gw, session, host, store, meta, activity = harness(sdk, mode=mode)
+        store.mark(meta, "reply_pending", reply="Saved answer")
+        if mode == "slack":
+            original = gw._inkbox.slack.list_connections.side_effect
+            connections = gw._inkbox.slack.list_connections.return_value
+            gw._inkbox.slack.list_connections.return_value = []
+        else:
+            original = gw._identity.get_imessage
+            monkeypatch.setattr(gw._identity, "get_imessage", lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("source unavailable")))
+        await session.recover_reply("Saved answer", mode, meta)
+        await asyncio.wait_for(session._worker, 2)
+        assert store.summary()["reply_pending"] == 1 and store.summary()["failed"] == 0
+        assert host.queries == [] and not writes(sdk)
+        assert session._retrying_turn is None and session._queue.empty()
+        assert [state for _, state in activity] == ["accepted", "failed"]
+        if mode == "slack":
+            gw._inkbox.slack.send_message.assert_not_called()
+            gw._inkbox.slack.list_connections.side_effect = original
+            gw._inkbox.slack.list_connections.return_value = connections
+        else:
+            monkeypatch.setattr(gw._identity, "get_imessage", original)
+        # Explicit recovery retries only the saved output after the route is
+        # available again. It never reruns the completed model request.
+        store.close()
+        gw._channel_stores.clear()
+        await gw._recover_channel_inputs()
+        await asyncio.wait_for(session._worker, 2)
+        recovered = gw._channel_store(mode)
+        assert recovered.summary()["done"] == 1 and host.queries == []
+        if mode == "slack":
+            assert gw._inkbox.slack.send_message.call_count == 1
+        else:
+            assert len(writes(sdk)) == 1
+        recovered.close()
 
     asyncio.run(run())
 
@@ -211,6 +271,44 @@ def test_unknown_send_is_not_retried_or_replaced_by_error_send(sdk, monkeypatch)
         await session.stop_companion()
         store.close()
 
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["server_error", "response_lost"])
+def test_recovered_saved_answer_keeps_unknown_post_uncertain_without_retry(sdk, monkeypatch, failure):
+    async def run():
+        gw, session, host, store, meta, activity = harness(sdk)
+        store.mark(meta, "reply_pending", reply="Saved answer")
+        if failure == "server_error":
+            # SDK retries 503 internally with the same idempotency key. Use
+            # its non-retried 500 to isolate the bridge's own recovery policy.
+            sdk.send_status = 500
+        else:
+            original = gw._identity.send_imessage
+
+            @wraps(original)
+            def lose_response(**kwargs):
+                original(**kwargs)
+                raise ConnectionError("Synthetic response loss after POST")
+
+            monkeypatch.setattr(gw._identity, "send_imessage", lose_response)
+
+        async def forbidden_retry(*_args, **_kwargs):
+            pytest.fail("Unknown saved-answer POST cannot enter the safe retry path")
+
+        monkeypatch.setattr(session, "_wait_channel_retry", forbidden_retry)
+        store.close()
+        gw._channel_stores.clear()
+        await gw._recover_channel_inputs()
+        await asyncio.wait_for(session._worker, 3)
+        recovered = gw._channel_store("imessage")
+        assert host.queries == [] and len(writes(sdk)) == 1
+        assert recovered.summary()["uncertain"] == 1 and recovered.summary()["failed"] == 0
+        assert not recovered.pending_replies() and not recovered.replay_pending()
+        await gw._recover_channel_inputs()
+        assert len(writes(sdk)) == 1 and host.queries == []
+        assert [state for _, state in activity] == ["accepted", "failed"]
+        recovered.close()
     asyncio.run(run())
 
 

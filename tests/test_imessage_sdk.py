@@ -104,7 +104,7 @@ def active_source(monkeypatch):
     session = make_session([])
     session._turn_active = True
     session._current_turn = _Turn(text="Question", mode="imessage", reply_meta={
-        "conversation_id": CONVERSATION_ID, **source_metadata(message()),
+        "conversation_id": CONVERSATION_ID, "imessage_threaded_replies": True, **source_metadata(message()),
     })
     token = CURRENT_SESSION.set(session)
     return session, token
@@ -323,15 +323,69 @@ def test_real_sdk_gateway_routes_and_correlates_native_queued_reply(sdk):
 
 
 @pytest.mark.parametrize("destination", [{"conversation_id": "other-conversation"}, {"to": ["+15550002222"]}])
-def test_active_native_destination_override_is_rejected_before_upload_or_send(sdk, monkeypatch, destination):
+def test_deliberate_separate_send_has_no_inherited_source_or_answer_suppression(sdk, monkeypatch, destination):
     from unittest.mock import Mock
-    active_source(monkeypatch)
-    upload=Mock()
+    session, _ = active_source(monkeypatch)
+    upload=Mock(return_value="https://example.com/synthetic-media")
     monkeypatch.setattr("inkbox_claude.tools._upload_media_url",upload)
-    result,_=tool(sdk, text="Answer",media_path="must-not-read-local-file",**destination)
-    assert result["isError"]
+    result, payload = tool(sdk, text="Separate instruction", media_path="synthetic-path", **destination)
+    assert not result.get("isError") and payload["sent"] is True
+    upload.assert_called_once()
+    assert len(posts(sdk)) == 1
+    body = json.loads(posts(sdk)[0].content)
+    expected = {**destination, "text": "Separate instruction", "media_urls": ["https://example.com/synthetic-media"]}
+    if "to" in expected:
+        expected["to"] = expected["to"][0]
+    assert body == expected
+    assert session._imessage_tool_outputs == []
+    assert not [request for request in sdk.requests if "/imessage/" in request.url.path and request.method == "GET"]
+    assert posts(sdk)[0].url.params["agent_identity_id"] == IDENTITY_ID
+
+
+@pytest.mark.parametrize("destination", [{"conversation_id": "other-conversation"}, {"to": ["+15550002222"]}])
+@pytest.mark.parametrize("state", ["ended", "stopped", "disabled"])
+def test_independent_send_still_requires_current_native_owner(sdk, monkeypatch, destination, state):
+    from unittest.mock import Mock
+    session, _ = active_source(monkeypatch)
+    if state == "ended":
+        session._current_turn = None
+    elif state == "stopped":
+        session._interrupting = True
+    else:
+        monkeypatch.setenv("INKBOX_IMESSAGE_THREADED_REPLIES", "false")
+    upload = Mock()
+    monkeypatch.setattr("inkbox_claude.tools._upload_media_url", upload)
+    # The tool captures the original owner before the identity read yields.
+    if state == "ended":
+        session, _ = active_source(monkeypatch)
+        original = sdk.client.get_identity
+        def lose_owner(*args, **kwargs):
+            result = original(*args, **kwargs)
+            session._current_turn = None
+            return result
+        monkeypatch.setattr(sdk.client, "get_identity", lose_owner)
+    result, _ = tool(sdk, text="Separate instruction", media_path="synthetic-path", **destination)
+    assert result["isError"] and not posts(sdk)
     upload.assert_not_called()
-    assert not posts(sdk)
+
+
+@pytest.mark.parametrize("failure", ["correlation", "notice"])
+def test_accepted_tool_send_is_not_rejected_by_local_tracking_failure(sdk, monkeypatch, failure):
+    session, _ = active_source(monkeypatch)
+    cfg = BridgeConfig(identity="agent", base_url="https://example.com")
+    store = IMessageState(cfg)
+    store.mark_delivery_failed(OUTBOUND_ID, {"chat_id": session.chat_id, "meta": {"conversation_id": CONVERSATION_ID}})
+    if failure == "correlation":
+        monkeypatch.setattr(IMessageState, "record_outbound", lambda *_args: (_ for _ in ()).throw(OSError("disk unavailable")))
+    else:
+        monkeypatch.setattr(session, "buffer_delivery_notice", lambda *_args: (_ for _ in ()).throw(OSError("disk unavailable")))
+    result, payload = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer")
+    assert not result.get("isError") and payload["sent"] is True
+    assert payload["id"] == OUTBOUND_ID and "Do not resend" in payload["warning"]
+    assert len(posts(sdk)) == 1 and len(session._imessage_tool_outputs) == 1
+    if failure == "notice":
+        assert len(store.pending_failure_notices()) == 1
+        assert store.lookup_outbound(OUTBOUND_ID)["status"] == "failed"
 
 
 @pytest.mark.parametrize("when", ["before_upload", "after_upload"])

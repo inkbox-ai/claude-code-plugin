@@ -157,7 +157,7 @@ def inbound_stop(envelope: dict, identity_id: str) -> tuple[str, str, dict] | No
     return incoming
 
 
-def validate_connection(resource: Any, identity_id: str, meta: dict) -> None:
+def validate_connection(resource: Any, identity_id: str, meta: dict) -> str | None:
     """Fail closed on stale, ambiguous, disconnected or cross-identity routes."""
     def field(item, key):
         return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
@@ -169,6 +169,8 @@ def validate_connection(resource: Any, identity_id: str, meta: dict) -> None:
             or not meta.get("workspace_id") or field(matches[0], "workspace_id") != meta["workspace_id"]
             or field(matches[0], "status") != "connected"):
         raise PermissionError("Slack connection is not uniquely active for this identity and workspace")
+    bot = field(matches[0], "bot_user_id")
+    return bot if isinstance(bot, str) and bot else None
 
 
 def send_reply(client: Any, meta: dict, text: str, *, connection_checked: bool = False) -> Any:

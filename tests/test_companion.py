@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import sqlite3
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -353,29 +354,49 @@ def test_recovery_only_retries_work_before_query(harness, checkpoint):
     asyncio.run(scenario())
 
 
-def test_query_timeout_is_fenced_and_unconfirmed_without_retry(harness):
+@pytest.mark.parametrize("owned", [False, True])
+def test_query_timeout_requires_positive_fence_and_never_replays(harness, owned):
+    import subprocess
+    import sys
+
     async def scenario():
+        child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"]) if owned else None
         envelope, pages = fixture()
         gw, _ = harness.build(pages)
+        gw.sessions.fence_fn = gw._record_host_fence
+
+        async def connect(client):
+            if child is not None:
+                client._transport = SimpleNamespace(_process=SimpleNamespace(pid=child.pid))
 
         async def fail(_client, _text):
             stored = json.loads(next(harness.root.glob("companion/*/*.json")).read_text())
             assert stored["events"][uid(12)]["state"] == "submitting"
             raise TimeoutError("Acceptance unknown")
 
+        harness.hooks.connect = connect
         harness.hooks.query = fail
-        await gw._handle_webhook(Request(envelope))
-        record = (await drained(gw))[0]
-        assert record["state"] == "initialized"
-        assert record["events"][uid(12)]["state"] == "unconfirmed"
-        await gw._handle_webhook(Request(envelope))
-        assert len(harness.queries) == 1
-        await gw._cleanup()
-        restarted, _ = harness.build(pages)
-        restarted._companion_receiver().recover()
-        await drained(restarted)
-        assert len(harness.queries) == 1
-        await restarted._cleanup()
+        try:
+            await gw._handle_webhook(Request(envelope))
+            record = (await drained(gw))[0]
+            assert record["state"] == ("initialized" if owned else "paused")
+            assert record["events"][uid(12)]["state"] == ("unconfirmed" if owned else "submitting")
+            assert record["events"][uid(12)].get("host_fenced", False) is owned
+            await gw._handle_webhook(Request(envelope))
+            assert len(harness.queries) == 1
+            await gw._cleanup()
+            if child is not None:
+                assert child.poll() is not None
+            restarted, _ = harness.build(pages)
+            restarted._companion_receiver().recover()
+            recovered = (await drained(restarted))[0]
+            assert recovered["state"] == ("initialized" if owned else "paused")
+            assert len(harness.queries) == 1
+            await restarted._cleanup()
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait()
 
     asyncio.run(scenario())
 
@@ -631,6 +652,66 @@ def test_historical_and_live_control_text_do_not_clear_session(harness):
         assert len(harness.queries) == 2
         assert len(harness.clients) == 1
         assert '"text": "/clear"' in harness.queries[1]
+        await gw._cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_failed_reset_retains_durable_companion_context_and_session(harness):
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        await gw._handle_webhook(Request(envelope))
+        record = (await drained(gw))[0]
+        session = gw.sessions.sessions[record["session_key"]]
+        prior_context, prior_host = list(record["context"]), record["host_session_id"]
+        session._execution_blocked = True
+        session._blocked_owner_keys = None
+        scope = {**envelope["companion"], "phase": "live", "sequence": 2}
+        control = event(scope, "owner@example.com", 13, "/new")
+        assert (await gw._handle_webhook(Request(control, request_id="reset-control"))).status == 200
+        await drained(gw)
+        assert record["state"] == "paused" and record["error"] == "control_cleanup_unconfirmed"
+        assert record["host_session_id"] == prior_host and all(item in record["context"] for item in prior_context)
+        assert record["events"][uid(13)]["state"] == "completed" and len(harness.queries) == 1
+        assert any("remains paused" in str(output) for output in harness.outputs)
+        await gw._cleanup()
+        restarted, _ = harness.build(pages)
+        receiver = restarted._companion_receiver()
+        receiver.recover()
+        retained = next(iter(receiver.records.values()))
+        assert retained["host_session_id"] == prior_host and all(item in retained["context"] for item in prior_context)
+        assert (await restarted._handle_webhook(Request(control, request_id="reset-retry"))).status == 200
+        await drained(restarted)
+        assert len(harness.queries) == 1 and retained["events"][uid(13)]["state"] == "completed"
+        await restarted._cleanup()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("write_error", [OSError, sqlite3.OperationalError])
+def test_uncertain_companion_close_write_error_still_clears_activity(harness, write_error):
+    from unittest.mock import AsyncMock
+
+    async def scenario():
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        activity = []
+
+        async def notify(_chat, _mode, _meta, state):
+            activity.append(state)
+
+        async def fail_query(_client, _text):
+            session = next(iter(gw.sessions.sessions.values()))
+            session.close = AsyncMock(side_effect=write_error("checkpoint unavailable"))
+            raise RuntimeError("submission outcome unavailable")
+
+        gw.sessions.activity_fn = notify
+        harness.hooks.query = fail_query
+        assert (await gw._handle_webhook(Request(envelope))).status == 200
+        record = (await drained(gw))[0]
+        assert record["state"] == "paused" and record["events"][uid(12)]["state"] == "submitting"
+        assert activity[-1] == "failed" and len(harness.queries) == 1
         await gw._cleanup()
 
     asyncio.run(scenario())
@@ -1015,6 +1096,124 @@ def test_shutdown_keeps_lock_until_host_stops_and_fences_late_checkpoint(harness
         await restarted._cleanup()
         await gw._cleanup()
 
+    asyncio.run(scenario())
+
+
+def test_positive_shutdown_fence_survives_restart_and_allows_fresh_companion_input(harness, monkeypatch):
+    import subprocess
+    import sys
+    from inkbox_claude.runtime import process_identity
+
+    async def scenario():
+        child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
+        owner = process_identity(SimpleNamespace(_transport=SimpleNamespace(_process=SimpleNamespace(pid=child.pid))))
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        gw.sessions.fence_fn = gw._record_host_fence
+        entered = asyncio.Event()
+
+        async def receive(_client):
+            entered.set()
+            await asyncio.Event().wait()
+
+        harness.hooks.receive = receive
+        monkeypatch.setattr("inkbox_claude.runtime.process_identity", lambda _client: owner if child.poll() is None else None)
+        try:
+            await gw._handle_webhook(Request(envelope))
+            await asyncio.wait_for(entered.wait(), 2)
+            record = next(iter(gw._companion.records.values()))
+            assert record["events"][uid(12)]["host_owner"] == owner
+            await gw._cleanup()
+            assert child.poll() is not None
+            assert record["events"][uid(12)]["host_fenced"] is True
+            harness.hooks.receive = None
+            restarted, _ = harness.build(pages)
+            monkeypatch.setattr("inkbox_claude.runtime.fence_process", lambda _owner: pytest.fail("The same stopped owner already has durable positive proof"))
+            restarted._companion_receiver().recover()
+            recovered = (await drained(restarted))[0]
+            assert recovered["state"] == "initialized"
+            assert recovered["events"][uid(12)]["state"] == "unconfirmed"
+            assert len(harness.queries) == 1
+            fresh = event({**envelope["companion"], "phase": "live", "sequence": 2}, "owner@example.com", 13, "Fresh task")
+            await restarted._handle_webhook(Request(fresh, request_id="fresh-request"))
+            await drained(restarted)
+            assert len(harness.queries) == 2
+            assert "Fresh task" in harness.queries[-1]
+            assert "unconfirmed outcome" in harness.queries[-1]
+            await restarted._cleanup()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("can_fence", [False, True])
+def test_companion_auth_retry_clears_old_fence_before_new_owner_crash(harness, monkeypatch, can_fence):
+    import os
+    import subprocess
+    import sys
+    from inkbox_claude.runtime import fence_process
+
+    async def scenario():
+        children = []
+        entered = asyncio.Event()
+        envelope, pages = fixture()
+        gw, _ = harness.build(pages)
+        gw.sessions.fence_fn = gw._record_host_fence
+
+        async def connect(client):
+            child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
+            children.append(child)
+            client._transport = SimpleNamespace(_process=SimpleNamespace(pid=child.pid))
+
+        async def receive(_client):
+            raise sessions_mod.ClaudeNotLoggedInError("Synthetic pre-execution login rejection")
+
+        async def query(_client, _text):
+            if len(children) == 2:
+                entered.set()
+                await asyncio.Event().wait()
+
+        harness.hooks.connect, harness.hooks.receive, harness.hooks.query = connect, receive, query
+        try:
+            await gw._handle_webhook(Request(envelope))
+            await asyncio.wait_for(entered.wait(), 3)
+            receiver = gw._companion
+            record = next(iter(receiver.records.values()))
+            current = record["events"][uid(12)]
+            assert children[0].poll() is not None and children[1].poll() is None
+            assert current["host_owner"]["pid"] == children[1].pid
+            assert not current.get("host_fenced") and not current.get("host_terminal")
+            # Emulate process loss: release only the gateway's task/journal
+            # resources, leaving P2 alive for the restarted recovery boundary.
+            tasks = [*receiver.jobs.values(), *[session._worker for session in gw.sessions.sessions.values() if session._worker]]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            os.close(receiver._owner_fd)
+            receiver._closed = True
+            restarted, _ = harness.build(pages)
+            seen = []
+
+            def fence(owner):
+                seen.append(owner)
+                return fence_process(owner) if can_fence else False
+
+            monkeypatch.setattr("inkbox_claude.runtime.fence_process", fence)
+            restarted._companion_receiver().recover()
+            recovered = (await drained(restarted))[0]
+            assert [owner["pid"] for owner in seen] == [children[1].pid]
+            assert recovered["state"] == ("initialized" if can_fence else "paused")
+            assert recovered["events"][uid(12)]["state"] == ("unconfirmed" if can_fence else "submitting")
+            assert (children[1].poll() is not None) is can_fence
+            assert len(harness.queries) == 2 and harness.outputs == []
+            await restarted._cleanup()
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
     asyncio.run(scenario())
 
 
