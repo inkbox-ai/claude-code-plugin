@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -221,3 +222,166 @@ print('installed')
     result = subprocess.run([sys.executable, "-c", program, script, str(tmp_path / "trace")],
                             capture_output=True, text=True, check=True)
     assert result.stdout.strip() == "installed"
+
+
+def test_real_native_init_reports_only_known_availability_and_preserves_messages(tmp_path):
+    from claude_agent_sdk import SystemMessage
+
+    known = diagnostics.CONTACT_TOOLS
+    messages = [
+        SystemMessage(subtype="init", data={"tools": [
+            "mcp__inkbox__" + name for name in known if name != "inkbox_delete_contact"
+        ] + [SECRET], "session_id": SECRET}),
+        SystemMessage(subtype="compact_boundary", data={"tools": list(known), "body": SECRET}),
+        SystemMessage(subtype="init", data={"tools": [{"name": SECRET}]}),
+        SystemMessage(subtype="init", data={"unavailable": SECRET}),
+        SimpleNamespace(subtype="init", data={"tools": list(known)}),
+    ]
+
+    class Host:
+        async def receive_response(self):
+            for message in messages:
+                yield message
+
+    path = tmp_path / "trace"
+    trace = diagnostics.Trace(path)
+    trace.wrap_receive(Host)
+
+    async def receive():
+        return [message async for message in Host().receive_response()]
+
+    received = asyncio.run(receive())
+    assert all(a is b for a, b in zip(received, messages, strict=True))
+    available = [r for r in records(path) if r["phase"] == "native_tools"]
+    assert len(available) == 1
+    assert available[0]["contact_tools"] == {name: name != "inkbox_delete_contact" for name in known}
+
+
+def test_native_init_observation_failure_cannot_change_delivery(tmp_path):
+    from claude_agent_sdk import SystemMessage
+
+    class Unreadable(dict):
+        def get(self, _key):
+            raise RuntimeError(SECRET)
+
+    message = SystemMessage(subtype="init", data=Unreadable())
+    trace = diagnostics.Trace(tmp_path / "trace")
+    trace.observe_native_tools(message)
+    assert not (tmp_path / "trace").exists()
+
+
+@pytest.mark.parametrize("ignored,detail", [(None, "none"), ("stale-a2a-event", "a2a_stale"),
+                                           ("task-completed", "a2a_stopped"), (SECRET, "other")])
+def test_a2a_admission_observer_preserves_exact_return_and_projects_only_outcome(tmp_path, ignored, detail):
+    result = ({"private_task": SECRET}, ignored)
+
+    class Gateway:
+        async def admit(self, private_payload):
+            assert private_payload == SECRET
+            return result
+
+    trace = diagnostics.Trace(tmp_path / "trace")
+    trace.wrap(Gateway, "admit", "a2a_admission")
+    assert asyncio.run(Gateway().admit(SECRET)) is result
+    observed = [r for r in records(tmp_path / "trace") if r["status"] == "observed"]
+    assert len(observed) == 1 and observed[0]["admitted"] is (ignored is None)
+    assert observed[0]["detail"] == detail
+
+
+@pytest.mark.parametrize("status", [200, 502])
+def test_actual_published_a2a_card_send_observation_does_not_change_protocol(tmp_path, monkeypatch, status):
+    from inkbox.a2a.client import A2AClient
+
+    class ObservedA2A(A2AClient):
+        pass
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"supportedInterfaces": [{
+                "protocolVersion": "1.0", "protocolBinding": "JSONRPC", "url": "https://example.invalid/rpc",
+            }]})
+        body = json.loads(request.content)
+        assert body["params"]["message"]["parts"] == [{"text": SECRET}]
+        return httpx.Response(status, json={"jsonrpc": "2.0", "id": body["id"], "result": {"task": {
+            "id": SECRET, "contextId": SECRET, "status": {"state": "TASK_STATE_WORKING"},
+        }}})
+
+    monkeypatch.setattr(httpx, "HTTPTransport", lambda **_kwargs: httpx.MockTransport(handle))
+    trace = diagnostics.Trace(tmp_path / "trace")
+    trace.wrap(ObservedA2A, "fetch_card", "a2a_card")
+    trace.wrap(ObservedA2A, "send", "a2a_send")
+    client = ObservedA2A(api_key=SECRET, platform_base_url="https://example.invalid")
+    try:
+        target = client.fetch_card("https://example.invalid/card")
+        if status == 200:
+            result = client.send(target, text=SECRET)
+            assert result.task.id == SECRET
+        else:
+            with pytest.raises(httpx.HTTPStatusError) as caught:
+                client.send(target, text=SECRET)
+            assert caught.value.response.status_code == status
+    finally:
+        client.close()
+    assert [r.method for r in requests] == ["GET", "POST"]
+    rows = records(tmp_path / "trace")
+    assert [(r["phase"], r["status"]) for r in rows] == [
+        ("a2a_card", "start"), ("a2a_card", "ok"), ("a2a_send", "start"),
+        ("a2a_send", "ok" if status == 200 else "error"),
+    ]
+    if status != 200:
+        assert rows[-1]["http_status"] == status
+
+
+def test_partial_install_failure_restores_originals_and_keeps_gateway_result(tmp_path, monkeypatch, capsys):
+    from inkbox_claude.sessions import ContactSession
+
+    original = ContactSession.handle_inbound
+    wrap = diagnostics.Trace.wrap
+    calls = []
+
+    def fail_second(self, cls, name, *args, **kwargs):
+        calls.append(name)
+        if len(calls) == 2:
+            raise RuntimeError(SECRET)
+        wrap(self, cls, name, *args, **kwargs)
+
+    monkeypatch.setattr(diagnostics.Trace, "wrap", fail_second)
+    result = object()
+    assert diagnostics.run_gateway(tmp_path / "trace", lambda: result) is result
+    assert calls == ["handle_inbound", "_run_turn"]
+    assert ContactSession.handle_inbound is original
+    assert SECRET not in capsys.readouterr().err
+
+
+def test_failed_observer_startup_preserves_exact_gateway_exception(tmp_path, monkeypatch, capsys):
+    failure = RuntimeError(SECRET)
+
+    def unavailable(_path):
+        raise ValueError(SECRET)
+
+    def gateway():
+        raise failure
+
+    monkeypatch.setattr(diagnostics, "install", unavailable)
+    with pytest.raises(RuntimeError) as caught:
+        diagnostics.run_gateway(tmp_path / "trace", gateway)
+    assert caught.value is failure
+    assert SECRET not in capsys.readouterr().err
+
+
+def test_availability_report_reprojects_fixed_boolean_schema(tmp_path, capsys):
+    path = tmp_path / "trace"
+    known = {name: True for name in diagnostics.CONTACT_TOOLS}
+    path.write_text("\n".join(json.dumps({"phase": "native_tools", "status": "observed",
+        "contact_tools": value, "tool_arguments": SECRET, "session_id": SECRET}) for value in [
+            known, {**known, SECRET: True}, {**known, "inkbox_get_contact": SECRET},
+        ]))
+    diagnostics.report(path)
+    output = capsys.readouterr().out
+    assert SECRET not in output
+    rows = [json.loads(line) for line in output.splitlines()]
+    assert rows[0]["contact_tools"] == known
+    assert "contact_tools" not in rows[1] and "contact_tools" not in rows[2]
