@@ -111,7 +111,7 @@ jobs:
 
       - name: Start bridge gateway
         run: |
-          nohup inkbox-claude run > /tmp/gateway.log 2>&1 &
+          nohup python3 tests/live/diagnostic_gateway.py > /tmp/gateway.log 2>&1 &
           echo $! > /tmp/gateway.pid
           for i in $(seq 1 36); do
             if grep -q "\[bridge\] ready" /tmp/gateway.log; then
@@ -150,3 +150,7 @@ jobs:
         if: always()
         run: |
           [ -f /tmp/gateway.pid ] && kill "$(cat /tmp/gateway.pid)" 2>/dev/null || true
+
+      - name: Sanitized channel lifecycle diagnostics
+        if: failure()
+        run: python3 tests/live/diagnostic_gateway.py report
