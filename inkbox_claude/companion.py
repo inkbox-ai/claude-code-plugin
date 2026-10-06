@@ -26,7 +26,9 @@ FAILURE_CHANNELS = {
     "text.delivery_failed": "phone",
     "imessage.delivery_failed": "imessage",
 }
-MODES = {"mail": "email", "phone": "sms", "imessage": "imessage"}
+from .slack import SLACK_INCOMING_EVENTS
+CHANNELS.update({event: "slack" for event in SLACK_INCOMING_EVENTS})
+MODES = {"mail": "email", "phone": "sms", "imessage": "imessage", "slack": "slack"}
 SCOPE_FIELDS = ("scope_id", "activation_id", "conversation_id", "channel")
 ROUTING_FIELDS = (*SCOPE_FIELDS, "phase", "sequence")
 SOURCE_FIELDS = (
@@ -48,7 +50,7 @@ SOURCE_FIELDS = (
     "to",
     "cc",
     "reply_to",
-    "sender_access",
+    "sender_access", "slack_route", "slack_author",
 )
 REVOKED_STATUSES = {401, 403, 404, 409}
 RETRY_INITIAL_DELAY = 1.0
@@ -161,6 +163,7 @@ def decode(envelope: dict) -> tuple[dict, dict, str]:
     if conversation != scope["conversation_id"]:
         raise ValueError("Companion conversation mismatch")
     sender = str(
+        message.get("slack_author") if channel == "slack" else
         (message.get("from_address") or "")
         if channel == "mail"
         else message.get("sender_phone_number")
@@ -333,7 +336,7 @@ class CompanionReceiver:
                 or (scope["phase"] == "ordinary") != (record["scope"]["phase"] == "ordinary")
                 or scope["sequence"] in sequences
                 or event["state"]
-                not in {"pending", "submitting", "submitted", "generated", "sending", "completed", "discarded"}
+                not in {"pending", "submitting", "submitted", "generated", "sending", "completed", "discarded", "unconfirmed"}
             ):
                 raise ValueError("Invalid Companion checkpoint event")
             sequences.add(scope["sequence"])
@@ -371,7 +374,11 @@ class CompanionReceiver:
         scope, message, sender = decode(envelope)
         if len(json.dumps(message).encode()) > self.gateway.cfg.companion_max_bytes:
             raise ValueError("Companion input exceeds the configured byte limit")
-        if scope["phase"] == "ordinary" and not self.gateway._sender_allowed(sender):
+        candidates = [sender]
+        if scope["channel"] == "slack":
+            route = message["slack_route"]
+            candidates.extend([route["actor_id"], f"{route['workspace_id']}:{route['actor_id']}"])
+        if scope["phase"] == "ordinary" and not self.gateway._sender_allowed(*candidates):
             raise PermissionError("Companion sender is not locally allowed")
         if scope["phase"] != "ordinary" and not callable(
             getattr(
@@ -442,8 +449,11 @@ class CompanionReceiver:
 
     def recover(self) -> None:
         """Resume hydration and work that has not crossed the host boundary."""
-        for key in self.records:
-            self.schedule(key)
+        for key, record in self.records.items():
+            if record.get("error") == "uncertain_host_outcome":
+                self.jobs[key] = asyncio.create_task(self.recover_uncertain(key))
+            else:
+                self.schedule(key)
 
     def delivery_failure_scopes(self, envelope: dict) -> list[str]:
         """Match lifecycle failures by canonical channel and conversation only."""
@@ -505,6 +515,31 @@ class CompanionReceiver:
             self.save(key)
             logger.warning("Companion delivery failed for scope %s; inspect its checkpoint", key)
 
+    async def recover_uncertain(self, key: str) -> None:
+        from .runtime import fence_process, saved_answer
+        from .sessions import _transcript_dir
+        record = self.records[key]
+        if not any(event["state"] in {"submitting", "submitted", "sending"} for event in record["events"].values()):
+            return
+        for event in record["events"].values():
+            if event["state"] not in {"submitting", "submitted", "sending"}:
+                continue
+            if not event.get("host_fenced") and not event.get("host_terminal") and not await asyncio.to_thread(fence_process, event.get("host_owner")):
+                return
+            reply = None if event["state"] == "sending" or self.was_stopped(record, event) else await asyncio.to_thread(saved_answer,
+                _transcript_dir(self.gateway.cfg.project_dir), record.get("host_session_id", ""), event["submission_id"])
+            if reply is not None and event.get("submitted_meta"):
+                event.update(state="generated", reply=reply, reply_meta=event["submitted_meta"])
+            else:
+                event["state"] = "unconfirmed"
+                if event.get("submitted_meta"):
+                    await self.gateway.sessions.get(record["session_key"]).notify_activity(MODES[record["scope"]["channel"]], event["submitted_meta"], "failed")
+                record.setdefault("context", []).append("An earlier request has an unconfirmed outcome. Do not repeat its actions automatically.")
+        record["state"] = "ordinary" if record["scope"]["phase"] == "ordinary" else "initialized"
+        record.pop("error", None)
+        self.save(key)
+        await self.drain(key)
+
     def discard_context(self, key: str) -> None:
         """Retain deduplication tombstones after access is revoked."""
         record = self.records[key]
@@ -541,8 +576,31 @@ class CompanionReceiver:
                 or self.active_replies.get(chat_id) != meta):
             raise PermissionError("No authorized Companion reply target")
         sender = record.get("sponsor") or meta.get("sender", "")
-        if not self.gateway._sender_allowed(sender):
+        if not self.author_allowed(record, sender):
             raise PermissionError("Companion sender is no longer locally allowed")
+        if mode == "slack":
+            if not self.gateway.cfg.slack_enabled:
+                raise PermissionError("Slack is disabled")
+            if record["scope"]["phase"] == "ordinary":
+                return
+            page = as_dict(await asyncio.to_thread(self.gateway._inkbox.companion.activation_messages,
+                self.gateway.cfg.identity, record["scope"]["activation_id"], limit=1))
+            if any(str(page.get(k, "")) != str(record["scope"].get(k, "")) for k in SCOPE_FIELDS):
+                raise PermissionError("Slack Companion activation changed")
+            context = as_dict(page["reply_context"])
+            if (str(context.get("connection_id")), context.get("slack_conversation_id")) != (meta.get("connection_id"), meta.get("conversation_id")):
+                raise PermissionError("Slack Companion channel changed")
+
+    def author_allowed(self, record: dict, sender: str) -> bool:
+        candidates = [sender]
+        if record["scope"]["channel"] == "slack":
+            actor = sender.partition(":")[2]
+            candidates.append(actor)
+            for event in record["events"].values():
+                route = event["message"].get("slack_route", {})
+                if event["sender"] == sender and route.get("actor_id") == actor:
+                    candidates.append(f"{route['workspace_id']}:{actor}")
+        return self.gateway._sender_allowed(*candidates)
 
     def begin_send(self, chat_id: str) -> None:
         """Mark the external boundary after all local send preparation succeeded."""
@@ -575,7 +633,7 @@ class CompanionReceiver:
         if not trigger.get("author") or trigger.get("historical") is not False:
             raise ValueError("Companion sponsor trigger is invalid")
         for event in record["events"].values():
-            if event["scope"]["phase"] == "initialization" and (
+            if scope["channel"] != "slack" and event["scope"]["phase"] == "initialization" and (
                 str(trigger["id"]) != str(event["message"]["id"])
                 or not same_author(scope["channel"], trigger["author"], event["sender"])
             ):
@@ -586,10 +644,15 @@ class CompanionReceiver:
                     scope["channel"], entry.get("author"), event["sender"]
                 ):
                     raise ValueError("Companion snapshot author mismatch")
-        if not self.gateway._sender_allowed(str(trigger["author"])):
+        if not self.author_allowed(record, str(trigger["author"])):
             raise PermissionError("Companion sponsor is not locally allowed")
         context = as_dict(snapshot["reply_context"])
         reply_meta(scope, context)
+        if scope["channel"] == "slack":
+            for event in record["events"].values():
+                route = event["message"]["slack_route"]
+                if (str(context.get("connection_id")), context.get("slack_conversation_id")) != (route["connection_id"], route["conversation_id"]):
+                    raise ValueError("Slack snapshot channel mismatch")
         snapshot.update(entries=entries, reply_context=context, sponsor=trigger["author"])
         if not isinstance(snapshot.get("text"), str) or not snapshot["text"]:
             raise ValueError("Companion snapshot is empty")
@@ -626,6 +689,8 @@ class CompanionReceiver:
             return False
         if cfg.group_reply_mode != "mention":
             return True
+        if event["scope"]["channel"] == "slack":
+            return bool(event["message"]["slack_route"].get("slack_mentioned"))
         identity = self.gateway._identity
         handle = getattr(identity, "agent_handle", None) or cfg.identity
         if mentions_agent(text, handle):
@@ -639,8 +704,12 @@ class CompanionReceiver:
             for _, recipient in getaddresses([item for item in recipients if isinstance(item, str)])
         ))
 
-    def control_text(self, text: str) -> str:
+    def control_text(self, text: str, event=None) -> str:
         """Strip a leading agent mention from controls and approval answers."""
+        if event and event["scope"]["channel"] == "slack":
+            bot = event["message"].get("slack_route", {}).get("slack_bot_user_id")
+            if bot and text.lstrip().startswith(f"<@{bot}>"):
+                return text.lstrip()[len(bot) + 3:].strip()
         parts = text.strip().split(maxsplit=1)
         handle = str(getattr(self.gateway._identity, "agent_handle", None) or self.gateway.cfg.identity).lstrip("@").casefold()
         if parts and parts[0].casefold().rstrip(",:") in {"@agent", f"@{handle}"}:
@@ -650,10 +719,18 @@ class CompanionReceiver:
     async def deliver(self, key: str, event: dict) -> None:
         """Send a checkpointed model result without repeating its model turn."""
         record = self.records[key]
+        if self.was_stopped(record, event):
+            event["state"] = "discarded"
+            self.save(key)
+            await self.gateway.sessions.get(record["session_key"]).notify_activity(
+                MODES[record["scope"]["channel"]], event["reply_meta"], "cancelled",
+            )
+            return
         chat_id = record["session_key"]
         meta = event["reply_meta"]
         self.active_replies[chat_id] = deepcopy(meta)
         self.active_outputs[chat_id] = (key, event)
+        await self.gateway.sessions.get(chat_id).notify_activity(MODES[record["scope"]["channel"]], meta, "accepted")
         try:
             reply = event.get("reply") or ""
             if reply and reply.strip() != "[SILENT]":
@@ -662,6 +739,7 @@ class CompanionReceiver:
             record.pop("error", None)
             record.pop("retry_count", None)
             self.save(key)
+            await self.gateway.sessions.get(chat_id).notify_activity(MODES[record["scope"]["channel"]], meta, "cancelled" if event.get("cancelled") else "completed")
         finally:
             self.active_replies.pop(chat_id, None)
             self.active_outputs.pop(chat_id, None)
@@ -671,6 +749,7 @@ class CompanionReceiver:
         record = self.records[key]
         session = self.gateway.sessions.get(record["session_key"])
         session.companion_approver = event["sender"]
+        await session.notify_activity(MODES[record["scope"]["channel"]], meta, "accepted")
 
         def checkpoint(state: str, **result: str) -> None:
             if self._closing or self._closed:
@@ -680,10 +759,15 @@ class CompanionReceiver:
             if record["state"] in {"failed", "paused"}:
                 raise PermissionError("Companion submission is no longer active")
             event["state"] = state
+            if state == "submitting":
+                event.pop("host_fenced", None)
+                event.pop("host_terminal", None)
+                event["host_owner"] = session._host_owner
+                event["submitted_meta"] = deepcopy(meta)
             if session.resume_session_id:
                 record["host_session_id"] = session.resume_session_id
             if state == "generated":
-                event.update(reply=result["reply"], reply_meta=deepcopy(meta))
+                event.update(reply=result["reply"], reply_meta=deepcopy(meta), cancelled=bool(result.get("cancelled")), host_terminal=True)
                 record["context"] = []
                 record.pop("retry_count", None)
             self.save(key)
@@ -712,7 +796,7 @@ class CompanionReceiver:
         """Hydrate once, buffer quiet context, and process each current receipt."""
         record = self.records[key]
         try:
-            if record["state"] in {"failed", "paused"}:
+            if record["state"] in {"failed", "paused"} or (record["scope"]["channel"] == "slack" and not self.gateway.cfg.slack_enabled):
                 return False
             if record["state"] in {"pending", "ready"}:
                 snapshot = await self.load(record)
@@ -740,6 +824,10 @@ class CompanionReceiver:
                         self.save(key)
                     return False
                 event = min(events, key=lambda item: item["scope"]["sequence"])
+                if self.was_stopped(record, event):
+                    event["state"] = "discarded"
+                    self.save(key)
+                    continue
                 if event["state"] == "generated":
                     await self.deliver(key, event)
                     continue
@@ -750,7 +838,7 @@ class CompanionReceiver:
                     self.save(key)
                     continue
                 if scope["phase"] == "ordinary":
-                    if not self.gateway._sender_allowed(event["sender"]):
+                    if not self.author_allowed(record, event["sender"]):
                         event["state"] = "discarded"
                         self.save(key)
                         continue
@@ -764,8 +852,18 @@ class CompanionReceiver:
                         if scope["channel"] == "mail" and audience(incoming) != audience(context):
                             raise ValueError("Companion email audience changed")
                         # Keep the saved sponsor anchor even for live email replies.
+                if scope["channel"] == "slack":
+                    route = message["slack_route"]
+                    context.update(connection_id=route["connection_id"], slack_conversation_id=route["conversation_id"], thread_ts=route["thread_ts"])
                 meta = reply_meta(scope, context)
                 meta["sender"] = event["sender"]
+                if scope["channel"] == "slack":
+                    meta.update(deepcopy(message["slack_route"]))
+                    meta["sender"] = event["sender"]
+                    meta["companion_conversation_id"] = scope["conversation_id"]
+                elif scope["channel"] == "imessage" and self.gateway.cfg.imessage_threaded_replies:
+                    from .imessage import source_metadata
+                    meta.update(source_metadata(message, event["submission_id"]))
                 raw_text = await self.raw_text(event)
                 if message["id"] not in record.get("history_ids", []):
                     item = json.dumps({
@@ -783,16 +881,21 @@ class CompanionReceiver:
                     self.save(key)
                     continue
                 from .sessions import _control_command
-                control = self.control_text(raw_text)
+                control = self.control_text(raw_text, event)
                 if (scope["phase"] != "initialization" and _control_command(control)
                         and same_author(scope["channel"], event["sender"], record.get("sponsor") or event["sender"])):
                     session = self.gateway.sessions.get(record["session_key"])
                     self.active_replies[record["session_key"]] = deepcopy(meta)
                     try:
-                        await session.handle_inbound(control, MODES[scope["channel"]], meta)
+                        control_result = await session.handle_inbound(control, MODES[scope["channel"]], meta)
                     finally:
                         self.active_replies.pop(record["session_key"], None)
                     if _control_command(control) == "reset":
+                        if control_result is False:
+                            event["state"] = "completed"
+                            record.update(state="paused", error="control_cleanup_unconfirmed")
+                            self.save(key)
+                            return False
                         record["context"] = []
                         record.pop("host_session_id", None)
                     event["state"] = "completed"
@@ -812,6 +915,17 @@ class CompanionReceiver:
                 self.discard_context(key)
             elif uncertain:
                 record.update(state="paused", error="uncertain_host_outcome")
+                self.save(key)
+                session = self.gateway.sessions.sessions.get(record["session_key"])
+                if session is not None:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass  # Keep the uncertain journal and continue indicator cleanup.
+                    else:
+                        await self.recover_uncertain(key)
+                        if record["state"] != "paused":
+                            return False
             elif isinstance(exc, ValueError) or getattr(exc, "status_code", None) == 413:
                 record.update(state="failed", error=str(exc) if isinstance(exc, ValueError) else "activation_unavailable")
             elif any(event["state"] == "generated" for event in record["events"].values()) and not retryable_read(exc):
@@ -824,10 +938,25 @@ class CompanionReceiver:
                     retry = True
                 else:
                     record.update(state="paused", error=f"retry_exhausted:{type(exc).__name__}")
+            if not retry:
+                session = self.gateway.sessions.sessions.get(record["session_key"])
+                if session is not None:
+                    for item in record["events"].values():
+                        route = item.get("reply_meta") or item.get("submitted_meta")
+                        if route and item["state"] not in {"completed", "discarded"}:
+                            await session.notify_activity(MODES[record["scope"]["channel"]], route, "failed")
             self.save(key)
             logger.warning("Companion work %s: %s", key, record["error"])
             return retry
         return False
+
+    def was_stopped(self, record: dict, event: dict) -> bool:
+        if record["scope"]["channel"] != "slack":
+            return False
+        route = event["message"].get("slack_route", {})
+        return self.gateway._channel_store("slack").was_stopped(
+            record["session_key"], route.get("source_event_id", ""),
+        )
 
     async def answer_pending(self, key: str, event_id: str) -> None:
         """Only the prompted sender may answer, under current receipt gates."""
@@ -837,6 +966,10 @@ class CompanionReceiver:
             return
         session = self.gateway.sessions.sessions.get(record["session_key"])
         pending = session.pending if session else None
+        if pending is not None and event["scope"]["channel"] == "slack":
+            route = event["message"]["slack_route"]
+            if tuple(route.get(k) for k in ("connection_id", "conversation_id", "thread_ts")) != tuple(pending.route.get(k) for k in ("connection_id", "conversation_id", "thread_ts")):
+                return
         if pending is None or pending.future.done() or not same_author(
             event["scope"]["channel"], event["sender"], session.companion_approver
         ):
@@ -846,9 +979,11 @@ class CompanionReceiver:
             return
         if session.pending is not pending or pending.future.done():
             return
-        text = self.control_text(text)
+        text = self.control_text(text, event)
         from .escalation import parse_permission_reply
-        if pending.kind == "permission" and parse_permission_reply(text) is None:
+        from .sessions import _control_command
+        if _control_command(text) or (pending.kind == "permission" and parse_permission_reply(text) is None):
+            await session._abort_in_flight(only_turns=[pending.owner or session._current_turn])
             return
         event["state"] = "completed"
         self.save(key)
@@ -863,10 +998,10 @@ class CompanionReceiver:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        for record in self.records.values():
-            session = self.gateway.sessions.sessions.get(record["session_key"])
-            if session is not None:
-                await session.stop_companion()
+        sessions = {self.gateway.sessions.sessions.get(record["session_key"]) for record in self.records.values()}
+        results = await asyncio.gather(*(session.stop_companion() for session in sessions if session is not None), return_exceptions=True)
+        if any(isinstance(result, BaseException) for result in results):
+            logger.warning("Some Companion conversations retain an unconfirmed host outcome")
         self.active_replies.clear()
         self._closed = True
         fcntl.flock(self._owner_fd, fcntl.LOCK_UN)

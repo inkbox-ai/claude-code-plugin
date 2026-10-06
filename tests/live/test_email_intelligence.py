@@ -19,6 +19,7 @@ Skipped unless both keys + LIVE_REAL_MODEL=1 are set.
 from __future__ import annotations
 
 import os
+import json
 import re
 import time
 import uuid
@@ -86,12 +87,22 @@ def _plugin_tool_names() -> list[str]:
     return sorted(set(re.findall(r'@tool\(\s*"(inkbox_[a-z0-9_]+)"', src.read_text())))
 
 
+def _observe_contact_tool_presence(candidate: str) -> None:
+    """Bounded diagnostic only; no body, subject, address or arbitrary name."""
+    names = (
+        "inkbox_lookup_contact", "inkbox_list_contacts", "inkbox_get_contact",
+        "inkbox_create_contact", "inkbox_update_contact", "inkbox_delete_contact",
+    )
+    print(json.dumps({"contact_tool_presence": {name: name in candidate for name in names}}, sort_keys=True))
+
+
 def _ask(
     remote,
     aut_email: str,
     remote_email: str,
     question: str,
     accept: Callable[[str], bool] | None = None,
+    observe: Callable[[str], None] | None = None,
 ) -> str:
     """Email the agent a question; return a matching new reply body.
 
@@ -137,6 +148,11 @@ def _ask(
                 f"(matched_error_count={len(bad)})"
             )
             candidates.append(body)
+            if observe is not None and len(candidates) <= 8:
+                try:
+                    observe(lowered)
+                except Exception:
+                    pass
             # Without a content predicate, preserve the original strict
             # request/reply correlation. Predicate-based intelligence checks
             # also accept a separate same-recipient tool email.
@@ -268,6 +284,7 @@ def test_aware_of_inkbox_tools(ctx):
         ctx["remote_email"],
         "List the exact names of all the Inkbox tools you have access to, one per line.",
         accept=lambda candidate: all(t.lower() in candidate for t in contact_tools),
+        observe=_observe_contact_tool_presence,
     )
     hits = [t for t in tool_names if t.lower() in body]
     assert len(hits) >= 3, (

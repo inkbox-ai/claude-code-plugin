@@ -265,6 +265,7 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_a2a_fail",
     }
 
+    expected.update({"inkbox_list_vault_secrets", "inkbox_get_vault_secret", "inkbox_get_totp_code"})
     assert set(tools) == expected
     assert set(tool_names) == {f"mcp__inkbox__{name}" for name in expected}
 

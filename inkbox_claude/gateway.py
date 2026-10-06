@@ -786,6 +786,9 @@ class InkboxGateway:
         self._public_host: str = ""
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
+        self._slack_activity = None
+        self._channel_stores = {}
+        self._runtime_ready = False
         self._companion: Any = None
 
         self._self_addresses: set[str] = set()
@@ -884,6 +887,19 @@ class InkboxGateway:
             await self._open_tunnel()
 
         await asyncio.to_thread(self._patch_identity_objects)
+        if self.cfg.imessage_threaded_replies:
+            from .config import imessage_threading_capability
+            supported, detail = imessage_threading_capability(self._identity)
+            if not supported:
+                raise RuntimeError(detail)
+        if self.cfg.slack_enabled:
+            from .slack_activity import SlackActivity
+            from .sessions import _state_path
+            from .slack import validate_connection
+            self._slack_activity = SlackActivity(self._inkbox.slack,
+                _state_path().parent / f"slack-activity-{self._identity.id}.json",
+                validate_route=lambda meta: validate_connection(self._inkbox.slack, str(self._identity.id), meta))
+            await self._slack_activity.recover()
 
         # Sessions get the Inkbox tools so Claude can message proactively.
         server, tool_names = build_inkbox_mcp_server(self._inkbox, self.cfg.identity, self.cfg)
@@ -896,8 +912,13 @@ class InkboxGateway:
             typing_fn=self.send_typing,
             on_send_rejected=self._note_send_rejection,
             health_fn=self.health_report,
+            activity_fn=self._slack_activity.notify if self._slack_activity else None,
+            receipt_fn=self._channel_receipt,
+            fence_fn=self._record_host_fence,
         )
         self._companion_receiver().recover()
+        await self._recover_channel_inputs()
+        self._runtime_ready = True
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
 
@@ -914,6 +935,7 @@ class InkboxGateway:
     async def _start_http_server(self) -> None:
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/ready", self._handle_ready)
         app.router.add_post(DEFAULT_WEBHOOK_PATH, self._handle_webhook)
         app.router.add_get(INKBOX_WS_PATH, self._handle_call_ws)
         self._runner = web.AppRunner(app)
@@ -968,6 +990,9 @@ class InkboxGateway:
         webhook_url = f"{self._public_url}{DEFAULT_WEBHOOK_PATH}"
         ws_url = f"wss://{self._public_host}{INKBOX_WS_PATH}"
         identity = self._inkbox.get_identity(self.cfg.identity)
+        if self.cfg.slack_enabled:
+            from .slack import reconcile_subscription
+            reconcile_subscription(self._inkbox, identity.id, webhook_url + "?channel=slack")
 
         def _reconcile(
             owner_kw: Dict[str, Any],
@@ -1625,6 +1650,11 @@ class InkboxGateway:
             await asyncio.gather(*jobs, return_exceptions=True)
         if self.sessions is not None:
             await self.sessions.close_all()
+        self._runtime_ready = False
+        for store in getattr(self, "_channel_stores", {}).values():
+            store.close()
+        if getattr(self, "_slack_activity", None) is not None:
+            await self._slack_activity.close()
         if self._runner is not None:
             await self._runner.cleanup()
         if self._tunnel is not None:
@@ -1636,6 +1666,144 @@ class InkboxGateway:
     # ------------------------------------------------------------------
     # Inbound: webhooks
     # ------------------------------------------------------------------
+
+    def _channel_store(self, mode):
+        from .imessage import IMessageState
+        if mode not in self._channel_stores:
+            store = IMessageState(self.cfg, channel=mode)
+            store.acquire_owner()
+            self._channel_stores[mode] = store
+        return self._channel_stores[mode]
+
+    async def _channel_receipt(self, chat_id, mode, meta, state, text=None):
+        if meta.get("companion") or not (mode == "slack" or (mode == "imessage" and self.cfg.imessage_threaded_replies)):
+            return
+        if state == "running":
+            from .runtime import process_identity
+            session = self.sessions.get(chat_id)
+            meta = {**meta, "host_owner": process_identity(session._client), "host_session_id": session.resume_session_id,
+                    "host_fenced": False, "host_terminal": False}
+        self._channel_store(mode).mark(meta, state, reply=text, chat_id=chat_id)
+
+    def _record_host_fence(self, chat_id, owners):
+        """Persist positive proof only for records owned by the exact stopped process."""
+        for mode, enabled in (("slack", self.cfg.slack_enabled), ("imessage", self.cfg.imessage_threaded_replies)):
+            if enabled or mode in self._channel_stores:
+                self._channel_store(mode).record_host_fence(chat_id, owners)
+        if self._companion is not None:
+            for key, record in self._companion.records.items():
+                if record["session_key"] != chat_id:
+                    continue
+                changed = False
+                for event in record["events"].values():
+                    owner = event.get("host_owner") or {}
+                    if event["state"] in {"submitting", "submitted", "sending"} and (owner.get("pid"), owner.get("created")) in owners:
+                        event["host_fenced"] = True
+                        changed = True
+                if changed:
+                    self._companion.save(key)
+
+    async def _recover_channel_inputs(self):
+        for mode, enabled in (("slack", self.cfg.slack_enabled), ("imessage", self.cfg.imessage_threaded_replies)):
+            if not enabled:
+                continue
+            store = self._channel_store(mode)
+            if mode == "imessage":
+                self._retain_imessage_failure_notices()
+            from .runtime import fence_process
+            blocked_chats = set()
+            for item in store.interrupted():
+                session = self.sessions.get(item["chat_id"])
+                if not await asyncio.to_thread(fence_process, item["meta"].get("host_owner")):
+                    session._execution_blocked = True
+                    blocked_chats.add(item["chat_id"])
+                else:
+                    store.mark({**item["meta"], "host_fenced": True}, "uncertain", chat_id=item["chat_id"])
+            for item in store.pending_uncertain_notices():
+                session = self.sessions.get(item["chat_id"])
+                event_id = (item["meta"].get("source_event_id") or item["meta"].get("imessage_event_id")
+                            or item["meta"].get("message_id"))
+                session.buffer_context("Earlier work has an unconfirmed outcome. Do not repeat its actions automatically.",
+                                       f"unconfirmed:{mode}:{event_id}")
+                store.mark_uncertain_notice_buffered(item["meta"], item["chat_id"])
+            pending = store.replay_pending()
+            for item in store.pending_replies():
+                if item["chat_id"] in blocked_chats:
+                    continue
+                meta = item["meta"]
+                if not self._sender_allowed(str(meta.get("sender") or ""), str(meta.get("actor_id") or "")):
+                    store.mark(meta, "cancelled")
+                    continue
+                session = self.sessions.get(item["chat_id"])
+                await session.recover_reply(item["reply"], mode, meta)
+            for item in pending:
+                if item["chat_id"] in blocked_chats:
+                    continue
+                meta = item["meta"]
+                if self._sender_allowed(str(meta.get("sender") or ""), str(meta.get("actor_id") or "")):
+                    await self.sessions.get(item["chat_id"]).handle_inbound(item["text"], mode, meta)
+                else:
+                    store.mark(meta, "cancelled")
+
+    async def _on_slack_received(self, envelope):
+        from .slack import inbound_message, inbound_stop, SLACK_STOP_EVENT
+        if not self.cfg.slack_enabled:
+            return web.json_response({"ok": True, "ignored": "slack-disabled"})
+        stop = envelope.get("event_type") == SLACK_STOP_EVENT
+        incoming = (inbound_stop if stop else inbound_message)(envelope, str(self._identity.id))
+        if incoming is None:
+            return web.json_response({"ok": True, "ignored": "slack-message"})
+        chat_id, body, meta = incoming
+        if not stop and not self._sender_allowed(meta["sender"], meta["actor_id"]):
+            return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
+        from .slack import validate_connection
+        try:
+            meta["slack_bot_user_id"] = await asyncio.to_thread(validate_connection, self._inkbox.slack, str(self._identity.id), meta)
+        except (PermissionError, ValueError):
+            return web.json_response({"ok": True, "ignored": "slack-connection-unavailable"})
+        session = self.sessions.sessions.get(chat_id)
+        if stop:
+            candidates = list(self.sessions.sessions.items())
+            targets = [(key, owned, [turn for turn in owned.slack_stop_targets(meta)
+                if self._sender_allowed(str((turn.reply_meta or {}).get("sender") or ""), meta["actor_id"], meta["sender"])])
+                for key, owned in candidates]
+            targets = [(key, owned, turns) for key, owned, turns in targets if turns]
+            snapshot = [{"chat_id": key, "source_event_ids": [
+                (turn.reply_meta or {}).get("source_event_id") for turn in turns
+            ]} for key, _, turns in targets]
+            if not self._channel_store("slack").consume_control(meta["source_event_id"], snapshot):
+                return web.json_response({"ok": True, "deduped": True})
+            paused = False
+            for _, owned, turns in targets:
+                try:
+                    await owned._abort_in_flight(only_mode="slack", only_turns=turns)
+                except Exception:
+                    if not getattr(owned, "_execution_blocked", False) and not owned._pending_fenced_owners:
+                        raise
+                    paused = True
+                    for turn in turns:
+                        await owned.notify_activity("slack", turn.reply_meta or {}, "failed")
+            return web.json_response({"ok": True, "paused": paused})
+        if not meta["slack_addressed"] and not self.sessions.has_session(chat_id):
+            return web.json_response({"ok": True, "ignored": "unengaged-thread"})
+        if not self._channel_store("slack").admit(chat_id, body, meta):
+            return web.json_response({"ok": True, "deduped": True})
+        try:
+            await self.sessions.get(chat_id).handle_inbound(body, "slack", meta)
+        except Exception:
+            self._channel_store("slack").forget_pending(meta)
+            raise
+        return web.json_response({"ok": True})
+
+    async def _handle_ready(self, request: "web.Request") -> "web.Response":
+        blocked = sum(record["state"] == "paused" for record in self._companion.records.values()) if self._companion else 0
+        blocked += sum(bool(getattr(session, "_execution_blocked", False)) for session in self.sessions.sessions.values()) if self.sessions else 0
+        from .runtime import local_readiness
+        host_ready, detail = await asyncio.to_thread(local_readiness)
+        ready = bool(self._runtime_ready and self.sessions is not None and host_ready and not blocked)
+        return web.json_response({"ok": ready, "ready": ready, "blocked_conversations": blocked,
+                                  "host_ready": host_ready, "host_detail": detail,
+                                  "model_execution_verified": False}, status=200 if ready else 503)
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         result = {"ok": True, "identity": self.cfg.identity}
@@ -1753,6 +1921,12 @@ class InkboxGateway:
         # Trusted source label. ``None`` means no registered provider claimed
         # the request — an unknown/unverifiable third party.
         source = provider.name if provider is not None else None
+        if str(envelope.get("event_type") or "").startswith("slack."):
+            if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
+                    url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
+                return web.Response(status=401, text="Slack events require a valid signature")
+            if not self.cfg.slack_enabled:
+                return web.json_response({"ok": True, "ignored": "slack-disabled"})
         if envelope.get("companion") is not None and source != "inkbox":
             return web.Response(status=401, text="Companion events require a valid Inkbox signature")
 
@@ -1782,6 +1956,9 @@ class InkboxGateway:
             if self.sessions is None:
                 return web.Response(status=503, text="Companion receiver is starting")
             try:
+                if str(envelope.get("event_type") or "").startswith("slack."):
+                    from .slack_companion import normalize_envelope
+                    envelope = await asyncio.to_thread(normalize_envelope, self._inkbox, self.cfg.identity, envelope)
                 result = self._companion_receiver().accept(envelope)
             except ValueError:
                 return web.Response(status=400, text="Invalid Companion event")
@@ -1813,6 +1990,8 @@ class InkboxGateway:
                         if len(self._call_meta_by_id) > 100:
                             self._call_meta_by_id.pop(next(iter(self._call_meta_by_id)), None)
                     response = web.json_response({"ok": True})
+                elif event_type.startswith("slack."):
+                    response = await self._on_slack_received(envelope)
                 elif event_type == "message.received":
                     response = await self._on_mail_received(envelope)
                 elif event_type == "text.received":
@@ -1895,7 +2074,7 @@ class InkboxGateway:
             bool: True for a recognised Inkbox event shape.
         """
         if event_type and event_type.startswith(
-            ("message.", "text.", "imessage.", "a2a.", "call.")
+            ("message.", "text.", "imessage.", "a2a.", "call.", "slack.")
         ):
             return True
         # ``id`` by itself is not a call discriminator: generic external
@@ -2701,7 +2880,18 @@ class InkboxGateway:
         }
         # A fresh inbound starts a fresh logical reply — reset its failed-send budget.
         self._clear_outbound_failures("imessage", conversation_id, sender, chat_id=chat_id)
-        await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+        if self.cfg.imessage_threaded_replies:
+            from .imessage import source_metadata
+            meta.update(source_metadata(message, str(envelope.get("id") or message["id"])))
+            meta["media"] = bool(media)
+            if not self._channel_store("imessage").admit(chat_id, body, meta):
+                return web.json_response({"ok": True, "deduped": True})
+        try:
+            await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+        except Exception:
+            if self.cfg.imessage_threaded_replies:
+                self._channel_store("imessage").forget_pending(meta)
+            raise
         return web.json_response({"ok": True})
 
     async def _on_imessage_reaction_received(self, envelope: Dict[str, Any]) -> "web.Response":
@@ -2781,7 +2971,25 @@ class InkboxGateway:
                         "contact": contact,
                         "contact_memories": memories,
                     }
-                    await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+                    if self.cfg.imessage_threaded_replies:
+                        from .imessage import source_metadata
+                        receipt_id = f"reaction:{reaction_id}" if reaction_id else str(envelope.get("id") or "")
+                        if not target_message_id or not receipt_id:
+                            self._dedup_commit(event_key)
+                            return web.json_response({"ok": True, "ignored": "reaction-without-source"})
+                        # The reaction owns the receipt; the reacted-to message
+                        # owns the native reply target, never the reaction ID.
+                        meta.update(source_metadata({"id": target_message_id}, receipt_id))
+                        meta["message_id"] = reaction_id or receipt_id
+                        if not self._channel_store("imessage").admit(chat_id, body, meta):
+                            self._dedup_commit(event_key)
+                            return web.json_response({"ok": True, "deduped": True})
+                    try:
+                        await self.sessions.get(chat_id).handle_inbound(body, "imessage", meta)
+                    except Exception:
+                        if self.cfg.imessage_threaded_replies:
+                            self._channel_store("imessage").forget_pending(meta)
+                        raise
                     response = web.json_response({"ok": True})
         except Exception:
             self._dedup_rollback(event_key)
@@ -3117,7 +3325,29 @@ class InkboxGateway:
             stage="delivery_failed",
         )
 
+    def _retain_imessage_failure_notices(self):
+        if self.sessions is None:
+            return
+        from .imessage import retain_failure_notices
+        store = self._channel_store("imessage")
+        for chat_id in dict.fromkeys(item["chat_id"] for item in store.pending_failure_notices()):
+            retain_failure_notices(store, self.sessions.get(chat_id))
+
     async def _on_imessage_delivery_failed(self, envelope: Dict[str, Any]) -> "web.Response":
+        if self.cfg.imessage_threaded_replies:
+            data = envelope.get("data") or {}
+            message = data.get("message") or {}
+            message_id = str(message.get("id") or "")
+            if str(message.get("direction") or "").lower() == "inbound" or not message_id:
+                return web.json_response({"ok": True, "ignored": "invalid-outbound-failure"})
+            store = self._channel_store("imessage")
+            conversation_id = str(message.get("conversation_id") or message.get("conversationId") or "").strip()
+            fallback = {"chat_id": self._chat_key(data, str(message.get("remote_number") or "").strip(),
+                                               self._thread_key("imessage", conversation_id)),
+                        "meta": {"conversation_id": conversation_id or None}}
+            store.mark_delivery_failed(message_id, fallback)
+            self._retain_imessage_failure_notices()
+            return web.json_response({"ok": True})
         data = envelope.get("data") or {}
         message = data.get("message") or {}
         message_id = str(message.get("id") or "")
@@ -4848,6 +5078,37 @@ class InkboxGateway:
             )
             return
 
+        if mode == "slack":
+            from .slack import send_reply, validate_connection
+            from .tools import _to_thread_drained
+            from .sessions import CHANNEL_DELIVERY_GUARD
+            from .imessage import SafeReplyPreflightError
+            from .companion import retryable_read
+            guard = CHANNEL_DELIVERY_GUARD.get()
+            if guard is not None:
+                guard()
+            if not self.cfg.slack_enabled:
+                raise PermissionError("Slack is disabled")
+            meta = {**meta, "identity_id": str(self._identity.id)}
+            try:
+                await _to_thread_drained(validate_connection, self._inkbox.slack, str(self._identity.id), meta)
+            except Exception as exc:
+                if retryable_read(exc):
+                    raise SafeReplyPreflightError("Slack reply preflight is temporarily unavailable") from None
+                raise
+            if guard is not None:
+                guard()
+            if meta.get("companion"):
+                await self._companion_receiver().authorize_reply(chat_id, mode, meta)
+                self._companion_receiver().begin_send(chat_id)
+            elif meta.get("final_reply"):
+                self._channel_store("slack").begin_send(meta, chat_id)
+            def send_checked_slack():
+                if guard is not None:
+                    guard()
+                return send_reply(self._inkbox, meta, content, connection_checked=True)
+            await _to_thread_drained(send_checked_slack)
+            return
         if mode == "sms":
             text = strip_markdown(content)
             if len(text) > SMS_MAX_LENGTH:
@@ -4881,12 +5142,46 @@ class InkboxGateway:
                 raise ValueError(f"No iMessage conversation id for chat {chat_id}")
             if meta.get("companion"):
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
+            kwargs = {"conversation_id": conversation_id, "text": text}
+            guard = None
+            if meta.get("imessage_threaded_replies") and not self.cfg.imessage_threaded_replies:
+                raise PermissionError("Native iMessage replies are disabled")
+            if self.cfg.imessage_threaded_replies:
+                from .imessage import validate_reply_target, SafeReplyPreflightError
+                from .sessions import CHANNEL_DELIVERY_GUARD
+                from .companion import retryable_read
+                guard = CHANNEL_DELIVERY_GUARD.get()
+                if guard is not None:
+                    guard()
+                try:
+                    kwargs.update(await asyncio.to_thread(validate_reply_target, identity, meta))
+                except Exception as exc:
+                    if retryable_read(exc):
+                        raise SafeReplyPreflightError("iMessage reply preflight is temporarily unavailable") from None
+                    raise
+                if guard is not None:
+                    guard()
+                kwargs["idempotency_key"] = "claude-imsg-" + hashlib.sha256(json.dumps([
+                    self.cfg.base_url, self.cfg.identity, chat_id,
+                    meta.get("imessage_event_ids") or meta.get("message_id"),
+                    "final" if meta.get("final_reply") or meta.get("companion") else uuid.uuid4().hex, kwargs,
+                ], sort_keys=True).encode()).hexdigest()
+                if not meta.get("companion") and meta.get("final_reply"):
+                    self._channel_store("imessage").begin_send(meta, chat_id)
+            if meta.get("companion"):
                 self._companion_receiver().begin_send(chat_id)
-            await asyncio.to_thread(
-                identity.send_imessage,
-                conversation_id=conversation_id,
-                text=text,
-            )
+            from .tools import _to_thread_drained
+            def send_checked_imessage():
+                if guard is not None:
+                    guard()
+                return identity.send_imessage(**kwargs)
+            sent = await _to_thread_drained(send_checked_imessage)
+            if self.cfg.imessage_threaded_replies:
+                try:
+                    self._channel_store("imessage").record_outbound(sent, meta, chat_id)
+                    self._retain_imessage_failure_notices()
+                except Exception:
+                    logger.warning("iMessage accepted; local delivery tracking needs recovery. Do not resend.")
         else:  # email
             identity = self._identity
             if identity is None:

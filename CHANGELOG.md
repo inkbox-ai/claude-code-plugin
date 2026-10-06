@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.14
+
+### Added
+
+- Opt-in Slack tools and guided workspace/app installation, channel-wide Companion,
+  exact-route controls, inline reactions and native threaded work status.
+- Opt-in native iMessage source replies, durable ordinary-message receipts,
+  compatible burst collection, queued follow-ups, and bounded thread reads.
+- Identity-scoped Vault metadata, selected credentials and current 2FA codes with
+  lazy local unlocking, fresh access checks and no TOTP seed exposure.
+- Separate readiness diagnostics, native process ownership fencing, positive
+  saved-answer recovery and retained unconfirmed outcomes without replay.
+
+### Fixed
+
+- Serialize permission prompts and treat fresh instructions as new work without
+  consuming them as an obsolete permission answer. Preserve exact Slack actor
+  and native-thread ownership for controls.
+- Persist native Stop targets and unresolved process fences across repeated restarts;
+  reject stale or ambiguous Slack connections before replies and status cleanup.
+- Reconnect a stale Claude login once only before any execution, never replaying
+  an auth failure after assistant/tool progress or saving an error response session ID.
+- Quarantine vanished/reused native parent processes instead of treating an old
+  descendant snapshot as proof that orphaned tools stopped.
+- Drain native tool side effects during shutdown, preserve unrelated voice work
+  when stopping native iMessage, and retain callback-first outbound failures.
+- Automatically resume durable Slack and native iMessage work after temporary
+  pre-submission or read-only delivery checks recover, preserving saved answers
+  and working status without replaying an uncertain model task or send.
+- Preserve exact positive shutdown fences across restart; keep cleanup running
+  for other conversations when a host outcome remains unconfirmed.
+- Recognize native Slack mentions in permission replies, retain bystander input
+  quietly while approval is pending, and preserve unrelated queued consultations.
+- Retain quiet iMessage failure notices durably without changing accepted sends
+  into rejected tool results; independent explicit sends never inherit reply routing.
+- Persist native iMessage reaction turns before processing, reply to the reacted-to
+  message, and prevent duplicate work after restart.
+- Preserve incompatible iMessage follow-ups across retries and retain native Slack
+  Stop targets across restart without cancelling later work.
+- Keep unconfirmed-outcome context after shutdown and route callback-first delivery
+  notices to the accepted send's conversation once its destination is known.
+- Reset execution proof when a retry acquires a new host, retain exact positive
+  fence proof across transient journal failures, and keep uncertain saved-answer
+  sends out of pre-submission retry and terminal-failure paths.
+
+
 ## 0.2.13
 
 ### Added

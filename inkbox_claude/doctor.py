@@ -58,7 +58,7 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         import inkbox  # noqa: F401
         checks.append(("inkbox SDK", True, "installed"))
     except ImportError:
-        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.7.6,<1.0.0'"))
+        checks.append(("inkbox SDK", False, "pip install 'inkbox>=0.7.11,<1.0.0'"))
 
     try:
         import claude_agent_sdk  # noqa: F401
@@ -79,6 +79,14 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
         claude_bin or "not on PATH — install Claude Code first",
     ))
 
+    from .runtime import local_readiness
+    host_ready, detail = local_readiness()
+    checks.append(("Claude readiness", host_ready, detail))
+    checks.append(("Vault unlock key", True,
+                   "configured locally" if os.getenv("INKBOX_CLAUDE_VAULT_KEY") else "locked (optional); set INKBOX_CLAUDE_VAULT_KEY locally"))
+    checks.append(("Slack receiver", bool(cfg.signing_key) if cfg.slack_enabled else True,
+                   "enabled; requires signed Inkbox events" if cfg.slack_enabled else "disabled"))
+    checks.append(("response policy", True, f"groups={cfg.group_reply_mode}; Companion={cfg.companion_response_mode}"))
     project_dir = cfg.project_dir
     checks.append((
         "project dir",
@@ -99,6 +107,17 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
                 "imessage" if getattr(identity, "imessage_enabled", False) else None,
             ])) or "no channels provisioned"
             checks.append(("identity reachable", True, detail))
+            if cfg.imessage_threaded_replies:
+                from .config import imessage_threading_capability
+                supported, hint = imessage_threading_capability(identity)
+                checks.append(("native iMessage", supported, hint + "; backend capability requires a source-bound live check"))
+            if cfg.slack_enabled:
+                from .slack_companion import require_sdk_support
+                try:
+                    require_sdk_support()
+                    checks.append(("Slack Companion SDK", True, "supported; current activation is checked before turns and sends"))
+                except ValueError:
+                    checks.append(("Slack Companion SDK", False, "upgrade inkbox to >=0.7.14 for Slack Companion"))
             expected_action = (
                 "hosted_agent"
                 if cfg.voice_stack is VoiceStack.INKBOX_VOICE_AI

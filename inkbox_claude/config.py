@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import inspect
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
@@ -97,6 +98,8 @@ class BridgeConfig:
     # off: only registered, signature-verified sources get through).
     external_events_enabled: bool = False
     contact_memories_enabled: bool = True
+    slack_enabled: bool = False
+    imessage_threaded_replies: bool = False
     companion_max_bytes: int = 200_000
     group_reply_mode: str = "auto"
     companion_response_mode: str = "safe"
@@ -204,6 +207,8 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         skip_webhook_reconcile=env_flag("INKBOX_SKIP_WEBHOOK_RECONCILE", False),
         external_events_enabled=env_flag("INKBOX_EXTERNAL_EVENTS_ENABLED", False),
         contact_memories_enabled=env_flag("INKBOX_CONTACT_MEMORIES_ENABLED", True),
+        slack_enabled=env_flag("INKBOX_SLACK_ENABLED", False),
+        imessage_threaded_replies=env_flag("INKBOX_IMESSAGE_THREADED_REPLIES", False),
         companion_max_bytes=int(os.getenv("INKBOX_COMPANION_MAX_BYTES") or 200_000),
         group_reply_mode=_mode_env("INKBOX_GROUP_REPLY_MODE", "auto", {"auto", "mention"}),
         companion_response_mode=_mode_env("INKBOX_COMPANION_RESPONSE_MODE", "safe", {"safe", "relaxed"}),
@@ -231,3 +236,33 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         ).strip().lower(),
         realtime=realtime,
     )
+
+
+def imessage_threading_capability(identity: Any) -> tuple[bool, str]:
+    """Check local SDK support without asserting remote API availability."""
+    requirements = {
+        "send_imessage": {"reply_to_message_id", "plain_reply_fallback", "idempotency_key"},
+        "get_imessage": set(),
+        "get_imessage_thread": {"limit", "cursor"},
+        "get_imessage_conversation_thread": {"limit", "cursor"},
+    }
+    missing = []
+    for name, keywords in requirements.items():
+        method = getattr(identity, name, None)
+        if not callable(method):
+            missing.append(name)
+            continue
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            missing.append(name)
+            continue
+        if not keywords.issubset(parameters):
+            missing.append(name)
+    if missing:
+        return False, (
+            "Threaded iMessage replies require an Inkbox SDK with native reply and "
+            "thread-read support. Upgrade to SDK 0.7.13 or newer "
+            "or set INKBOX_IMESSAGE_THREADED_REPLIES=false. Missing: " + ", ".join(missing)
+        )
+    return True, "SDK native-reply APIs available; backend support is not verified"

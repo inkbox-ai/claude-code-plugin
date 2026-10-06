@@ -73,7 +73,7 @@ jobs:
         run: |
           tests/ci/retry_install.sh uv pip install --system \
             \
-            -e . pytest
+            -e . "inkbox==0.7.14" pytest
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
@@ -111,7 +111,7 @@ jobs:
 
       - name: Start bridge gateway
         run: |
-          nohup inkbox-claude run > /tmp/gateway.log 2>&1 &
+          nohup python3 tests/live/diagnostic_gateway.py > /tmp/gateway.log 2>&1 &
           echo $! > /tmp/gateway.pid
           for i in $(seq 1 36); do
             if grep -q "\[bridge\] ready" /tmp/gateway.log; then
@@ -140,7 +140,17 @@ jobs:
           AUT_WEBHOOK_URL: http://127.0.0.1:8767/webhook
         run: python3 -m pytest tests/live -v
 
+      - name: Real Claude native Vault contract
+        if: matrix.leg == 'real'
+        env:
+          INKBOX_RUN_NATIVE_HOST_TESTS: "1"
+        run: python3 -m pytest tests/contract/test_native_vault_host.py -v
+
       - name: Stop bridge gateway
         if: always()
         run: |
           [ -f /tmp/gateway.pid ] && kill "$(cat /tmp/gateway.pid)" 2>/dev/null || true
+
+      - name: Sanitized channel lifecycle diagnostics
+        if: failure()
+        run: python3 tests/live/diagnostic_gateway.py report

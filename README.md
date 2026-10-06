@@ -10,7 +10,7 @@
 </p>
 
 <p>
-  <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Tunnel</code>
+  <code>Slack</code> · <code>Email</code> · <code>Calls</code> · <code>SMS / MMS</code> · <code>iMessage</code> · <code>Tunnel</code>
 </p>
 
 <br clear="left">
@@ -308,11 +308,12 @@ Delivery failures for tracked conversations are logged and saved as
 `last_delivery_failure` in their checkpoints for operator review. They do not
 start an automatic retry turn or a private contact conversation.
 
-If a query's acceptance, completion, or send outcome is uncertain, the conversation is marked
-`paused`. Restarting does not resend it. Stop the bridge and inspect the Claude
-transcript using the checkpoint's logical input ID before reconciling the state.
-Keep unresolved outcomes paused; deleting checkpoints or resetting them to pending
-can repeat actions. An oversized or unavailable activation is marked `failed`;
+If a query's acceptance, completion, or send outcome is uncertain, the request is retained
+without replay. The conversation stays `paused` while the old native owner cannot be
+fenced; once fencing is proved, the uncertain request becomes `unconfirmed` and later
+fresh work can proceed. Stop the bridge and inspect the Claude transcript using the
+checkpoint's logical input ID before manually reconciling an unresolved outcome.
+Deleting checkpoints or resetting uncertain requests to pending can repeat actions. An oversized or unavailable activation is marked `failed`;
 after correcting a pre-submission failure, an operator may reset its state to
 `pending` while the bridge is stopped, then restart to revalidate it.
 
@@ -457,3 +458,126 @@ resamples to and from the realtime session's 24 kHz PCM format, preserving audio
 across WebSocket frame boundaries. Older call streams that advertise 8 kHz μ-law
 (or omit their audio descriptor) remain supported. Call audio quality also depends
 on the remote connection. Hosted voice and managed speech modes are unchanged.
+
+## Slack, native iMessage, and Vault
+
+Version **0.2.14** requires Inkbox SDK **0.7.11+**. Published SDK **0.7.14** is the
+full-feature tested version. Native iMessage requires **0.7.13+**; Slack Companion
+requires **0.7.14+**, and both require matching server capabilities.
+
+### Slack
+
+Run `inkbox-claude setup` to opt in, select or configure a saved workspace, prepare
+its agent app, open the installation link, and wait for a confirmed connection.
+Setup preserves an existing connection and never silently switches credentials.
+Alternatively set `INKBOX_SLACK_ENABLED=true` for an already configured identity.
+Slack events always require a valid Inkbox webhook signature, even if general
+webhook signature enforcement is disabled.
+
+Ordinary channel mentions reply in a native thread; ordinary DMs reply inline.
+Companion keeps one channel-wide conversation across native threads, but replies,
+approval answers, and Stop stay attached to the current message's exact route.
+Native Stop receipts persist their exact actor/thread-owned targets before interruption;
+a redelivered Stop cannot cancel a later request. Current connection ownership, workspace
+and connected status are checked before admission, replies and indicator cleanup.
+A top-level Companion reply stays top-level. `INKBOX_GROUP_REPLY_MODE=mention`
+requires a native agent mention in a group; `INKBOX_COMPANION_RESPONSE_MODE=safe`
+requires current direct admission. These independent settings compose. Quiet
+messages remain context without starting tools, generation, or a work indicator.
+
+Inline replies use 👀 while working and ❌ on failure. Native subthreads use Slack's
+working/awaiting-input status only, without reaction fallback. The connection must
+support the relevant Slack API capability. API success alone cannot verify the
+indicator's appearance in a particular Slack client.
+
+The six Slack tools support connections, conversations, bounded message history,
+retained-text search, explicit sends, and action lookup. Attachment references are
+metadata, not downloaded files. Explicit sends require a stable idempotency key;
+inspect an uncertain action instead of sending it again. Disabling Slack blocks
+its tools, new input, recovered work, and automatic delivery.
+
+### Native iMessage replies
+
+Opt in by setting `INKBOX_IMESSAGE_THREADED_REPLIES=true` in the bridge environment
+and restarting. This is deliberately not an additional setup wizard prompt.
+Every message-triggered reply targets its admitted source. Short compatible bursts
+collect after 750 ms of quiet, capped at two seconds, and target their first source.
+Further messages queue behind active work instead of interrupting it. Media,
+reactions, different senders, and different native reply contexts do not combine.
+Bursts are limited to eight sources and 4000 combined text characters; overflow stays
+queued with its own source anchor. Source-bound send/read tools cannot change the
+native reply target, upload before route validation, or expand Companion history.
+Stop affects owned iMessage work, not an unrelated voice consult for the contact.
+
+Native IDs remain opaque and nullable. The bridge performs identity-scoped source
+and thread preflight reads before targeted sending. Only the API may fall back to
+a plain same-conversation message. A failed targeted send never causes a second,
+unthreaded send. A deliberately requested send to a different conversation or `to`
+uses ordinary SDK routing, without inheriting the inbound native source or
+suppressing its answer. It still requires the originating turn to remain active.
+Triggerless proactive sends retain ordinary SDK behavior.
+The model cannot override the bridge's target/fallback policy. Companion uses its
+existing ordered durable receipt owner rather than ordinary burst collection.
+With native replies enabled, asynchronous delivery failures are retained as bounded,
+quiet context, including callbacks that precede the accepted-send response. They do
+not start model work or authorize a resend. Accepted sends remain accepted if local
+delivery tracking is temporarily unavailable.
+
+### Vault and 2FA
+
+The agent can list identity-accessible secret metadata, retrieve one selected
+credential, or obtain a current login 2FA code. Set **`INKBOX_CLAUDE_VAULT_KEY`**
+locally to enable lazy unlocking. Never put it in a conversation or tool argument.
+Metadata and unrelated tools remain available with a missing or wrong bridge key.
+Every credential/code invocation validates the current bridge-local key and freshly
+checks the selected secret's identity access before and after decryption. Cached or
+SDK-global unlocked state cannot bypass a missing/changed key or revoked access. Credential output omits TOTP seeds; code output contains
+only the current code and its validity timing.
+
+Migrate any **SDK-global** `INKBOX_VAULT_KEY` or `vault_key` in `~/.inkbox/config`
+to the bridge-specific environment setting. The SDK eagerly unlocks global keys
+at client construction; it has no public opt-out in the supported release. The
+bridge does not rewrite global SDK settings or monkeypatch SDK internals.
+
+## Readiness and retained work
+
+`/health` remains a listener/liveness endpoint. `/ready` additionally checks native
+Claude CLI authentication, initialized session storage, and blocked conversation
+owners. `inkbox-claude doctor` uses the same bounded native auth check. Neither
+endpoint claims a model task or external reply was completed; use a live acceptance
+check for that proof. If Claude reports a stale login before any execution, the bridge reconnects once
+without discarding the selected session and then gives local login guidance. An auth
+failure after assistant/tool progress or a nonzero host-turn count is uncertain and
+is never retried as a login refresh.
+
+Ordinary Slack/native-iMessage receipts and completed answers are persisted before
+acknowledgement or send. Companion journals, quiet context, Claude session IDs,
+and hosted-SMS reservations remain intact across upgrade. Temporary transport
+failures positively identified before host submission or during read-only reply
+preflight retry automatically with capped backoff, keeping the original route and
+working indication. A saved answer retries delivery preparation only, not the
+model task; Stop cancels its owned retry. A nonretryable check before the send
+checkpoint retains the answer for explicit recovery without sending or retrying it.
+Only positively matched
+terminal saved answers may be reused after a host interruption. Otherwise an
+uncertain request is retained without automatic re-execution; later fresh work
+can proceed only after the old native host and side effects are fenced. An
+uncertain send is never automatically replayed. If ownership cannot be proved,
+readiness reports a blocked scope for operator inspection. That block survives repeated
+restarts until ownership fencing is positively confirmed. A missing or reused native
+parent PID is not proof of cleanup: its older child snapshot may omit later orphaned
+tools, so that scope stays quarantined. A live owned process is fenced before SDK
+disconnect removes its observable identity.
+Successful shutdown fences are persisted for the exact stopped owner, allowing fresh
+work after restart without replaying its interrupted request. A failed proof write
+retains the exact fence for a later persistence retry without releasing unrelated
+unconfirmed owners. Failed reset or resume controls leave the conversation paused
+and preserve the existing session and context. Revoked or terminally
+failed Companion records remain deduplication tombstones and do not by themselves
+make the bridge unready.
+
+State lives under `INKBOX_CLAUDE_HOME` (default `~/.inkbox-claude`). Stop the bridge
+before backing up or moving it. Do not delete journals or session IDs to recover a
+paused scope. Older releases do not understand the new unconfirmed scheduling
+state; preserve the state directory and use this release for recovery rather than
+assuming a downgrade can safely replay it.

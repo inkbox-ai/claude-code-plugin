@@ -72,7 +72,7 @@ jobs:
           version: "latest"
 
       - name: Install bridge and protocol driver
-        run: tests/ci/retry_install.sh uv pip install --system -e .
+        run: tests/ci/retry_install.sh uv pip install --system -e . "inkbox==0.7.14"
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
@@ -95,7 +95,7 @@ jobs:
 
       - name: Start bridge gateway
         run: |
-          nohup inkbox-claude run > "$RUNNER_TEMP/gateway.log" 2>&1 &
+          nohup python3 tests/live/diagnostic_gateway.py > "$RUNNER_TEMP/gateway.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/gateway.pid"
           for _ in $(seq 1 36); do
             grep -q "\[bridge\] ready" "$RUNNER_TEMP/gateway.log" && exit 0
@@ -120,3 +120,8 @@ jobs:
         if: always()
         run: |
           kill "$(cat "$RUNNER_TEMP/gateway.pid" 2>/dev/null)" 2>/dev/null || true
+
+      - name: Sanitized A2A lifecycle diagnostics
+        if: always()
+        continue-on-error: true
+        run: python3 tests/live/diagnostic_gateway.py report

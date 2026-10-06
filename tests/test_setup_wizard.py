@@ -84,8 +84,8 @@ def test_env_reads_quoted_value_from_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("version, accepted", [
-    ("0.5.9", False), ("0.7.2", False), ("0.7.6rc1", False),
-    ("0.7.6", True), ("0.7.7", True),
+    ("0.5.9", False), ("0.7.2", False), ("0.7.11rc1", False),
+    ("0.7.6", False), ("0.7.11", True), ("0.7.12", True),
 ])
 def test_setup_requires_installed_companion_sdk(monkeypatch, capsys, version, accepted):
     symbols = {"Inkbox": object()}
@@ -95,7 +95,7 @@ def test_setup_requires_installed_companion_sdk(monkeypatch, capsys, version, ac
 
     assert setup_wizard._ensure_inkbox_sdk() is (symbols if accepted else None)
     if not accepted:
-        assert "older than 0.7.6" in capsys.readouterr().out
+        assert "older than 0.7.11" in capsys.readouterr().out
 
 
 def test_install_command_prefers_uv_when_available(monkeypatch):
@@ -108,7 +108,7 @@ def test_install_command_prefers_uv_when_available(monkeypatch):
         "install",
         "--python",
         "/tmp/venv/bin/python",
-        "inkbox>=0.7.6,<1.0.0",
+        "inkbox>=0.7.11,<1.0.0",
         "aiohttp>=3.9",
     ]]
 
@@ -118,10 +118,10 @@ def test_install_command_falls_back_to_pip_and_ensurepip(monkeypatch):
     monkeypatch.setattr(setup_wizard.shutil, "which", lambda _name: None)
 
     assert setup_wizard._install_commands() == [
-        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.6,<1.0.0", "aiohttp>=3.9"]],
+        [["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.11,<1.0.0", "aiohttp>=3.9"]],
         [
             ["/tmp/venv/bin/python", "-m", "ensurepip", "--upgrade"],
-            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.6,<1.0.0", "aiohttp>=3.9"],
+            ["/tmp/venv/bin/python", "-m", "pip", "install", "inkbox>=0.7.11,<1.0.0", "aiohttp>=3.9"],
         ],
     ]
 
@@ -140,7 +140,7 @@ def test_missing_sdk_guidance_prints_interpreter(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "/tmp/venv/bin/python" in out
     assert "uv pip install --python" in out
-    assert "inkbox>=0.7.6,<1.0.0" in out
+    assert "inkbox>=0.7.11,<1.0.0" in out
 
 
 # ----------------------------------------------------------------------

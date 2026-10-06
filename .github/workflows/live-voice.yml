@@ -65,7 +65,7 @@ jobs:
         run: |
           tests/ci/retry_install.sh uv pip install --system \
             \
-            -e . pytest fastapi 'uvicorn[standard]'
+            -e . "inkbox==0.7.14" pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
@@ -83,6 +83,8 @@ jobs:
 
       - name: Configure speech mode (${{ matrix.scenario }})
         run: |
+          echo "VOICE_DIAGNOSTIC_DRIVER=$RUNNER_TEMP/voice-driver-diagnostic.jsonl" >> "$GITHUB_ENV"
+          echo "VOICE_DIAGNOSTIC_TEST=$RUNNER_TEMP/voice-test-diagnostic.jsonl" >> "$GITHUB_ENV"
           echo "INKBOX_REALTIME_MODEL=gpt-realtime-2" >> "$GITHUB_ENV"
           if [ "${{ matrix.scenario }}" = "outbound_realtime" ]; then
             echo "INKBOX_VOICE_STACK=openai_realtime" >> "$GITHUB_ENV"
@@ -111,8 +113,10 @@ jobs:
       - name: Start voice driver
         env:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+          VOICE_DRIVER_AUTO_STOP: "false"
+          VOICE_DRIVER_LISTEN: "180"
         run: |
-          nohup python3 tests/live/voice_driver.py > /tmp/voice_driver.log 2>&1 &
+          nohup python3 tests/live/voice_diagnostics.py driver > /tmp/voice_driver.log 2>&1 &
           echo $! > /tmp/voice_driver.pid
           for i in $(seq 1 30); do
             [ -f "$VOICE_DRIVER_STATE" ] && { echo "driver ready"; exit 0; }
@@ -145,7 +149,7 @@ jobs:
           VOICE_SCENARIO: ${{ matrix.scenario }}
           LIVE_REAL_MODEL: "1"
           GATEWAY_LOG: /tmp/gateway.log
-        run: python3 -m pytest tests/live/test_voice.py -v
+        run: python3 tests/live/voice_diagnostics.py test tests/live/test_voice.py -v
 
       # Driver first (SIGINT so its cleanup reverts the number's auto-accept),
       # then a beat for the revert to land, then the gateway.
@@ -155,3 +159,8 @@ jobs:
           [ -f /tmp/voice_driver.pid ] && kill -INT "$(cat /tmp/voice_driver.pid)" 2>/dev/null || true
           sleep 3
           [ -f /tmp/gateway.pid ] && kill "$(cat /tmp/gateway.pid)" 2>/dev/null || true
+
+      - name: Content-free voice diagnostics
+        if: always()
+        continue-on-error: true
+        run: python3 tests/live/voice_diagnostics.py report "$VOICE_DIAGNOSTIC_DRIVER" "$VOICE_DIAGNOSTIC_TEST"

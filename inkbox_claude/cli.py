@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="inkbox-claude",
-        description="Talk to Claude Code over email, SMS, iMessage, and voice via Inkbox.",
+        description="Talk to Claude Code over email, Slack, SMS, iMessage, and voice via Inkbox.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("setup", help="run the interactive setup wizard")
