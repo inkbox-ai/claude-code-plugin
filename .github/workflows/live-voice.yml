@@ -111,6 +111,8 @@ jobs:
       - name: Start voice driver
         env:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+          VOICE_DRIVER_AUTO_STOP: "false"
+          VOICE_DRIVER_LISTEN: "180"
         run: |
           nohup python3 tests/live/voice_driver.py > /tmp/voice_driver.log 2>&1 &
           echo $! > /tmp/voice_driver.pid

@@ -18,6 +18,7 @@ Env:
   VOICE_DRIVER_PORT       local port the tunnel forwards to (default 8090)
   VOICE_DRIVER_STATE      path to write the JSON state file
   VOICE_DRIVER_LINE       the one line the driver speaks (default below)
+  VOICE_DRIVER_AUTO_STOP  false when the test owns call hangup (default true)
 """
 
 from __future__ import annotations
@@ -62,9 +63,10 @@ GREETING = os.environ.get("VOICE_DRIVER_GREETING", "Hello?")
 # "greeting over" — the first ask is simply allowed to land wherever it lands, and
 # _run_turn re-asks once the agent is actually idle.
 SPEAK_AFTER_S = float(os.environ.get("VOICE_DRIVER_SPEAK_AFTER", "5"))
-# Then give the agent a turn and hang up — a dropped WS does NOT end the call, so we
-# must send an explicit stop or the leg lingers until the server max-duration cap.
+# Bound scripted re-asking. Tests with finally cleanup own the call lifetime;
+# standalone drivers still hang up explicitly because dropping WS does not.
 LISTEN_S = float(os.environ.get("VOICE_DRIVER_LISTEN", "12"))
+AUTO_STOP = os.environ.get("VOICE_DRIVER_AUTO_STOP", "true").strip().lower() != "false"
 # Re-ask the question this often while the agent is idle. An ask the greeting
 # talked over is otherwise never repeated and the call idles out with the agent
 # still waiting for a request. 0 disables re-asking.
@@ -113,7 +115,7 @@ async def phone_media_ws(ws: WebSocket) -> None:
         log.info("spoke: %s", text)
 
     async def _run_turn() -> None:
-        # Speak one line, give the agent a turn, then hang up so the call ends fast.
+        # Speak one line, then give the agent a bounded opportunity to answer.
         await _say(GREETING)
         await asyncio.sleep(SPEAK_AFTER_S)
         await _say(LINE)
@@ -138,6 +140,8 @@ async def phone_media_ws(ws: WebSocket) -> None:
                 await _say(LINE)
                 asked_at = loop.time()
                 reasks += 1
+        if not AUTO_STOP:
+            return  # Keep the receive loop alive until test-owned hangup.
         try:
             await ws.send_text(json.dumps({"event": "stop"}))
             log.info("sent stop (hangup)")
