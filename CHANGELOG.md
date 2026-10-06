@@ -26,6 +26,9 @@
   descendant snapshot as proof that orphaned tools stopped.
 - Drain native tool side effects during shutdown, preserve unrelated voice work
   when stopping native iMessage, and retain callback-first outbound failures.
+- Automatically resume durable Slack and native iMessage work after temporary
+  pre-submission or read-only delivery checks recover, preserving saved answers
+  and working status without replaying an uncertain model task or send.
 
 
 ## 0.2.13

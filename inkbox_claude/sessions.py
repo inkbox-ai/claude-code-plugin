@@ -19,7 +19,7 @@ import os
 import re
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -96,6 +96,9 @@ SendRejectedFn = Callable[[str, str, Dict[str, Any], str, Exception], Awaitable[
 
 TYPING_REFRESH_SECONDS = 40.0
 TYPING_MAX_SECONDS = 600.0
+CHANNEL_RETRY_INITIAL_DELAY = 1.0
+CHANNEL_RETRY_MAX_DELAY = 30.0
+CHANNEL_DELIVERY_GUARD: ContextVar[Any] = ContextVar("channel_delivery_guard", default=None)
 
 
 @dataclass
@@ -127,6 +130,9 @@ class _Turn:
     attempts: int = 0
     burst_source_count: int = 1
     burst_text_chars: int = 0
+    saved_reply: Optional[str] = None
+    cancelled: bool = False
+    retry_wake: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(frozen=True)
@@ -389,6 +395,9 @@ class ContactSession:
         self._imessage_tool_outputs = []
         self._deferred_turn = None
         self._batching_turn = None
+        self._retrying_turn = None
+        self._delivery_turn = None
+        self._shutting_down = False
         self._side_effects = set()
         self.cfg = cfg
         self.send_fn = send_fn
@@ -478,8 +487,9 @@ class ContactSession:
             await self.receipt(mode, meta, "done")
             return
 
-        if command and mode == "slack" and self._current_turn is not None:
-            route = self._current_turn.reply_meta or {}
+        control_turn = self._current_turn or self._delivery_turn or self._retrying_turn
+        if command and mode == "slack" and control_turn is not None:
+            route = control_turn.reply_meta or {}
             if any(meta.get(k) != route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id")):
                 self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or ""))
                 await self.receipt(mode, meta, "done")
@@ -566,7 +576,7 @@ class ContactSession:
 
     async def _batch(self, turn):
         meta = turn.reply_meta or {}
-        if (turn.mode != "imessage" or not self.cfg.imessage_threaded_replies or turn.checkpoint
+        if (turn.mode != "imessage" or not self.cfg.imessage_threaded_replies or turn.checkpoint or turn.saved_reply is not None
                 or turn.future or meta.get("companion") or meta.get("media") or meta.get("reaction")):
             return turn
         deadline = turn.queued_at + 2.0
@@ -582,7 +592,7 @@ class ContactSession:
             other = self._queue.get_nowait()
             ometa = other.reply_meta or {}
             from .imessage import compatible_key
-            if (other.mode != "imessage" or other.future or other.checkpoint or ometa.get("companion")
+            if (other.mode != "imessage" or other.future or other.checkpoint or other.saved_reply is not None or ometa.get("companion")
                     or ometa.get("media") or ometa.get("reaction") or other.queued_at > deadline
                     or turn.burst_source_count + other.burst_source_count > 8
                     or (turn.burst_text_chars or len(turn.text)) + (other.burst_text_chars or len(other.text)) + 2 > 4000
@@ -599,26 +609,40 @@ class ContactSession:
                 return turn
 
     async def _drain(self) -> None:
-        while self._deferred_turn is not None or not self._queue.empty():
+        while not self._shutting_down and (self._deferred_turn is not None or not self._queue.empty()):
             turn = self._deferred_turn or await self._queue.get()
             self._deferred_turn = None
             self._batching_turn = turn
             turn = await self._batch(turn)
-            if self._batching_turn is None:
+            if self._batching_turn is None or turn.cancelled:
                 continue
             self._batching_turn = None
             try:
-                result = await self._run_turn(turn)
+                if turn.saved_reply is not None:
+                    await self._deliver_reply(turn, turn.saved_reply)
+                    result = turn.saved_reply
+                else:
+                    result = await self._run_turn(turn)
                 if turn.checkpoint is None:
-                    await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled" if self._interrupting else "completed")
+                    await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled" if turn.cancelled or self._interrupting else "completed")
                 if turn.completion is not None and not turn.completion.done():
                     turn.completion.set_result(result or "")
             except Exception as exc:
+                if turn.cancelled or self._shutting_down:
+                    continue
+                from .companion import retryable_read
+                from .imessage import SafeReplyPreflightError
+                ordinary_channel = (turn.checkpoint is None and turn.future is None
+                    and (turn.mode == "slack" or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)))
+                safe_start = (ordinary_channel and not turn.submitted and not turn.execution_observed
+                              and retryable_read(exc))
+                safe_reply = (ordinary_channel and turn.saved_reply is not None
+                              and isinstance(exc, SafeReplyPreflightError))
+                if safe_start or safe_reply:
+                    await self._wait_channel_retry(turn, close_host=safe_start)
+                    continue
                 if not turn.submitted and turn.checkpoint is None and turn.attempts < 3 and not isinstance(exc, (PermissionError, ValueError)):
-                    turn.attempts += 1
-                    await self.close()
-                    await asyncio.sleep(min(2 ** (turn.attempts - 1), 4))
-                    self._deferred_turn = turn
+                    await self._wait_channel_retry(turn, close_host=True)
                     continue
                 await self.receipt(turn.mode, turn.reply_meta or {}, "uncertain")
                 if turn.checkpoint is None:
@@ -643,10 +667,41 @@ class ContactSession:
                 logger.exception("[session %s] turn failed", self.chat_id)
                 await self.close()
                 await self.receipt(turn.mode, {**(turn.reply_meta or {}), "host_fenced": True}, "uncertain")
+                if ordinary_channel and turn.saved_reply is not None:
+                    continue  # Preserve the answer; do not start an untracked second send.
                 try:
                     await self.send_fn(self.chat_id, _turn_error_notice(exc), turn.mode or self.mode, deepcopy(turn.reply_meta or self.reply_meta))
                 except Exception:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
+
+    async def _wait_channel_retry(self, turn: _Turn, *, close_host: bool) -> None:
+        """Keep one cancellable queue owner while retrying proven pre-effect work."""
+        self._retrying_turn = turn
+        turn.attempts += 1
+        try:
+            if close_host:
+                await self.close()
+            generation = self._client_generation
+            delay = min(CHANNEL_RETRY_INITIAL_DELAY * 2 ** min(turn.attempts - 1, 10), CHANNEL_RETRY_MAX_DELAY)
+            try:
+                await asyncio.wait_for(turn.retry_wake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            if (not turn.cancelled and not self._shutting_down and generation == self._client_generation
+                    and not getattr(self, "_execution_blocked", False)):
+                self._deferred_turn = turn
+        finally:
+            if self._retrying_turn is turn:
+                self._retrying_turn = None
+
+    async def recover_reply(self, reply: str, mode: str, meta: Dict[str, Any]) -> None:
+        """Queue a durable answer for delivery without submitting another model turn."""
+        if self._shutting_down:
+            return
+        await self.notify_activity(mode, meta, "accepted")
+        await self._queue.put(_Turn(text="", mode=mode, reply_meta=deepcopy(meta), saved_reply=reply))
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain())
 
     async def run_companion(
         self, text: str, mode: str, meta: Dict[str, Any], checkpoint: Callable[..., None],
@@ -695,6 +750,7 @@ class ContactSession:
         had_work = (
             self._turn_active or self.pending is not None or not self._queue.empty()
             or self._batching_turn is not None or self._deferred_turn is not None
+            or self._retrying_turn is not None or self._delivery_turn is not None
         )
         reply_mode, _ = self._reply_route()
         await self._abort_in_flight(only_mode="imessage" if reply_mode == "imessage" and self.cfg.imessage_threaded_replies else None)
@@ -703,7 +759,8 @@ class ContactSession:
     def slack_stop_targets(self, meta):
         """Snapshot exact actor/route-owned turns, never future requests on that route."""
         fields = ("connection_id", "workspace_id", "conversation_id", "thread_ts", "actor_id")
-        candidates = [self._current_turn, self._batching_turn, self._deferred_turn, *list(self._queue._queue)]
+        candidates = [self._current_turn, self._batching_turn, self._deferred_turn,
+                      self._retrying_turn, self._delivery_turn, *list(self._queue._queue)]
         return [turn for turn in candidates if turn is not None and turn.mode == "slack"
                 and all((turn.reply_meta or {}).get(k) == meta.get(k) for k in fields)]
 
@@ -717,6 +774,11 @@ class ContactSession:
         owns_active = selected(active) or (active is None and only_mode is None and only_turns is None)
         pending = self.pending
         dropped = []
+        for turn in (self._retrying_turn, self._delivery_turn):
+            if selected(turn) and not any(turn is item for item in dropped):
+                turn.cancelled = True
+                turn.retry_wake.set()
+                dropped.append(turn)
         if selected(self._batching_turn):
             dropped.append(self._batching_turn)
             self._batching_turn = None
@@ -809,6 +871,10 @@ class ContactSession:
         """
         if self._turn_active:
             state = "I'm working on your last message right now."
+        elif self._retrying_turn is not None:
+            state = "I'm waiting for a temporary connection issue to clear, then I'll continue your message."
+        elif self._delivery_turn is not None:
+            state = "I've prepared your reply and am checking delivery."
         elif self.pending is not None and not self.pending.future.done():
             state = f"I'm waiting on your reply to a {self.pending.kind}."
         elif not self._queue.empty():
@@ -1173,6 +1239,7 @@ class ContactSession:
             return
         if reply and reply.strip() != "[SILENT]":
             await self.receipt(turn.mode, turn.reply_meta or {}, "reply_pending", reply)
+            turn.saved_reply = reply
             await self._deliver_reply(turn, reply)
         else:
             await self.receipt(turn.mode, turn.reply_meta or {}, "done")
@@ -1208,7 +1275,17 @@ class ContactSession:
             None
         """
         mode, meta = turn.mode or self.mode, deepcopy(turn.reply_meta or self.reply_meta)
+        generation = self._client_generation
+        self._delivery_turn = turn
+
+        def guard():
+            if (turn.cancelled or self._shutting_down or self._delivery_turn is not turn
+                    or generation != self._client_generation or getattr(self, "_execution_blocked", False)):
+                raise PermissionError("Reply ownership is no longer active")
+
+        token = CHANNEL_DELIVERY_GUARD.set(guard)
         try:
+            guard()
             await self.send_fn(self.chat_id, reply, mode, {**meta, "final_reply": True})
             await self.receipt(mode, meta, "done")
         except Exception as exc:
@@ -1217,6 +1294,10 @@ class ContactSession:
             logger.warning("Reply send rejected (%s)", type(exc).__name__)
             if self.on_send_rejected is not None:
                 await self.on_send_rejected(self.chat_id, mode, meta, reply, exc)
+        finally:
+            CHANNEL_DELIVERY_GUARD.reset(token)
+            if self._delivery_turn is turn:
+                self._delivery_turn = None
 
     async def run_consult(
         self,
@@ -1486,6 +1567,9 @@ class ContactSession:
 
     async def stop_companion(self) -> None:
         """Stop the host worker before its journal owner can be released."""
+        self._shutting_down = True
+        if self._retrying_turn is not None:
+            self._retrying_turn.retry_wake.set()
         if self._worker is not None:
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)

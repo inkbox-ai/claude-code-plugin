@@ -171,10 +171,11 @@ def validate_connection(resource: Any, identity_id: str, meta: dict) -> None:
         raise PermissionError("Slack connection is not uniquely active for this identity and workspace")
 
 
-def send_reply(client: Any, meta: dict, text: str) -> Any:
+def send_reply(client: Any, meta: dict, text: str, *, connection_checked: bool = False) -> Any:
     if not text or len(text) > SLACK_MAX_TEXT_LENGTH or "\x00" in text:
         raise ValueError("Slack text must be 1–12000 characters without NUL characters")
-    validate_connection(slack_resource(client), str(meta.get("identity_id") or ""), meta)
+    if not connection_checked:
+        validate_connection(slack_resource(client), str(meta.get("identity_id") or ""), meta)
     coordinates = [meta["connection_id"], meta["conversation_id"], meta.get("thread_ts")]
     key = hashlib.sha256(json.dumps(
         [meta["source_event_id"], coordinates, text], separators=(",", ":")

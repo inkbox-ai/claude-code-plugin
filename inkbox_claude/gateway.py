@@ -1708,14 +1708,7 @@ class InkboxGateway:
                     store.mark(meta, "cancelled")
                     continue
                 session = self.sessions.get(item["chat_id"])
-                await session.notify_activity(mode, meta, "accepted")
-                try:
-                    await self.send_to_contact(item["chat_id"], item["reply"], mode, {**meta, "final_reply": True})
-                    store.mark(meta, "done")
-                    await session.notify_activity(mode, meta, "completed")
-                except Exception:
-                    store.mark(meta, "uncertain")
-                    await session.notify_activity(mode, meta, "failed")
+                await session.recover_reply(item["reply"], mode, meta)
             for item in pending:
                 if item["chat_id"] in blocked_chats:
                     continue
@@ -5021,16 +5014,33 @@ class InkboxGateway:
         if mode == "slack":
             from .slack import send_reply, validate_connection
             from .tools import _to_thread_drained
+            from .sessions import CHANNEL_DELIVERY_GUARD
+            from .imessage import SafeReplyPreflightError
+            from .companion import retryable_read
+            guard = CHANNEL_DELIVERY_GUARD.get()
+            if guard is not None:
+                guard()
             if not self.cfg.slack_enabled:
                 raise PermissionError("Slack is disabled")
             meta = {**meta, "identity_id": str(self._identity.id)}
-            await _to_thread_drained(validate_connection, self._inkbox.slack, str(self._identity.id), meta)
+            try:
+                await _to_thread_drained(validate_connection, self._inkbox.slack, str(self._identity.id), meta)
+            except Exception as exc:
+                if retryable_read(exc):
+                    raise SafeReplyPreflightError("Slack reply preflight is temporarily unavailable") from None
+                raise
+            if guard is not None:
+                guard()
             if meta.get("companion"):
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
                 self._companion_receiver().begin_send(chat_id)
             elif meta.get("final_reply"):
-                self._channel_store("slack").mark(meta, "sending", chat_id=chat_id)
-            await _to_thread_drained(send_reply, self._inkbox, meta, content)
+                self._channel_store("slack").begin_send(meta, chat_id)
+            def send_checked_slack():
+                if guard is not None:
+                    guard()
+                return send_reply(self._inkbox, meta, content, connection_checked=True)
+            await _to_thread_drained(send_checked_slack)
             return
         if mode == "sms":
             text = strip_markdown(content)
@@ -5066,20 +5076,39 @@ class InkboxGateway:
             if meta.get("companion"):
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
             kwargs = {"conversation_id": conversation_id, "text": text}
+            guard = None
+            if meta.get("imessage_threaded_replies") and not self.cfg.imessage_threaded_replies:
+                raise PermissionError("Native iMessage replies are disabled")
             if self.cfg.imessage_threaded_replies:
-                from .imessage import validate_reply_target
-                kwargs.update(await asyncio.to_thread(validate_reply_target, identity, meta))
+                from .imessage import validate_reply_target, SafeReplyPreflightError
+                from .sessions import CHANNEL_DELIVERY_GUARD
+                from .companion import retryable_read
+                guard = CHANNEL_DELIVERY_GUARD.get()
+                if guard is not None:
+                    guard()
+                try:
+                    kwargs.update(await asyncio.to_thread(validate_reply_target, identity, meta))
+                except Exception as exc:
+                    if retryable_read(exc):
+                        raise SafeReplyPreflightError("iMessage reply preflight is temporarily unavailable") from None
+                    raise
+                if guard is not None:
+                    guard()
                 kwargs["idempotency_key"] = "claude-imsg-" + hashlib.sha256(json.dumps([
                     self.cfg.base_url, self.cfg.identity, chat_id,
                     meta.get("imessage_event_ids") or meta.get("message_id"),
                     "final" if meta.get("final_reply") or meta.get("companion") else uuid.uuid4().hex, kwargs,
                 ], sort_keys=True).encode()).hexdigest()
                 if not meta.get("companion") and meta.get("final_reply"):
-                    self._channel_store("imessage").mark(meta, "sending", chat_id=chat_id)
+                    self._channel_store("imessage").begin_send(meta, chat_id)
             if meta.get("companion"):
                 self._companion_receiver().begin_send(chat_id)
             from .tools import _to_thread_drained
-            sent = await _to_thread_drained(identity.send_imessage, **kwargs)
+            def send_checked_imessage():
+                if guard is not None:
+                    guard()
+                return identity.send_imessage(**kwargs)
+            sent = await _to_thread_drained(send_checked_imessage)
             if self.cfg.imessage_threaded_replies:
                 self._channel_store("imessage").record_outbound(sent, meta, chat_id)
         else:  # email

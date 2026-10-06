@@ -16,6 +16,10 @@ _STATES = {"pending", "running", "reply_pending", "sending", "done", "cancelled"
 _TERMINAL = {"done", "cancelled"}
 
 
+class SafeReplyPreflightError(ConnectionError):
+    """A transient read failed before any channel send was submitted."""
+
+
 def _private_dir(name: str) -> Path:
     root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
     path = root / name
@@ -202,10 +206,23 @@ class IMessageState:
                 # A completed answer remains safely retryable until the send
                 # checkpoint; a failed read-only preflight cannot have sent it.
                 next_state = "reply_pending" if state == "uncertain" and row["state"] == "reply_pending" else state
+                if state == "cancelled" and row["state"] == "sending":
+                    next_state = "uncertain"
                 db.execute(
                     "UPDATE receipts SET meta=?,state=?,reply=?,batch_anchor=? WHERE event_id=?",
                     (_json(merged), next_state, _json(reply) if reply is not None else row["reply"], anchor, row["event_id"]),
                 )
+
+    def begin_send(self, meta: dict[str, Any], chat_id: str) -> None:
+        """Atomically reject cancelled or already-attempted final deliveries."""
+        ids = _event_ids(meta)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = [db.execute("SELECT * FROM receipts WHERE event_id=?", (event_id,)).fetchone() for event_id in ids]
+            if not rows or any(row is None or row["chat_id"] != chat_id or row["state"] != "reply_pending" for row in rows):
+                raise PermissionError("Reply receipt is no longer awaiting delivery")
+            for event_id in ids:
+                db.execute("UPDATE receipts SET state='sending' WHERE event_id=?", (event_id,))
 
     def record_outbound(self, message: Any, meta: dict[str, Any], chat_id: str) -> None:
         sent = _outbound(message)

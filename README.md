@@ -546,7 +546,11 @@ is never retried as a login refresh.
 
 Ordinary Slack/native-iMessage receipts and completed answers are persisted before
 acknowledgement or send. Companion journals, quiet context, Claude session IDs,
-and hosted-SMS reservations remain intact across upgrade. Only positively matched
+and hosted-SMS reservations remain intact across upgrade. Temporary transport
+failures positively identified before host submission or during read-only reply
+preflight retry automatically with capped backoff, keeping the original route and
+working indication. A saved answer retries delivery preparation only, not the
+model task; Stop cancels its owned retry. Only positively matched
 terminal saved answers may be reused after a host interruption. Otherwise an
 uncertain request is retained without automatic re-execution; later fresh work
 can proceed only after the old native host and side effects are fenced. An

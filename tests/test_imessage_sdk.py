@@ -228,6 +228,54 @@ def test_real_sdk_unavailable_backend_prevents_targeted_send(sdk, monkeypatch):
     assert not posts(sdk)
 
 
+@pytest.mark.parametrize("failure", ["endpoint", "source_conversation", "thread_conversation"])
+def test_native_preflight_rejects_invalid_authority_before_media_upload(sdk, monkeypatch, failure):
+    from unittest.mock import Mock
+
+    active_source(monkeypatch)
+    if failure == "endpoint":
+        sdk.thread_status = 404
+    elif failure == "source_conversation":
+        sdk.source["conversation_id"] = str(UUID(int=20))
+    else:
+        sdk.page["conversation_id"] = str(UUID(int=20))
+    upload = Mock()
+    monkeypatch.setattr("inkbox_claude.tools._upload_media_url", upload)
+    result, _ = tool(sdk, conversation_id=CONVERSATION_ID, text="Answer", media_path="must-not-read")
+    assert result["isError"]
+    upload.assert_not_called()
+    assert not posts(sdk)
+    probes = [request for request in sdk.requests if request.url.path.endswith("/thread")]
+    assert len(probes) == 1 and probes[0].url.params["limit"] == "1"
+
+
+@pytest.mark.parametrize("failure", ["endpoint", "source_conversation", "thread_conversation"])
+def test_gateway_preflight_rejection_preserves_unsent_durable_answer(sdk, failure):
+    cfg = BridgeConfig(identity="agent", base_url="https://example.com", imessage_threaded_replies=True)
+    gateway = InkboxGateway(cfg)
+    gateway._inkbox = sdk.client
+    gateway._identity = sdk.client.get_identity("agent")
+    meta = {"conversation_id": CONVERSATION_ID, "imessage_threaded_replies": True,
+            **source_metadata(sdk.source, "original")}
+    store = gateway._channel_store("imessage")
+    assert store.admit("contact", "Question", meta)
+    store.mark(meta, "reply_pending", reply="Saved answer")
+    if failure == "endpoint":
+        sdk.thread_status = 404
+    elif failure == "source_conversation":
+        sdk.source["conversation_id"] = str(UUID(int=20))
+    else:
+        sdk.page["conversation_id"] = str(UUID(int=20))
+    try:
+        with pytest.raises(Exception):
+            asyncio.run(gateway.send_to_contact("contact", "Saved answer", "imessage", meta))
+        assert store.summary()["reply_pending"] == 1
+        assert store.summary()["sending"] == 0
+        assert not posts(sdk)
+    finally:
+        store.close()
+
+
 def test_real_sdk_target_rejection_does_not_trigger_plain_resend(sdk, monkeypatch):
     active_source(monkeypatch)
     sdk.send_status = 422
