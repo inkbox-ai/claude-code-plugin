@@ -84,6 +84,23 @@ def _speech_key(text: str) -> str:
     """Compare speech ignoring ASR casing, spacing and punctuation."""
     return "".join(char for char in text.casefold() if char.isalnum())
 
+
+class _FinalAnswerMatcher:
+    """Match the unchanged expected answer across bounded final STT fragments."""
+
+    def __init__(self, expected: str):
+        self.key = _speech_key(expected)
+        self._limit = min(max(len(self.key) - 1, 0), 4096)
+        self._tail = ""
+
+    def observe(self, text: str, *, final: bool) -> bool:
+        if not final or not text.strip() or not self.key:
+            return False
+        joined = self._tail + _speech_key(text)
+        matched = self.key in joined
+        self._tail = joined[-self._limit:] if self._limit else ""
+        return matched
+
 app = FastAPI()
 
 
@@ -106,7 +123,7 @@ async def phone_media_ws(ws: WebSocket) -> None:
     loop = asyncio.get_event_loop()
     answered = asyncio.Event()        # agent said the expected answer back
     state = {"last_heard": 0.0}       # monotonic ts of the agent's most recent turn
-    answer_key = _speech_key(ANSWER_CONTAINS)
+    answer = _FinalAnswerMatcher(ANSWER_CONTAINS)
     convo: asyncio.Task | None = None
 
     async def _say(text: str) -> None:
@@ -156,12 +173,15 @@ async def phone_media_ws(ws: WebSocket) -> None:
             if kind == "start":
                 log.info("call start: %s", ev.get("stream_id"))
                 convo = asyncio.create_task(_run_turn())
-            elif kind == "transcript" and ev.get("is_final"):
+            elif kind == "transcript":
                 text = ev.get("text") or ""
-                log.info("heard (final): %s", text)
+                if not text.strip():
+                    continue
                 state["last_heard"] = loop.time()  # agent is actively talking
-                if answer_key and answer_key in _speech_key(text):
-                    answered.set()
+                if ev.get("is_final"):
+                    log.info("heard (final): %s", text)
+                    if answer.observe(text, final=True):
+                        answered.set()
             elif kind == "stop":
                 log.info("call stop: %s", ev.get("reason"))
                 break
