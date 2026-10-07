@@ -2278,7 +2278,7 @@ def _configure_autostart() -> bool:
     if prompt_yes_no("  Start it now and automatically on every boot?", True):
         if install_autostart(env_file):
             return True
-        print_warning("  Couldn't set up boot autostart — starting in the background for now.")
+        print_warning("  Couldn't set up boot autostart — checking whether a background start is available.")
         return bring_up()
 
     if prompt_yes_no("  Start it in the background now (until you reboot)?", True):
