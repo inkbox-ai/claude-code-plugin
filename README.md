@@ -123,18 +123,29 @@ On startup the bridge opens an Inkbox tunnel, wires mail/text/iMessage webhook s
 inkbox-claude run        # foreground (Ctrl+C to stop) — good for first runs and debugging
 ```
 
-Or run it as a background daemon (PID + log under `~/.inkbox-claude/`):
+Or manage a background bridge (logs and standalone PID under `~/.inkbox-claude/`):
 
 ```bash
-inkbox-claude start      # detach and run in the background
+inkbox-claude start      # start the installed service, or detach into the background
 inkbox-claude status     # is it running? where are the logs?
 inkbox-claude restart    # restart it
-inkbox-claude stop       # graceful stop (SIGTERM, then SIGKILL after 5s)
+inkbox-claude stop       # stop through the service manager or standalone PID
 
 tail -f ~/.inkbox-claude/gateway.log
 ```
 
-`start` auto-loads `.env` from the current directory, so you don't have to `source` it first. `run` is the foreground version a service manager (systemd, Docker) should supervise; `start`/`stop` are the self-contained background option.
+For standalone background runs, `start` auto-loads `.env` from the current directory.
+`run` is the foreground entry point a service manager should supervise.
+When an autostart service is installed for the current profile, `status` and startup
+checks read its state and PID from launchd or systemd; `start`, `stop`, and `restart`
+use that manager and its configured environment. A running process does not by
+itself establish that the tunnel is healthy.
+
+On macOS, `stop` unloads the launchd job so `KeepAlive` does not restart it;
+`start` loads it again. The autostart definition remains installed for the next
+login. Standalone processes continue to use the PID file and graceful stop, with
+SIGKILL after five seconds if needed. If an installed service cannot be inspected,
+commands report an error rather than launching another copy.
 
 ### Start on boot
 
@@ -461,7 +472,7 @@ on the remote connection. Hosted voice and managed speech modes are unchanged.
 
 ## Slack, native iMessage, and Vault
 
-Version **0.2.14** requires Inkbox SDK **0.7.11+**. Published SDK **0.7.14** is the
+Version **0.2.15** requires Inkbox SDK **0.7.11+**. Published SDK **0.7.14** is the
 full-feature tested version. Native iMessage requires **0.7.13+**; Slack Companion
 requires **0.7.14+**, and both require matching server capabilities.
 

@@ -1,7 +1,15 @@
 import os
 import time
 
+import pytest
+
 from inkbox_claude import cli, daemon
+
+
+@pytest.fixture(autouse=True)
+def isolated_service_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path / ".inkbox-claude"))
 
 
 def test_read_pid_none_when_no_file(tmp_path, monkeypatch):

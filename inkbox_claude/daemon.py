@@ -1,22 +1,27 @@
 """Run the bridge gateway in the foreground or as a background daemon.
 
 `inkbox-claude run` stays in the foreground (what systemd/Docker/debugging
-want). `start`/`stop`/`status`/`restart` manage a detached background
-process with a PID file and a log file under ``~/.inkbox-claude/``.
+want). `start`/`stop`/`status`/`restart` use the installed service manager or a
+standalone background process with state under ``~/.inkbox-claude/``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import platform
+import plistlib
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 try:
     from .config import read_config
@@ -50,6 +55,132 @@ def _pid_file() -> Path:
 
 def _log_file() -> Path:
     return _state_dir() / "gateway.log"
+
+
+@dataclass(frozen=True)
+class _ManagedService:
+    """Observed state of the installed user service."""
+
+    manager: Literal["launchd", "systemd"]
+    target: str
+    definition: Path
+    loaded: bool = False
+    state: str = "not loaded"
+    pid: int | None = None
+    error: str | None = None
+
+
+def _service_profile_matches(manager: str, definition: Path) -> bool:
+    """Keep a different standalone profile separate from the installed user service."""
+    home = str(Path.home() / ".inkbox-claude")
+    if manager == "launchd":
+        with definition.open("rb") as source:
+            values = plistlib.load(source)
+        home = values.get("EnvironmentVariables", {}).get("INKBOX_CLAUDE_HOME", home)
+    else:
+        for line in definition.read_text().splitlines():
+            if line.startswith("Environment="):
+                for assignment in shlex.split(line.removeprefix("Environment=")):
+                    if assignment.startswith("INKBOX_CLAUDE_HOME="):
+                        home = assignment.split("=", 1)[1].replace("%%", "%")
+    return Path(home).expanduser().resolve() == _state_dir().resolve()
+
+
+def _managed_service() -> _ManagedService | None:
+    """Inspect an installed service; distinguish an unavailable manager from a stopped job."""
+    system = platform.system()
+    if system == "Darwin":
+        manager = "launchd"
+        definition = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+        target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+        command = ["launchctl", "print", target]
+    elif system == "Linux":
+        manager = "systemd"
+        definition = Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service"
+        target = f"{SERVICE_NAME}.service"
+        command = [
+            "systemctl", "--user", "show", target,
+            "--property=LoadState,ActiveState,MainPID",
+        ]
+    else:
+        return None
+    if not definition.is_file():
+        return None
+    try:
+        if not _service_profile_matches(manager, definition):
+            return None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return _ManagedService(manager, target, definition, error="could not read service definition")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return _ManagedService(manager, target, definition, error="service manager unavailable")
+    if manager == "launchd":
+        if result.returncode != 0:
+            if "Could not find service" in result.stderr:
+                return _ManagedService(manager, target, definition)
+            return _ManagedService(manager, target, definition, error="could not inspect service")
+        # Only root-level properties describe this job, not its nested environment.
+        properties = dict(
+            line.strip().split(" = ", 1)
+            for line in result.stdout.splitlines()
+            if line.startswith("\t") and not line.startswith("\t\t") and " = " in line
+        )
+        state = properties.get("state")
+        pid_text = properties.get("pid", "0")
+        loaded = True
+    else:
+        if result.returncode != 0:
+            return _ManagedService(manager, target, definition, error="could not inspect service")
+        properties = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if properties.get("LoadState") == "not-found":
+            return _ManagedService(manager, target, definition)
+        state = properties.get("ActiveState")
+        pid_text = properties.get("MainPID", "")
+        loaded = properties.get("LoadState") == "loaded"
+    if not state or not pid_text.isdecimal():
+        return _ManagedService(manager, target, definition, error="unrecognized service status")
+    pid = int(pid_text) or None
+    return _ManagedService(manager, target, definition, loaded=loaded, state=state, pid=pid)
+
+
+def _service_error(service: _ManagedService) -> int:
+    """Report an inspection failure without starting another process."""
+    print(f"Cannot determine bridge status ({service.manager}): {service.error}.")
+    return 1
+
+
+def _control_service(service: _ManagedService, action: Literal["start", "stop", "restart"]) -> int:
+    """Ask the owning service manager to perform a bounded lifecycle operation."""
+    if service.error:
+        return _service_error(service)
+    if action == "start" and service.pid is not None:
+        print(f"Already running (pid {service.pid}, {service.manager}). Logs: {_log_file()}")
+        return 0
+    if service.manager == "systemd":
+        command = ["systemctl", "--user", action, service.target]
+    elif action == "stop":
+        if not service.loaded:
+            print("Not running (launchd).")
+            return 0
+        command = ["launchctl", "bootout", service.target]
+    elif not service.loaded:
+        command = ["launchctl", "bootstrap", service.target.rsplit("/", 1)[0], str(service.definition)]
+    else:
+        command = ["launchctl", "kickstart", *(["-k"] if action == "restart" else []), service.target]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        print(f"Could not complete {action} through {service.manager}; check inkbox-claude status.")
+        return 1
+    if result.returncode != 0:
+        print(f"Could not {action} the {service.manager} service; check its service-manager logs.")
+        return 1
+    if action == "stop":
+        print(f"Stopped ({service.manager}).")
+    else:
+        print(f"Bridge {action} requested ({service.manager}). Check: inkbox-claude status")
+    return 0
 
 
 def _exited_as_our_child(pid: int) -> bool:
@@ -157,11 +288,25 @@ def run_foreground() -> int:
 
 
 def start() -> int:
-    """Start the gateway as a detached background process.
+    """Start the installed service or a standalone background gateway.
 
     Returns:
         int: 0 on success, 1 on failure.
     """
+    service = _managed_service()
+    if service is not None:
+        if service.error:
+            return _service_error(service)
+        existing = _read_pid()
+        if service.pid is None and existing is not None:
+            print(f"Already running (pid {existing}, standalone). Logs: {_log_file()}")
+            return 0
+        return _control_service(service, "start")
+    return _start_standalone()
+
+
+def _start_standalone() -> int:
+    """Start a detached gateway when no service manager owns it."""
     if os.name != "posix":
         print("Background mode needs a POSIX system. Use `inkbox-claude run` (or a service manager).")
         return 1
@@ -222,11 +367,22 @@ def start() -> int:
 
 
 def stop() -> int:
-    """Stop the background gateway, escalating to SIGKILL if it lingers.
+    """Stop the gateway through its service manager or standalone PID.
 
     Returns:
         int: 0 on success (or already stopped), 1 if the signal failed.
     """
+    service = _managed_service()
+    if service is not None:
+        if service.error:
+            return _service_error(service)
+        if service.pid is not None or _read_pid() is None:
+            return _control_service(service, "stop")
+    return _stop_standalone()
+
+
+def _stop_standalone() -> int:
+    """Stop a standalone gateway, escalating after its graceful-stop window."""
     pid = _read_pid()
     if not pid:
         print("Not running.")
@@ -257,14 +413,17 @@ def stop() -> int:
 
 
 def running_pid() -> int | None:
-    """Return the PID of the background gateway, or None when it is not running.
-
-    Public wrapper over the PID-file probe so callers outside this module can
-    ask "is one already up?" without reaching for a private helper.
+    """Return the service-managed or standalone gateway PID when observable.
 
     Returns:
         int | None: Live background gateway PID, else None.
     """
+    service = _managed_service()
+    if service is not None:
+        if service.error:
+            return None
+        if service.pid is not None:
+            return service.pid
     return _read_pid()
 
 
@@ -274,23 +433,40 @@ def status() -> int:
     Returns:
         int: 0 if running, 1 if not.
     """
+    service = _managed_service()
+    if service is not None:
+        if service.error:
+            return _service_error(service)
+        if service.pid is not None:
+            print(f"running (pid {service.pid}, {service.manager}; {service.state})")
+            print(f"  logs: {_log_file()}")
+            return 0
     pid = _read_pid()
     if pid:
         print(f"running (pid {pid})")
         print(f"  logs: {_log_file()}")
         return 0
-    print("not running")
+    print(f"not running ({service.manager}; {service.state})" if service is not None else "not running")
     return 1
 
 
 def restart() -> int:
-    """Stop the background gateway if running, then start a fresh one.
+    """Restart the managed service or replace a standalone gateway.
 
     Returns:
         int: Exit code from :func:`start`.
     """
-    stop()
-    return start()
+    service = _managed_service()
+    if service is not None:
+        if service.error:
+            return _service_error(service)
+        if service.pid is None and _read_pid() is not None:
+            result = _stop_standalone()
+            if result != 0:
+                return result
+        return _control_service(service, "restart")
+    result = _stop_standalone()
+    return result if result != 0 else _start_standalone()
 
 
 # ----------------------------------------------------------------------
@@ -343,8 +519,9 @@ def _install_systemd_user(exe: str, env_file: str) -> bool:
         "Wants=network-online.target\n\n"
         "[Service]\n"
         "Type=simple\n"
-        f"Environment=INKBOX_CLAUDE_ENV_FILE={env_file}\n"
-        f"ExecStart={exe} run\n"
+        f"Environment={json.dumps('INKBOX_CLAUDE_ENV_FILE=' + env_file.replace('%', '%%'), ensure_ascii=False)}\n"
+        f"Environment={json.dumps('INKBOX_CLAUDE_HOME=' + str(_state_dir()).replace('%', '%%'), ensure_ascii=False)}\n"
+        f"ExecStart={json.dumps(exe.replace('%', '%%'), ensure_ascii=False)} run\n"
         "Restart=on-failure\n"
         "RestartSec=5\n\n"
         "[Install]\n"
@@ -354,7 +531,7 @@ def _install_systemd_user(exe: str, env_file: str) -> bool:
 
     # systemd will own the gateway now — stop any fork-based one first.
     if _read_pid():
-        stop()
+        _stop_standalone()
 
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
@@ -434,7 +611,7 @@ def uninstall(purge: bool = False) -> int:
 
     # 1. Stop a running background gateway.
     if _read_pid():
-        stop()
+        _stop_standalone()
 
     # 2. Remove the boot/login service.
     if not uninstall_autostart():
@@ -475,25 +652,22 @@ def _install_launchd(exe: str, env_file: str) -> bool:
     plist_dir.mkdir(parents=True, exist_ok=True)
     plist = plist_dir / f"{LAUNCHD_LABEL}.plist"
     log = _log_file()
-    plist.write_text(
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0">\n<dict>\n'
-        f"  <key>Label</key><string>{LAUNCHD_LABEL}</string>\n"
-        "  <key>ProgramArguments</key>\n"
-        f"  <array><string>{exe}</string><string>run</string></array>\n"
-        "  <key>EnvironmentVariables</key>\n"
-        f"  <dict><key>INKBOX_CLAUDE_ENV_FILE</key><string>{env_file}</string></dict>\n"
-        "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n"
-        f"  <key>StandardOutPath</key><string>{log}</string>\n"
-        f"  <key>StandardErrorPath</key><string>{log}</string>\n"
-        "</dict>\n</plist>\n"
-    )
+    plist.write_bytes(plistlib.dumps({
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [exe, "run"],
+        "EnvironmentVariables": {
+            "INKBOX_CLAUDE_ENV_FILE": env_file,
+            "INKBOX_CLAUDE_HOME": str(_state_dir()),
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    }))
     print(f"  Wrote {plist}")
 
     if _read_pid():
-        stop()
+        _stop_standalone()
     subprocess.run(["launchctl", "unload", str(plist)], capture_output=True, text=True)
     loaded = subprocess.run(["launchctl", "load", "-w", str(plist)], capture_output=True, text=True)
     if loaded.returncode == 0:

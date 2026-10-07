@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.15
+
+### Fixed
+
+- Detect bridge processes managed by launchd or systemd in `status` and startup checks.
+- Route `start`, `stop`, and `restart` through the installed service manager, while
+  retaining standalone background-process support.
+- Preserve the configured state directory when installing an autostart service.
+
 ## 0.2.14
 
 ### Added
