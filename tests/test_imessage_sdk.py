@@ -142,9 +142,10 @@ def test_real_sdk_bridge_selected_target_policy_identity_and_key_reach_wire(sdk,
     reads = [request for request in sdk.requests if "/imessage/" in request.url.path and request.method == "GET"]
     assert [request.url.path for request in reads] == [
         f"/api/v1/imessage/messages/{SOURCE_ID}", f"/api/v1/imessage/messages/{SOURCE_ID}/thread",
+        f"/api/v1/imessage/messages/{OUTBOUND_ID}",
     ]
     assert all(request.url.params["agent_identity_id"] == IDENTITY_ID for request in reads)
-    assert reads[-1].url.params["limit"] == "1"
+    assert reads[1].url.params["limit"] == "1"
     assert payload["id"] == OUTBOUND_ID
     assert payload["status"] == "pending"
     assert payload["reply_to_message_id"] is None
@@ -297,7 +298,9 @@ def test_real_sdk_flag_off_keeps_ordinary_tool_wire_shape(sdk, monkeypatch):
     assert not result.get("isError"), payload
     assert json.loads(posts(sdk)[0].content) == {"conversation_id": CONVERSATION_ID, "text": "Answer"}
     assert not [request for request in sdk.requests if request.url.path.endswith("/thread")]
-    assert payload == {"sent": True, "id": OUTBOUND_ID}
+    assert payload["sent"] is True and payload["id"] == OUTBOUND_ID
+    assert payload["delivery_final"] is False
+    assert payload["service"] is None
 
 
 def test_real_sdk_gateway_routes_and_correlates_native_queued_reply(sdk):
@@ -342,7 +345,7 @@ def test_deliberate_separate_send_has_no_inherited_source_or_answer_suppression(
         expected["to"] = expected["to"][0]
     assert body == expected
     assert session._imessage_tool_outputs == []
-    assert not [request for request in sdk.requests if "/imessage/" in request.url.path and request.method == "GET"]
+    assert [request.url.path for request in sdk.requests if "/imessage/" in request.url.path and request.method == "GET"] == [f"/api/v1/imessage/messages/{OUTBOUND_ID}"]
     assert posts(sdk)[0].url.params["agent_identity_id"] == IDENTITY_ID
 
 
