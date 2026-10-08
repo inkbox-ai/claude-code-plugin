@@ -27,6 +27,7 @@ def test_sdk_exports_every_symbol_the_bridge_imports():
         PermissionResultDeny,
         ResultMessage,
         TextBlock,
+        ToolUseBlock,
         create_sdk_mcp_server,
         tool,
     )

@@ -461,11 +461,22 @@ on the remote connection. Hosted voice and managed speech modes are unchanged.
 
 ## Slack, native iMessage, and Vault
 
-Version **0.2.14** requires Inkbox SDK **0.7.11+**. Published SDK **0.7.14** is the
-full-feature tested version. Native iMessage requires **0.7.13+**; Slack Companion
-requires **0.7.14+**, and both require matching server capabilities.
+The bridge requires Inkbox SDK **0.7.15+**. Native iMessage and Slack Companion
+also require matching server capabilities. Native Slack task streams are optional
+and require an SDK exposing the complete task-stream interface (**0.7.16+**).
 
 ### Slack
+
+For a requested image or file, the agent can use `inkbox_slack_upload_file` with a
+local file of 1 byte–10 MiB. A Markdown image or local path alone does not upload
+a file. Uploads preserve the supplied conversation and thread; uncertain results
+must be inspected with `inkbox_slack_get_operation`, not resent.
+
+Slack replies use channel-specific mrkdwn guidance. While tools run, concise
+progress appears as a native task card when supported, or as one ordinary message
+edited in place. Inline DMs remain inline. Progress never includes tool arguments,
+local paths, or worker identifiers, and stops updating when the original turn ends.
+An unconfirmed write never causes a second progress message or blind replay.
 
 Run `inkbox-claude setup` to opt in, select or configure a saved workspace, prepare
 its agent app, open the installation link, and wait for a confirmed connection.
@@ -486,12 +497,13 @@ requires current direct admission. These independent settings compose. Quiet
 messages remain context without starting tools, generation, or a work indicator.
 
 Inline replies use 👀 while working and ❌ on failure. Native subthreads use Slack's
-working/awaiting-input status only, without reaction fallback. The connection must
+working/awaiting-input status, without reaction fallback. Tool progress is shown
+separately as task cards or one edited message. The connection must
 support the relevant Slack API capability. API success alone cannot verify the
 indicator's appearance in a particular Slack client.
 
-The six Slack tools support connections, conversations, bounded message history,
-retained-text search, explicit sends, and action lookup. Attachment references are
+The Slack tools support connections, conversations, bounded message history,
+retained-text search, explicit sends, file uploads, and action/operation lookup. Attachment references are
 metadata, not downloaded files. Explicit sends require a stable idempotency key;
 inspect an uncertain action instead of sending it again. Disabling Slack blocks
 its tools, new input, recovered work, and automatic delivery.

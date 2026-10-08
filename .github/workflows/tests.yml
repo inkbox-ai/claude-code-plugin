@@ -29,7 +29,7 @@ jobs:
           version: "latest"
 
       - name: Install test deps
-        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "psutil>=5.9,<8" "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox==0.7.14"
+        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "psutil>=5.9,<8" "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox==0.7.15"
 
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.
@@ -61,8 +61,8 @@ jobs:
       - name: Install bridge + latest SDK
         run: |
           tests/ci/retry_install.sh uv pip install --system \
-            "inkbox==0.7.14" \
-            -e . "inkbox==0.7.14" pytest
+            "inkbox==0.7.15" \
+            -e . "inkbox==0.7.15" pytest
           tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 
       - name: Install latest Claude Code CLI
@@ -76,7 +76,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        sdk: ["0.7.11", "0.7.13"]
+        sdk: ["0.7.15"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -88,7 +88,6 @@ jobs:
       - name: Base SDK contracts
         run: pytest -q tests/test_tools.py tests/test_slack.py tests/test_vault_tools.py tests/test_group_routes.py
       - name: Native iMessage SDK contract
-        if: matrix.sdk == '0.7.13'
         run: |
           python -c 'from inkbox.agent_identity import AgentIdentity; from inkbox_claude.config import imessage_threading_capability; assert imessage_threading_capability(AgentIdentity)[0]'
           pytest -q tests/test_imessage_sdk.py

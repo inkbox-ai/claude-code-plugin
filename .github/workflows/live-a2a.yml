@@ -72,7 +72,7 @@ jobs:
           version: "latest"
 
       - name: Install bridge and protocol driver
-        run: tests/ci/retry_install.sh uv pip install --system -e . "inkbox==0.7.14"
+        run: tests/ci/retry_install.sh uv pip install --system -e . "inkbox==0.7.15"
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code

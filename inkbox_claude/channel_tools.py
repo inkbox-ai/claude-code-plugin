@@ -17,6 +17,18 @@ def build_channel_tools(client, identity_handle, cfg):
             if set(args) - set(properties):
                 return _error("Unsupported tool arguments")
             try:
+                if name == "inkbox_slack_upload_file":
+                    session = CURRENT_SESSION.get()
+                    owner = getattr(session, "_current_turn", None)
+                    generation = getattr(session, "_client_generation", None)
+                    def authorize():
+                        if session is not None and (
+                                owner is None or session._current_turn is not owner or not session._turn_active
+                                or session._interrupting or owner.cancelled
+                                or session._client_generation != generation):
+                            raise ValueError("The originating turn has ended")
+                    authorize()
+                    return _result(await _to_thread_drained(operation, args, authorize))
                 return _result(await _to_thread_drained(operation, args))
             except Exception as exc:
                 # Classify failures without exposing provider bodies or credentials.
@@ -39,10 +51,13 @@ def build_channel_tools(client, identity_handle, cfg):
 
     if cfg.slack_enabled:
         for spec in SLACK_TOOLS:
-            def slack(args, name=spec["name"]):
+            def slack(args, authorize=None, name=spec["name"]):
                 if not cfg.slack_enabled:
                     raise ValueError("Slack is disabled")
-                return run_tool(client, identity_handle, name, args)
+                if authorize is not None:
+                    authorize()
+                return run_tool(client, identity_handle, name, args,
+                                local_root=cfg.project_dir, authorize=authorize)
             schema = spec["inputSchema"]
             register(spec["name"], spec["description"], schema["properties"], schema["required"], slack)
 
