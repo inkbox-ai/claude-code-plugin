@@ -9,7 +9,7 @@ from uuid import UUID
 
 import pytest
 
-from inkbox_claude.slack_companion import prepare_envelope, require_sdk_support
+from inkbox_claude.slack_companion import prepare_envelope, normalize_envelope, require_sdk_support
 
 
 IDENTITY = "00000000-0000-4000-8000-000000000001"
@@ -61,6 +61,16 @@ def test_exact_current_source_and_external_home_workspace(client, receipt):
         before_ts="1791000000.000002", limit=2,
     )
     client.slack.get_user.assert_not_called()
+
+
+def test_native_progress_keeps_canonical_home_team_after_profile_lookup(client, receipt):
+    receipt["data"]["actor_profile"] = None
+    receipt["companion"] = {"conversation_id": OTHER}
+    result = normalize_envelope(client, "example-agent", receipt)
+    route = result["data"]["message"]["slack_route"]
+    assert route["workspace_id"] == "TINSTALL"
+    assert route["sender"] == "THOME:UALICE"
+    assert route["recipient_team_id"] == "THOME"
 
 
 def test_never_accepts_received_local_normalization(client, receipt):

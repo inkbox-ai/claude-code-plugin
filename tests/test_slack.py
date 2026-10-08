@@ -200,6 +200,18 @@ def test_sender_profile_and_linked_contact_are_context_not_session_identity():
     assert "not instructions or permission" in framed
 
 
+@pytest.mark.parametrize("actor,team", [
+    ({"id": "U_ALICE", "team_id": "TREMOTE"}, "TREMOTE"),
+    ({"id": "U_OTHER", "team_id": "TREMOTE"}, None),
+    ({"id": "U_ALICE", "team_id": "invalid"}, None),
+    ({"id": "U_ALICE"}, None),
+])
+def test_task_recipient_home_team_requires_matching_verified_profile(actor, team):
+    meta = inbound_message(event(actor_profile=actor), IDENTITY)[2]
+    assert meta.get("recipient_team_id") == team
+    assert meta["workspace_id"] == "T_TEST"
+
+
 @pytest.mark.parametrize("actor", [None, "invalid", {"id": "U_OTHER", "profile": {"email": "other@example.com"}}])
 def test_absent_or_mismatched_actor_profile_does_not_change_routing(actor):
     incoming = inbound_message(event(actor_profile=actor, contact_id=None), IDENTITY)

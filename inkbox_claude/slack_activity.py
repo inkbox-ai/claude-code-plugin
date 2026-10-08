@@ -9,6 +9,9 @@ import logging
 from pathlib import Path
 from uuid import uuid4
 
+from .slack_progress import SlackProgress
+from .slack_streams import tool_progress
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,6 +20,8 @@ class SlackActivity:
         self.resource = resource
         self.validate_route = validate_route
         self.state_path = state_path
+        self._progress = SlackProgress(resource, state_path.with_suffix(".progress.json"),
+                                       validate_route=validate_route)
         self._active: dict[str, dict[str, str]] = {}
         self._records: dict[str, dict] = {}
         self._tails: dict[str, asyncio.Task] = {}
@@ -36,6 +41,7 @@ class SlackActivity:
             logger.warning("Slack activity state could not be saved")
 
     async def recover(self) -> None:
+        await self._progress.recover()
         if not self._supported:
             logger.warning("Slack native status needs an SDK with processing-status support")
         try:
@@ -77,6 +83,10 @@ class SlackActivity:
     async def notify(self, _chat_id: str, mode: str, meta: dict, state: str) -> None:
         if mode != "slack" or self._closing:
             return
+        if state.startswith("tool:"):
+            await self._progress.progress(_chat_id, meta, tool_progress(state[5:]))
+            return
+        await self._progress.notify(_chat_id, meta, state)
         native = bool(meta.get("thread_ts"))
         if native:
             if not self._supported:
@@ -198,12 +208,14 @@ class SlackActivity:
             self._persist()
 
     async def flush(self) -> None:
+        await self._progress.flush()
         while self._tails:
             await asyncio.gather(*list(self._tails.values()), return_exceptions=True)
             # An already-complete gather need not yield to the tail-cleanup callbacks.
             await asyncio.sleep(0)
 
     async def close(self) -> None:
+        await self._progress.close()
         self._closing = True
         for key in self._active:
             record = self._records.get(key)
@@ -215,3 +227,9 @@ class SlackActivity:
             await asyncio.wait_for(self.flush(), timeout=5)
         except asyncio.TimeoutError:
             logger.warning("Slack activity cleanup is deferred until the next gateway start")
+
+    async def progress(self, chat_id, meta, content):
+        return await self._progress.progress(chat_id, meta, content)
+
+    def has_chat(self, chat_id):
+        return self._progress.has_chat(chat_id)

@@ -47,12 +47,13 @@ try:
         PermissionResultDeny,
         ResultMessage,
         TextBlock,
+        ToolUseBlock,
     )
 
     CLAUDE_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover - doctor reports this cleanly
     AssistantMessage = ClaudeAgentOptions = ClaudeSDKClient = HookMatcher = None  # type: ignore
-    PermissionResultAllow = PermissionResultDeny = ResultMessage = TextBlock = None  # type: ignore
+    PermissionResultAllow = PermissionResultDeny = ResultMessage = TextBlock = ToolUseBlock = None  # type: ignore
     CLAUDE_SDK_AVAILABLE = False
 
 try:
@@ -1043,7 +1044,11 @@ class ContactSession:
         _tool_use_id: Optional[str],
         _context: Any,
     ) -> Dict[str, Any]:
-        """Capture only a normalized tool name for an active A2A worker turn."""
+        """Observe A2A activity without giving delegated uploads a later turn's owner."""
+        if (str(hook_input.get("tool_name") or "").removeprefix("mcp__inkbox__") == "inkbox_slack_upload_file"
+                and hook_input.get("agent_id")):
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": "Return the file to the originating conversation for upload."}}
         turn = self._current_turn
         a2a_context = turn.a2a_context if turn is not None else None
         if isinstance(a2a_context, dict):
@@ -1194,6 +1199,12 @@ class ContactSession:
                             for block in message.content:
                                 if isinstance(block, TextBlock):
                                     chunks.append(block.text)
+                                elif (isinstance(block, ToolUseBlock) and turn.mode == "slack"
+                                        and turn.future is None and self._current_turn is turn
+                                        and not getattr(message, "parent_tool_use_id", None)
+                                        and not self._interrupting and not turn.cancelled):
+                                    await self.notify_activity("slack", turn.reply_meta or {},
+                                                               "tool:" + block.name)
                         elif isinstance(message, ResultMessage):
                             if turn.checkpoint is not None:
                                 completed = not message.is_error and message.subtype == "success"

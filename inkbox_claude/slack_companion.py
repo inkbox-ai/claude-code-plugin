@@ -159,7 +159,8 @@ def normalize_envelope(client: Any, identity_handle: str, envelope: dict) -> dic
         raise ValueError("Invalid Slack Companion message")
     _, body, route = incoming
     source = prepared["_claude_slack_source"]
-    route.update(sender=source["author"], thread_ts=source["thread_ts"], slack_bot_user_id=source["bot_user_id"])
+    route.update(sender=source["author"], thread_ts=source["thread_ts"], slack_bot_user_id=source["bot_user_id"],
+                 recipient_team_id=source["author"].partition(":")[0])
     scope = prepared["companion"]
     result = deepcopy(prepared)
     result["data"] = {"message": {
