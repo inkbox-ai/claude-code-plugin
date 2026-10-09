@@ -519,3 +519,15 @@ def test_budget_expires_after_ttl():
     prompts = _consults(gw, "contact-123")
     assert len(prompts) == 2
     assert f"attempt=1/{MAX}" in prompts[1]
+
+
+def test_inline_failure_counts_once_without_retry_wakeup(monkeypatch, tmp_path):
+    from inkbox_claude import send_outcome
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    gw = _gw()
+    envelope = _delivery_failed_envelope()
+    send_outcome._mark(envelope["data"]["text_message"]["id"], "inline")
+    _run(gw, gw._on_text_delivery_failed(envelope, "text.delivery_failed"))
+    _run(gw, gw._on_text_delivery_failed(envelope, "text.delivery_failed"))
+    assert not _consults(gw, "contact-123")
+    assert max(row["attempts"] for row in gw._outbound_failure_state.values()) == 1

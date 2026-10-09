@@ -20,6 +20,8 @@ The bridge's runtime core:
 
 from __future__ import annotations
 
+from .send_outcome import reported_inline
+
 import asyncio
 import hashlib
 import json
@@ -3106,6 +3108,7 @@ class InkboxGateway:
         error_code: Optional[str],
         error_detail: Optional[str],
         stage: str,
+        reported_inline_id: str = "",
         contact: Optional[Dict[str, Any]] = None,
         reply_meta: Optional[Dict[str, Any]] = None,
     ) -> "web.Response":
@@ -3132,6 +3135,8 @@ class InkboxGateway:
             )
             return web.json_response({"ok": True, "ignored": "unkeyable"})
         attempts = self._record_outbound_failure(keys)
+        if await reported_inline(reported_inline_id):
+            return web.json_response({"ok": True, "reported_inline": True})
         if attempts >= OUTBOUND_FAILURE_MAX_ATTEMPTS:
             logger.error(
                 "[bridge] outbound %s to %s failed %d/%d times (%s %s) — retry budget "
@@ -3323,6 +3328,7 @@ class InkboxGateway:
             error_code=error_code or None,
             error_detail=reason or event_type,
             stage="delivery_failed",
+            reported_inline_id=message_id,
         )
 
     def _retain_imessage_failure_notices(self):
@@ -3386,6 +3392,7 @@ class InkboxGateway:
             error_code=error_code or None,
             error_detail=reason,
             stage="delivery_failed",
+            reported_inline_id=message_id,
         )
 
     async def _on_mail_delivery_failed(self, envelope: Dict[str, Any], event_type: str) -> "web.Response":

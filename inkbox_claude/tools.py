@@ -7,6 +7,8 @@ is pushed onto a thread.
 
 from __future__ import annotations
 
+from .send_outcome import poll_send_outcome
+
 import asyncio
 import dataclasses
 import json
@@ -499,7 +501,8 @@ def build_inkbox_mcp_server(
             if urls:
                 kwargs["media_urls"] = urls
             msg = identity.send_text(**kwargs)
-            return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls)}
+            return {"sent": True, "id": str(getattr(msg, "id", "")), "media": len(urls),
+                    **poll_send_outcome(client, identity, "sms", msg)}
 
         try:
             result = await asyncio.to_thread(_run)
@@ -607,6 +610,7 @@ def build_inkbox_mcp_server(
             if cfg.imessage_threaded_replies:
                 result.update({key: _json_safe(getattr(msg, key, None)) for key in
                     ("status", "reply_to_message_id", "thread_id", "thread_root_message_id")})
+            result.update(poll_send_outcome(client, identity, "imessage", msg, group=len(to_list or []) > 1))
             return result
 
         try:
