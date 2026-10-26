@@ -7,6 +7,7 @@ SDKs that predate ``set_incoming_call_action``.
 
 import types
 
+from inkbox_claude.whatsapp import EVENTS as WHATSAPP_EVENTS
 from inkbox_claude import gateway
 from inkbox_claude.config import BridgeConfig, VoiceStack
 
@@ -175,7 +176,8 @@ def test_a2a_subscription_falls_back_to_imessage_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert subscriptions.created[-1]["event_types"] == gateway.IMESSAGE_EVENTS
+    assert subscriptions.created[-2]["event_types"] == gateway.IMESSAGE_EVENTS
+    assert subscriptions.created[-1]["event_types"] == WHATSAPP_EVENTS
 
 
 def test_a2a_and_imessage_use_channel_coherent_subscriptions():
@@ -189,8 +191,10 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
         gateway.A2A_EVENTS,
         gateway.CALL_EVENTS,
         gateway.IMESSAGE_EVENTS,
+        WHATSAPP_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.example/webhook",
         "https://agent.example/webhook",
         "https://agent.example/webhook",
         "https://agent.example/webhook",
@@ -213,6 +217,7 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
     assert [created["event_types"] for created in subscriptions.created] == [
         gateway.CALL_EVENTS,
         gateway.IMESSAGE_EVENTS,
+        WHATSAPP_EVENTS,
     ]
 
 
@@ -223,4 +228,15 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert [created["event_types"] for created in subscriptions.created] == [gateway.CALL_EVENTS]
+    assert [created["event_types"] for created in subscriptions.created] == [gateway.CALL_EVENTS, WHATSAPP_EVENTS]
+
+
+def test_old_api_rejecting_whatsapp_keeps_other_subscriptions():
+    class OlderAPI(_FakeSubscriptions):
+        def create(self, **kwargs):
+            if any(event.startswith("whatsapp.") for event in kwargs["event_types"]):
+                raise ValueError("Unknown WhatsApp event prefix")
+            return super().create(**kwargs)
+    subscriptions = OlderAPI()
+    _patched_gateway(_Identity(phone=None, imessage_enabled=True), subscriptions=subscriptions)
+    assert [item["event_types"] for item in subscriptions.created] == [gateway.A2A_EVENTS, gateway.CALL_EVENTS, gateway.IMESSAGE_EVENTS]

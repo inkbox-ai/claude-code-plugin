@@ -265,6 +265,9 @@ def test_coding_agent_tool_tier_is_registered():
         "inkbox_a2a_fail",
     }
 
+    expected.update({"inkbox_lookup_whatsapp_send", "inkbox_send_whatsapp", "inkbox_list_whatsapp_conversations", "inkbox_get_whatsapp_conversation",
+                     "inkbox_list_whatsapp_messages", "inkbox_get_whatsapp_message", "inkbox_upload_whatsapp_media",
+                     "inkbox_get_whatsapp_media", "inkbox_mark_whatsapp_read", "inkbox_get_whatsapp_status"})
     expected.update({"inkbox_list_vault_secrets", "inkbox_get_vault_secret", "inkbox_get_totp_code"})
     assert set(tools) == expected
     assert set(tool_names) == {f"mcp__inkbox__{name}" for name in expected}

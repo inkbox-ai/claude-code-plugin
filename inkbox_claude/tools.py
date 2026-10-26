@@ -388,6 +388,8 @@ def build_inkbox_mcp_server(
                 "email": getattr(mailbox, "email_address", None),
                 "phone": dedicated_number,
                 "imessage_enabled": imessage_enabled,
+                "whatsapp_enabled": bool(getattr(identity, "whatsapp_enabled", False)),
+                "whatsapp_number": getattr(identity, "whatsapp_number", None),
                 "lines": {
                     "dedicated_phone_line": dedicated_number or "(none provisioned)",
                     "dedicated_phone_line_note": (

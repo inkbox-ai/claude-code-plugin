@@ -29,7 +29,7 @@ jobs:
           version: "latest"
 
       - name: Install test deps
-        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "psutil>=5.9,<8" "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox==0.7.15"
+        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "psutil>=5.9,<8" "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "$(tests/ci/candidate_sdk.sh)"
 
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.
@@ -61,8 +61,8 @@ jobs:
       - name: Install bridge + latest SDK
         run: |
           tests/ci/retry_install.sh uv pip install --system \
-            "inkbox==0.7.15" \
-            -e . "inkbox==0.7.15" pytest
+            "$(tests/ci/candidate_sdk.sh)" \
+            -e . "$(tests/ci/candidate_sdk.sh)" pytest
           tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 
       - name: Install latest Claude Code CLI
@@ -71,7 +71,7 @@ jobs:
       - name: Contract tests vs latest host
         run: pytest -q tests/contract
 
-  sdk-minimums:
+  historical-base-sdk:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     strategy:
@@ -83,8 +83,10 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v8.1.0
-      - name: Install published SDK minimum
-        run: tests/ci/retry_install.sh uv pip install --system -e . pytest "inkbox==${{ matrix.sdk }}"
+      - name: Install historical base-channel fixture (not a current installation floor)
+        run: |
+          tests/ci/retry_install.sh uv pip install --system --no-deps -e .
+          tests/ci/retry_install.sh uv pip install --system pytest aiohttp segno "psutil>=5.9,<8" claude-agent-sdk "audioop-lts>=0.2.1; python_version >= '3.13'" "inkbox==${{ matrix.sdk }}"
       - name: Base SDK contracts
         run: pytest -q tests/test_tools.py tests/test_slack.py tests/test_vault_tools.py tests/test_group_routes.py
       - name: Native iMessage SDK contract

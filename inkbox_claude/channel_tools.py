@@ -17,7 +17,7 @@ def build_channel_tools(client, identity_handle, cfg):
             if set(args) - set(properties):
                 return _error("Unsupported tool arguments")
             try:
-                if name == "inkbox_slack_upload_file":
+                if name == "inkbox_slack_upload_file" or "_whatsapp" in name:
                     session = CURRENT_SESSION.get()
                     owner = getattr(session, "_current_turn", None)
                     generation = getattr(session, "_client_generation", None)
@@ -35,7 +35,8 @@ def build_channel_tools(client, identity_handle, cfg):
                 message = "Operation unavailable. Check access and local configuration."
                 safe = ("Vault is locked", "secret_id must be a UUID", "only login", "no TOTP",
                         "No vault key matched", "not been initialized", "timed out",
-                        "The originating turn has ended", "originating conversation", "supplied Companion history")
+                        "The originating turn has ended", "originating conversation", "supplied Companion history",
+                        "WhatsApp requires Inkbox SDK 0.7.21 or newer")
                 for marker in safe:
                     if marker.lower() in str(exc).lower():
                         message = marker
@@ -43,11 +44,19 @@ def build_channel_tools(client, identity_handle, cfg):
                 if message == "Vault is locked":
                     message = "Vault is locked. Set INKBOX_CLAUDE_VAULT_KEY locally and restart. Never send the key in chat."
                 status = getattr(exc, "status_code", None)
-                return _error(message, **({"status_code": status} if isinstance(status, int) else {}))
+                recovery = {}
+                if "_whatsapp" in name:
+                    key = getattr(exc, "idempotency_key", None)
+                    if key:
+                        recovery = {"idempotency_key": key, "recovery": "Read message/send lookup state; do not send a new copy."}
+                return _error(message, **({"status_code": status} if isinstance(status, int) else {}), **recovery)
         registered.append(tool(name, description, {
             "type": "object", "properties": properties, "required": required,
             "additionalProperties": False,
         })(handler))
+
+    from .whatsapp import register_tools as register_whatsapp_tools
+    register_whatsapp_tools(register, client, identity_handle, cfg)
 
     if cfg.slack_enabled:
         for spec in SLACK_TOOLS:

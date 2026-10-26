@@ -297,6 +297,10 @@ def frame_inbound(mode: str, meta: Dict[str, Any], text: str) -> str:
         conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""
         label = "group_sms" if meta.get("conversation_kind") == "group" else "sms"
         header = f"[inkbox:{label}{from_part}{conversation_part} | {marker}]"
+    elif mode == "whatsapp":
+        conversation_id = str(meta.get("conversation_id") or "")
+        header = f"[inkbox:whatsapp{from_part} conversation_id={conversation_id} | {marker}]"
+        header += "\nYour normal final response is sent here automatically. Keep it under 4,000 characters. Do not also send it with a tool. WhatsApp supports no groups, reactions, quoted replies, typing, or voice calls."
     elif mode == "imessage":
         conversation_id = str(meta.get("conversation_id") or "").strip()
         conversation_part = f" conversation_id={conversation_id}" if conversation_id else ""

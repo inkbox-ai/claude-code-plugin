@@ -475,6 +475,9 @@ class ContactSession:
         command = None if meta.get("reaction") else _control_command(raw_text)
         is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
+        if pending_reply and (mode == "whatsapp" or self.pending.route.get("channel") == "whatsapp"):
+            pending_reply = mode == self.pending.route.get("channel") and all(
+                meta.get(k) == self.pending.route.get(k) for k in ("conversation_id", "sender"))
         if pending_reply and mode == "slack":
             pending_reply = all(meta.get(k) == self.pending.route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id"))
         if pending_reply:
@@ -499,6 +502,12 @@ class ContactSession:
             return
 
         control_turn = self._current_turn or self._delivery_turn or self._retrying_turn
+        if command and control_turn is not None and (mode == "whatsapp" or control_turn.mode == "whatsapp"):
+            route = control_turn.reply_meta or {}
+            if mode != control_turn.mode or any(meta.get(k) != route.get(k) for k in ("conversation_id", "sender")):
+                self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or ""))
+                await self.receipt(mode, meta, "done")
+                return
         if command and mode == "slack" and control_turn is not None:
             route = control_turn.reply_meta or {}
             if any(meta.get(k) != route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id")):
@@ -531,7 +540,7 @@ class ContactSession:
         # delivery-failure recovery) runs to completion and this message just
         # queues behind it.
         running_normal = self._current_turn is not None and self._current_turn.future is None
-        if self._turn_active and self._client is not None and running_normal and not self._interrupting and not (mode == "imessage" and self.cfg.imessage_threaded_replies):
+        if self._turn_active and self._client is not None and running_normal and not self._interrupting and not (mode == "whatsapp" or (mode == "imessage" and self.cfg.imessage_threaded_replies)):
             logger.info("[session %s] new message interrupts the running turn", self.chat_id)
             self._interrupting = True
             try:
@@ -598,7 +607,7 @@ class ContactSession:
 
     async def _batch(self, turn):
         meta = turn.reply_meta or {}
-        if (turn.mode != "imessage" or not self.cfg.imessage_threaded_replies or turn.checkpoint or turn.saved_reply is not None
+        if (not (turn.mode == "whatsapp" or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)) or turn.checkpoint or turn.saved_reply is not None
                 or turn.future or meta.get("companion") or meta.get("media") or meta.get("reaction")):
             return turn
         deadline = turn.queued_at + 2.0
@@ -614,7 +623,7 @@ class ContactSession:
             other = self._queue.get_nowait()
             ometa = other.reply_meta or {}
             from .imessage import compatible_key
-            if (other.mode != "imessage" or other.future or other.checkpoint or other.saved_reply is not None or ometa.get("companion")
+            if (other.mode != turn.mode or other.future or other.checkpoint or other.saved_reply is not None or ometa.get("companion")
                     or ometa.get("media") or ometa.get("reaction") or other.queued_at > deadline
                     or turn.burst_source_count + other.burst_source_count > 8
                     or (turn.burst_text_chars or len(turn.text)) + (other.burst_text_chars or len(other.text)) + 2 > 4000
@@ -655,7 +664,7 @@ class ContactSession:
                 from .companion import retryable_read
                 from .imessage import SafeReplyPreflightError
                 ordinary_channel = (turn.checkpoint is None and turn.future is None
-                    and (turn.mode == "slack" or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)))
+                    and (turn.mode in {"slack", "whatsapp"} or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)))
                 safe_start = (ordinary_channel and turn.saved_reply is None and not turn.submitted and not turn.execution_observed
                               and retryable_read(exc))
                 safe_reply = (ordinary_channel and turn.saved_reply is not None
@@ -796,7 +805,7 @@ class ContactSession:
         )
         reply_mode, _ = self._reply_route()
         try:
-            await self._abort_in_flight(only_mode="imessage" if reply_mode == "imessage" and self.cfg.imessage_threaded_replies else None)
+            await self._abort_in_flight(only_mode=reply_mode if reply_mode == "whatsapp" or (reply_mode == "imessage" and self.cfg.imessage_threaded_replies) else None)
         except Exception:
             if not getattr(self, "_execution_blocked", False) and not self._pending_fenced_owners:
                 raise
@@ -1026,7 +1035,7 @@ class ContactSession:
                 (conversation_id and target == conversation_id)
                 or (target and current and self._phone_key(target) == self._phone_key(current))
             )
-        elif self.mode == "imessage":
+        elif self.mode in {"imessage", "whatsapp"}:
             conversation_id = str(self.reply_meta.get("conversation_id") or "").strip()
             matched = bool(conversation_id and target == conversation_id)
 
@@ -1369,7 +1378,7 @@ class ContactSession:
             await self.send_fn(self.chat_id, reply, mode, {**meta, "final_reply": True})
             await self.receipt(mode, meta, "done")
         except Exception as exc:
-            if mode == "slack" or (mode == "imessage" and self.cfg.imessage_threaded_replies):
+            if mode in {"slack", "whatsapp"} or (mode == "imessage" and self.cfg.imessage_threaded_replies):
                 raise
             logger.warning("Reply send rejected (%s)", type(exc).__name__)
             if self.on_send_rejected is not None:

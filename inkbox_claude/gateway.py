@@ -1081,6 +1081,13 @@ class InkboxGateway:
         _reconcile({"agent_identity_id": identity.id}, CALL_EVENTS)
         if getattr(identity, "imessage_enabled", False):
             _reconcile({"agent_identity_id": identity.id}, IMESSAGE_EVENTS)
+        from .whatsapp import EVENTS as WHATSAPP_EVENTS, unsupported
+        try:
+            _reconcile({"agent_identity_id": identity.id}, WHATSAPP_EVENTS)
+        except Exception as exc:
+            if not unsupported(exc):
+                raise
+            logger.warning("WhatsApp notifications are unavailable; other channels remain active")
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     def _read_hosted_call_registry(self) -> Dict[str, Any]:
@@ -1676,7 +1683,7 @@ class InkboxGateway:
         return self._channel_stores[mode]
 
     async def _channel_receipt(self, chat_id, mode, meta, state, text=None):
-        if meta.get("companion") or not (mode == "slack" or (mode == "imessage" and self.cfg.imessage_threaded_replies)):
+        if meta.get("companion") or not (mode in {"slack", "whatsapp"} or (mode == "imessage" and self.cfg.imessage_threaded_replies)):
             return
         if state == "running":
             from .runtime import process_identity
@@ -1687,7 +1694,7 @@ class InkboxGateway:
 
     def _record_host_fence(self, chat_id, owners):
         """Persist positive proof only for records owned by the exact stopped process."""
-        for mode, enabled in (("slack", self.cfg.slack_enabled), ("imessage", self.cfg.imessage_threaded_replies)):
+        for mode, enabled in (("slack", self.cfg.slack_enabled), ("imessage", self.cfg.imessage_threaded_replies), ("whatsapp", True)):
             if enabled or mode in self._channel_stores:
                 self._channel_store(mode).record_host_fence(chat_id, owners)
         if self._companion is not None:
@@ -1704,7 +1711,7 @@ class InkboxGateway:
                     self._companion.save(key)
 
     async def _recover_channel_inputs(self):
-        for mode, enabled in (("slack", self.cfg.slack_enabled), ("imessage", self.cfg.imessage_threaded_replies)):
+        for mode, enabled in (("slack", self.cfg.slack_enabled), ("imessage", self.cfg.imessage_threaded_replies), ("whatsapp", True)):
             if not enabled:
                 continue
             store = self._channel_store(mode)
@@ -1921,6 +1928,12 @@ class InkboxGateway:
         # Trusted source label. ``None`` means no registered provider claimed
         # the request — an unknown/unverifiable third party.
         source = provider.name if provider is not None else None
+        if str(envelope.get("event_type") or "").startswith("whatsapp."):
+            if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
+                    url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
+                return web.Response(status=401, text="WhatsApp events require a valid signature")
+            if envelope.get("companion") is not None:
+                return web.Response(status=400, text="Unsupported WhatsApp event")
         if str(envelope.get("event_type") or "").startswith("slack."):
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
@@ -1974,7 +1987,7 @@ class InkboxGateway:
 
         try:
             event_type = str(envelope.get("event_type") or "")
-            if source == "inkbox" and self._is_known_inkbox_event(event_type, envelope):
+            if source == "inkbox" and (event_type.startswith("whatsapp.") or self._is_known_inkbox_event(event_type, envelope)):
                 # An Inkbox-signed request carrying a known Inkbox event shape.
                 # NB: an Inkbox *signature* only means Inkbox vouched for
                 # delivery — a forwarded external event can be Inkbox-signed
@@ -1996,6 +2009,14 @@ class InkboxGateway:
                     response = await self._on_mail_received(envelope)
                 elif event_type == "text.received":
                     response = await self._on_text_received(envelope)
+                elif event_type == "whatsapp.received":
+                    from .whatsapp import receive
+                    response = await receive(self, envelope)
+                elif event_type.startswith("whatsapp."):
+                    from .whatsapp import record_status
+                    record_status(self, envelope)
+                    logger.debug("[bridge] WhatsApp delivery notification %s", event_type)
+                    response = web.json_response({"ok": True, "ignored": event_type})
                 elif event_type == "imessage.received":
                     response = await self._on_imessage_received(envelope)
                 elif event_type == "imessage.reaction_received":
@@ -5128,6 +5149,9 @@ class InkboxGateway:
                 await self._companion_receiver().authorize_reply(chat_id, mode, meta)
                 self._companion_receiver().begin_send(chat_id)
             await asyncio.to_thread(identity.send_text, **kwargs)
+        elif mode == "whatsapp":
+            from .whatsapp import send_reply
+            await send_reply(self, chat_id, content, meta)
         elif mode == "imessage":
             text = strip_markdown(content)
             if len(text) > IMESSAGE_MAX_LENGTH:

@@ -593,3 +593,34 @@ before backing up or moving it. Do not delete journals or session IDs to recover
 paused scope. Older releases do not understand the new unconfirmed scheduling
 state; preserve the state directory and use this release for recovery rather than
 assuming a downgrade can safely replay it.
+
+## Dedicated WhatsApp
+
+WhatsApp is available by approval for an agent that already has a dedicated
+personal iMessage number. It uses the same number, not a shared line. Request
+access in the console, then complete the required approval/setup. There is no
+local WhatsApp enable flag or self-service provisioning tool. Once approved,
+the existing gateway receives messages without a restart or credential change.
+
+Normal final responses reply automatically to the originating WhatsApp conversation;
+do not also send them with a tool. Explicit native tools include
+`inkbox_send_whatsapp`, conversation/message reads, owned-media upload/access,
+local mark-read, fresh `inkbox_get_whatsapp_status`, and read-only
+`inkbox_lookup_whatsapp_send` recovery by the original request key. Tools are registered even
+before approval so a cached disabled snapshot does not block later access.
+
+Use one E.164 recipient or an existing conversation, text (maximum 4,000 Unicode
+code points), and at most one owned attachment (20 MiB). Upload first and retain
+the returned media ID. Media URLs expire; retrieve fresh access by media ID.
+An unavailable attachment remains explicit context. Groups, quoted replies,
+reactions, typing, remote read receipts, and WhatsApp calls are not supported.
+
+Incoming events are authenticated and deduplicated, and ordinary answers are
+journaled before sending. Preserve a logical-send key and media ID after an
+uncertain outcome; do not re-upload or send a new copy. Confirmed sending and
+unknown delivery are different facts. Delivery notifications update local
+correlation only: they do not wake the model or trigger automatic resend.
+
+This draft requires the matching API and the normal Inkbox SDK 0.7.21 release.
+CI builds the real reviewed public SDK commit through `tests/ci/candidate_sdk.sh`;
+no package publication or live messaging is part of this change.
