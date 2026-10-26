@@ -275,7 +275,7 @@ def register_tools(register, client, identity_handle, cfg):
                 )
             except Exception as exc:
                 exc.whatsapp_media_id = args.get("media_id")
-                if getattr(exc, "idempotency_key", None):
+                if getattr(exc, "idempotency_key", None) and not public_quota_error(exc):
                     # An unknown outcome must not be followed by the same final
                     # answer as a second ordinary send on this conversation.
                     _mark_tool_delivery("whatsapp", target)
@@ -474,3 +474,30 @@ def record_status(gateway, envelope):
             "INSERT OR REPLACE INTO outbound(message_id,route) VALUES(?,?)",
             (str(message["id"]), json.dumps(route)),
         )
+
+
+def public_quota_error(exc):
+    """Keep only the public WhatsApp policy envelope, never arbitrary error bodies."""
+    import re
+    detail = getattr(exc, "detail", None)
+    if getattr(exc, "status_code", None) not in {402, 403, 413, 422, 429}:
+        return {}
+    if not isinstance(detail, dict) or not re.fullmatch(r"whatsapp_[a-z0-9_]{1,120}", str(detail.get("error", ""))):
+        return {}
+    result = {"error": detail["error"]}
+    quota = detail.get("quota")
+    if isinstance(quota, str) and re.fullmatch(r"whatsapp\.[a-z0-9_.]{1,120}", quota):
+        result["quota"] = quota
+    for key in ("limit", "used"):
+        if isinstance(detail.get(key), int) and not isinstance(detail[key], bool):
+            result[key] = detail[key]
+    condition = detail.get("retry_condition")
+    if isinstance(condition, str):
+        result["retry_condition"] = condition[:1000]
+    reset = detail.get("reset_at")
+    if isinstance(reset, str) and re.fullmatch(r"[0-9T:.+Z-]{20,40}", reset):
+        result["reset_at"] = reset
+    retry = getattr(exc, "retry_after_seconds", None)
+    if isinstance(retry, int) and not isinstance(retry, bool) and retry >= 0:
+        result["retry_after_seconds"] = retry
+    return result

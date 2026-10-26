@@ -364,3 +364,11 @@ def test_status_before_send_response_and_old_callback_keep_latest_facts(setup):
     assert store.lookup_outbound(MESSAGE)["status"] == "delivered"
     assert store.lookup_outbound(MESSAGE)["delivery_state"] == "delivered"
     assert store.lookup_outbound(MESSAGE)["updated_at"] == "2026-10-01T12:02:00Z"
+
+
+def test_public_quota_errors_retain_only_policy_fields_and_retry_advice():
+    from inkbox import InkboxAPIError
+    from inkbox_claude.whatsapp import public_quota_error
+    error = InkboxAPIError(429, {"error": "whatsapp_rate_limit", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "Wait until reset", "message": "untrusted provider body", "credentials": "private"}, retry_after="60")
+    assert public_quota_error(error) == {"error": "whatsapp_rate_limit", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "Wait until reset", "retry_after_seconds": 60}
+    assert public_quota_error(InkboxAPIError(502, {"error": "upstream", "message": "private"})) == {}
