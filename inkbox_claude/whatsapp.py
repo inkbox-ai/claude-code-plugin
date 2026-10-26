@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from typing import Any
 
 EVENTS = [
@@ -269,6 +270,10 @@ def register_tools(register, client, identity_handle, cfg):
             )
             authorize()
             target = str(args.get("conversation_id") or args.get("to") or "")
+            recipient = re.sub(r"[\s().-]", "", str(args.get("to") or ""))
+            if (meta.get("channel") == "whatsapp" and re.fullmatch(r"\+[1-9]\d{6,14}", recipient)
+                    and recipient == meta.get("sender")):
+                target = str(meta.get("conversation_id") or target)
             try:
                 sent = require_method(identity, operation)(
                     **kwargs, idempotency_key=key

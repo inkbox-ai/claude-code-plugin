@@ -341,6 +341,66 @@ def test_lookup_tool_recovers_id_without_sending(setup):
     client.whatsapp._http.post.assert_not_called()
 
 
+@pytest.mark.parametrize("to,uncertain", [
+    ("+15555550101", False), ("+15555550101", True),
+    (" +1 (555) 555-0101 ", False), (" +1 (555) 555-0101 ", True), ("+15555550102", False),
+])
+def test_explicit_recipient_reply_keeps_native_final_from_duplicating(setup, monkeypatch, to, uncertain):
+    from inkbox_claude import sessions as sessions_mod
+    from inkbox_claude.sessions import _Turn
+    from inkbox_claude.tools import CURRENT_SESSION
+    from tests.test_sessions import make_session
+
+    gw, _, client = setup
+    monkeypatch.setattr("inkbox._message_requests.time.sleep", lambda _: None)
+    if uncertain:
+        client.whatsapp._http.post.side_effect = [httpx.ReadTimeout("response lost")] * 3 + [{"message": MESSAGE_WIRE}]
+    registered = {}
+    register_tools(lambda name, description, properties, required, operation: registered.update({name: operation}), client, "agent", gw.cfg)
+
+    async def run():
+        session = make_session([])
+        finals = []
+
+        async def send(chat, text, mode, meta):
+            finals.append(text)
+            await gw.send_to_contact(chat, text, mode, meta)
+
+        session.send_fn = send
+        session.receipt_fn = gw._channel_receipt
+        gw.sessions = NS(get=lambda _chat: session)
+
+        class FakeResult:
+            result = "Answer"
+            session_id = None
+
+        class FakeClient:
+            async def query(self, _text):
+                token = CURRENT_SESSION.set(session)
+                try:
+                    registered["inkbox_send_whatsapp"]({"to": to, "text": "Answer", "idempotency_key": "original-key"}, lambda: None)
+                except Exception:
+                    if not uncertain:
+                        raise
+                finally:
+                    CURRENT_SESSION.reset(token)
+
+            async def receive_response(self):
+                yield FakeResult()
+
+        monkeypatch.setattr(sessions_mod, "ResultMessage", FakeResult)
+        session._client = FakeClient()
+        meta = {
+            "channel": "whatsapp", "conversation_id": CONV, "sender": "+15555550101",
+            "message_id": MESSAGE, "source_event_id": "original-event", "imessage_event_ids": ["original-event"],
+        }
+        gw._channel_store("whatsapp").admit(session.chat_id, "Send the requested answer", meta)
+        await session._run_turn(_Turn(text="Send the requested answer", mode="whatsapp", reply_meta=meta))
+        assert finals == ([] if to != "+15555550102" else ["Answer"])
+
+    asyncio.run(run())
+
+
 def test_status_before_send_response_and_old_callback_keep_latest_facts(setup):
     from inkbox_claude.whatsapp import record_status
 
