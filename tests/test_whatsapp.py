@@ -345,6 +345,7 @@ def test_lookup_tool_recovers_id_without_sending(setup):
     ("+15555550101", False, None), ("+15555550101", True, None),
     (" +1 (555) 555-0101 ", False, None), (" +1 (555) 555-0101 ", True, None), ("+15555550102", False, None),
     ("+15555550101", True, 403), ("+15555550101", True, 422), ("+15555550101", True, 429),
+    ("+15555550101", True, 402),
 ])
 def test_explicit_recipient_reply_keeps_native_final_from_duplicating(setup, monkeypatch, to, uncertain, status):
     from inkbox import InkboxAPIError
@@ -356,7 +357,8 @@ def test_explicit_recipient_reply_keeps_native_final_from_duplicating(setup, mon
     gw, _, client = setup
     monkeypatch.setattr("inkbox._message_requests.time.sleep", lambda _: None)
     if status is not None:
-        client.whatsapp._http.post.side_effect = [InkboxAPIError(status, {"error": "whatsapp_unrecognized_policy"})] * (3 if status == 429 else 1) + [{"message": MESSAGE_WIRE}]
+        code = "whatsapp_cycle_limit_exceeded" if status == 402 else "whatsapp_unrecognized_policy"
+        client.whatsapp._http.post.side_effect = [InkboxAPIError(status, {"error": code})] * (3 if status == 429 else 1) + [{"message": MESSAGE_WIRE}]
     elif uncertain:
         client.whatsapp._http.post.side_effect = [httpx.ReadTimeout("response lost")] * 3 + [{"message": MESSAGE_WIRE}]
     registered = {}
