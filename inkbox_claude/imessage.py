@@ -291,6 +291,8 @@ class IMessageState:
                 route["status"] = previous["status"]
                 if "delivery_state" in previous:
                     route["delivery_state"] = previous["delivery_state"]
+                if "updated_at" in previous:
+                    route["updated_at"] = previous["updated_at"]
                 db.execute("UPDATE outbound SET route=? WHERE message_id=?", (_json(route), route["message_id"]))
                 if route["status"] == "failed" and meta.get("channel") != "whatsapp":
                     self._stage_failure_notice(db, route["message_id"], route)

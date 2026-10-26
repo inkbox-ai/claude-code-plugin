@@ -339,3 +339,28 @@ def test_lookup_tool_recovers_id_without_sending(setup):
         headers={"Idempotency-Key": "stable-key"},
     )
     client.whatsapp._http.post.assert_not_called()
+
+
+def test_status_before_send_response_and_old_callback_keep_latest_facts(setup):
+    from inkbox_claude.whatsapp import record_status
+
+    gw, _, _ = setup
+    newest = {
+        **MESSAGE_WIRE,
+        "status": "delivered",
+        "delivery_state": "delivered",
+        "updated_at": "2026-10-01T12:02:00Z",
+    }
+    record_status(gw, {"event_type": "whatsapp.delivered", "data": {"message": newest}})
+    store = gw._channel_store("whatsapp")
+    store.record_outbound(
+        NS(id=MESSAGE, status="sent", delivery_state="pending"),
+        {"channel": "whatsapp", "conversation_id": CONV},
+        "chat",
+    )
+    record_status(
+        gw, {"event_type": "whatsapp.sent", "data": {"message": MESSAGE_WIRE}}
+    )
+    assert store.lookup_outbound(MESSAGE)["status"] == "delivered"
+    assert store.lookup_outbound(MESSAGE)["delivery_state"] == "delivered"
+    assert store.lookup_outbound(MESSAGE)["updated_at"] == "2026-10-01T12:02:00Z"

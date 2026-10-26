@@ -251,7 +251,7 @@ def register_tools(register, client, identity_handle, cfg):
                 **({"text": args["text"]} if "text" in args else {}),
                 **({"media_ids": [args["media_id"]]} if args.get("media_id") else {}),
             }
-            key = (
+            key = args.get("idempotency_key") or (
                 "claude-wa-tool-"
                 + hashlib.sha256(
                     json.dumps(
@@ -266,6 +266,7 @@ def register_tools(register, client, identity_handle, cfg):
                     **kwargs, idempotency_key=key
                 )
             except Exception as exc:
+                exc.whatsapp_media_id = args.get("media_id")
                 if getattr(exc, "idempotency_key", None):
                     # An unknown outcome must not be followed by the same final
                     # answer as a second ordinary send on this conversation.
@@ -287,7 +288,11 @@ def register_tools(register, client, identity_handle, cfg):
                     logger.warning(
                         "WhatsApp accepted; local tracking needs recovery. Do not resend."
                     )
-            return sent
+            return {
+                "message": sent,
+                "idempotency_key": key,
+                "media_id": args.get("media_id"),
+            }
         if operation == "upload_whatsapp_media":
             path = Path(args["media_path"]).expanduser().resolve()
             if path.stat().st_size > 20 * 1024 * 1024:
@@ -331,6 +336,9 @@ def register_tools(register, client, identity_handle, cfg):
                 ),
                 "text": {**string("Message text"), "maxLength": 4000},
                 "media_id": string("Owned ID returned by upload"),
+                "idempotency_key": string(
+                    "Optional original key for the same logical send"
+                ),
             },
             [],
             "send_whatsapp",
@@ -407,6 +415,8 @@ def register_tools(register, client, identity_handle, cfg):
 def record_status(gateway, envelope):
     """Correlate content-free delivery facts without starting or retrying model work."""
     message = (envelope.get("data") or {}).get("message") or {}
+    if envelope.get("event_type") not in EVENTS[1:]:
+        return
     if (
         not message.get("id")
         or str(message.get("agent_identity_id") or "") != str(gateway._identity.id)
@@ -428,10 +438,28 @@ def record_status(gateway, envelope):
                 "unknown_route": True,
             }
         )
+        from datetime import datetime, timezone
+
+        def timestamp(value):
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                return (
+                    parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                ).timestamp()
+            except ValueError:
+                return None
+
+        incoming, previous = (
+            timestamp(message.get("updated_at")),
+            timestamp(route.get("updated_at")),
+        )
+        if incoming is None or (previous is not None and incoming < previous):
+            return
         route.update(
             {
                 "status": message.get("status"),
                 "delivery_state": message.get("delivery_state"),
+                "updated_at": message.get("updated_at"),
             }
         )
         db.execute(

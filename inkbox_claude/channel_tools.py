@@ -48,7 +48,7 @@ def build_channel_tools(client, identity_handle, cfg):
                 if "_whatsapp" in name:
                     key = getattr(exc, "idempotency_key", None)
                     if key:
-                        recovery = {"idempotency_key": key, "recovery": "Read message/send lookup state; do not send a new copy."}
+                        recovery = {"idempotency_key": key, "media_id": getattr(exc, "whatsapp_media_id", None), "recovery": "Read message/send lookup state; do not send a new copy."}
                 return _error(message, **({"status_code": status} if isinstance(status, int) else {}), **recovery)
         registered.append(tool(name, description, {
             "type": "object", "properties": properties, "required": required,
