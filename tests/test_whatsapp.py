@@ -341,11 +341,13 @@ def test_lookup_tool_recovers_id_without_sending(setup):
     client.whatsapp._http.post.assert_not_called()
 
 
-@pytest.mark.parametrize("to,uncertain", [
-    ("+15555550101", False), ("+15555550101", True),
-    (" +1 (555) 555-0101 ", False), (" +1 (555) 555-0101 ", True), ("+15555550102", False),
+@pytest.mark.parametrize("to,uncertain,status", [
+    ("+15555550101", False, None), ("+15555550101", True, None),
+    (" +1 (555) 555-0101 ", False, None), (" +1 (555) 555-0101 ", True, None), ("+15555550102", False, None),
+    ("+15555550101", True, 403), ("+15555550101", True, 422), ("+15555550101", True, 429),
 ])
-def test_explicit_recipient_reply_keeps_native_final_from_duplicating(setup, monkeypatch, to, uncertain):
+def test_explicit_recipient_reply_keeps_native_final_from_duplicating(setup, monkeypatch, to, uncertain, status):
+    from inkbox import InkboxAPIError
     from inkbox_claude import sessions as sessions_mod
     from inkbox_claude.sessions import _Turn
     from inkbox_claude.tools import CURRENT_SESSION
@@ -353,7 +355,9 @@ def test_explicit_recipient_reply_keeps_native_final_from_duplicating(setup, mon
 
     gw, _, client = setup
     monkeypatch.setattr("inkbox._message_requests.time.sleep", lambda _: None)
-    if uncertain:
+    if status is not None:
+        client.whatsapp._http.post.side_effect = [InkboxAPIError(status, {"error": "whatsapp_unrecognized_policy"})] * (3 if status == 429 else 1) + [{"message": MESSAGE_WIRE}]
+    elif uncertain:
         client.whatsapp._http.post.side_effect = [httpx.ReadTimeout("response lost")] * 3 + [{"message": MESSAGE_WIRE}]
     registered = {}
     register_tools(lambda name, description, properties, required, operation: registered.update({name: operation}), client, "agent", gw.cfg)
@@ -429,6 +433,6 @@ def test_status_before_send_response_and_old_callback_keep_latest_facts(setup):
 def test_public_quota_errors_retain_only_policy_fields_and_retry_advice():
     from inkbox import InkboxAPIError
     from inkbox_claude.whatsapp import public_quota_error
-    error = InkboxAPIError(429, {"error": "whatsapp_rate_limit", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "Wait until reset", "message": "untrusted provider body", "credentials": "private"}, retry_after="60")
-    assert public_quota_error(error) == {"error": "whatsapp_rate_limit", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "Wait until reset", "retry_after_seconds": 60}
+    error = InkboxAPIError(429, {"error": "whatsapp_daily_limit_exceeded", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "window_reset", "message": "untrusted provider body", "credentials": "private"}, retry_after="60")
+    assert public_quota_error(error) == {"error": "whatsapp_daily_limit_exceeded", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "window_reset", "retry_after_seconds": 60}
     assert public_quota_error(InkboxAPIError(502, {"error": "upstream", "message": "private"})) == {}

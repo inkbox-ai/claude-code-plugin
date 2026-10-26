@@ -17,6 +17,13 @@ EVENTS = [
     "whatsapp.delivery_unconfirmed",
 ]
 logger = logging.getLogger(__name__)
+_REJECTED_SEND_CODES = {
+    402: {"whatsapp_cycle_limit_exceeded"},
+    403: {"whatsapp_not_eligible", "whatsapp_access_required", "whatsapp_contact_not_allowed", "whatsapp_media_source_not_allowed"},
+    413: {"whatsapp_media_too_large"},
+    422: {"whatsapp_groups_not_supported", "whatsapp_invalid_recipient", "whatsapp_text_too_long", "whatsapp_unanswered_followup_limit", "whatsapp_opening_message_too_long", "whatsapp_reply_required_for_media", "whatsapp_reply_required_for_links", "whatsapp_reply_required_for_phone_numbers"},
+    429: {"whatsapp_daily_limit_exceeded", "whatsapp_unanswered_message_limit", "whatsapp_conversation_rate_limited", "whatsapp_new_contact_rate_limited", "whatsapp_new_contact_spacing", "whatsapp_follow_up_rate_limited"},
+}
 
 
 def field(value: Any, name: str, default=None):
@@ -485,9 +492,8 @@ def public_quota_error(exc):
     """Keep only the public WhatsApp policy envelope, never arbitrary error bodies."""
     import re
     detail = getattr(exc, "detail", None)
-    if getattr(exc, "status_code", None) not in {402, 403, 413, 422, 429}:
-        return {}
-    if not isinstance(detail, dict) or not re.fullmatch(r"whatsapp_[a-z0-9_]{1,120}", str(detail.get("error", ""))):
+    code = detail.get("error") if isinstance(detail, dict) else None
+    if not isinstance(code, str) or code not in _REJECTED_SEND_CODES.get(getattr(exc, "status_code", None), set()):
         return {}
     result = {"error": detail["error"]}
     quota = detail.get("quota")
