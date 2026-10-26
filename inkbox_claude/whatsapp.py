@@ -227,6 +227,14 @@ def register_tools(register, client, identity_handle, cfg):
                     )
                 )
             }
+        if operation == "get_whatsapp_status":
+            status = require_method(identity, operation)()
+            limits = None
+            try:
+                limits = require_method(identity, "get_whatsapp_limits")()
+            except Exception:
+                pass  # An older API must not block status or historical reads.
+            return {"status": status, "limits": limits}
         if operation == "send_whatsapp":
             selector = {
                 key: args[key] for key in ("to", "conversation_id") if key in args
