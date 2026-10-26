@@ -436,3 +436,15 @@ def test_public_quota_errors_retain_only_policy_fields_and_retry_advice():
     error = InkboxAPIError(429, {"error": "whatsapp_daily_limit_exceeded", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "window_reset", "message": "untrusted provider body", "credentials": "private"}, retry_after="60")
     assert public_quota_error(error) == {"error": "whatsapp_daily_limit_exceeded", "quota": "whatsapp.texts_per_agent_identity_per_24h", "limit": 20, "used": 20, "reset_at": "2026-10-27T00:00:00Z", "retry_condition": "window_reset", "retry_after_seconds": 60}
     assert public_quota_error(InkboxAPIError(502, {"error": "upstream", "message": "private"})) == {}
+
+
+@pytest.mark.parametrize("status,known", [(422, True), (429, False)])
+def test_email_policy_rejection_is_status_bound_and_public_fields_only(status, known):
+    from inkbox import InkboxAPIError
+    from inkbox_claude.whatsapp import public_quota_error
+
+    detail = {"error": "whatsapp_reply_required_for_email_addresses",
+              "quota": "whatsapp.pre_reply_email_addresses_allowed", "limit": 0,
+              "retry_condition": "recipient_reply_or_configuration", "message": "private-diagnostic"}
+    expected = {key: value for key, value in detail.items() if key != "message"} if known else {}
+    assert public_quota_error(InkboxAPIError(status, detail)) == expected
