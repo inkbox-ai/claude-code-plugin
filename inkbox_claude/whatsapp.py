@@ -64,6 +64,19 @@ class ReplyPreflightRejected(ValueError):
     notice = None
 
 
+class SendRecoveryRequired(ReplyPreflightRejected):
+    """Expose only the retained request identity and fixed recovery guidance."""
+
+    def __init__(self, key, intent=None, *, quoted=False):
+        message = ("An explicit quoted reply is unresolved; preserve its original request and key" if quoted
+                   else "A WhatsApp send was already attempted; preserve its original request and key")
+        super().__init__(message)
+        if isinstance(key, str) and key.strip() and len(key) <= 255 and key.isascii() and key.isprintable():
+            self.idempotency_key = key
+        media = (intent or {}).get("media_ids") or []
+        self.whatsapp_media_id = media[0] if media else None
+
+
 class ReplyTooLong(ReplyPreflightRejected):
     notice = "The answer exceeded WhatsApp's 4000-character limit and was not sent. Please ask for a shorter answer."
 
@@ -143,7 +156,7 @@ def validate_send_uncertainty(meta, *, key=None, intent=None):
     for previous in attempts:
         if previous["outcome"] in {"pending", "uncertain"} and (
                 key != previous["key"] or intent != previous["intent"]):
-            raise ReplyPreflightRejected("A send is unresolved; preserve its original request and key")
+            raise SendRecoveryRequired(previous["key"], previous["intent"])
     if (meta.get("whatsapp_explicit_quote_attempted")
             and not meta.get("whatsapp_quote_accepted")
             and (key is None or key != meta.get("whatsapp_explicit_quote_key")
@@ -151,7 +164,7 @@ def validate_send_uncertainty(meta, *, key=None, intent=None):
                  or delivery_target(meta, intent.get("conversation_id")) != meta.get("conversation_id")
                  or (meta.get("whatsapp_quote_intent") is not None
                      and intent != meta["whatsapp_quote_intent"]))):
-        raise ReplyPreflightRejected("An explicit quoted reply is unresolved; preserve its original request and key")
+        raise SendRecoveryRequired(meta.get("whatsapp_explicit_quote_key"), meta.get("whatsapp_quote_intent"), quoted=True)
 
 
 def reply_source(identity, conversation, message_id):
@@ -512,20 +525,20 @@ def register_tools(register, client, identity_handle, cfg):
                     if ((key == previous["key"] and kwargs != previous["intent"])
                             or (previous["outcome"] in {"pending", "uncertain"}
                                 and (key != previous["key"] or kwargs != previous["intent"]))):
-                        raise ReplyPreflightRejected("A send was already attempted; preserve its original request")
+                        raise SendRecoveryRequired(previous["key"], previous["intent"])
                 if source_bound:
                     retained = source_plain_send(meta)
                     if retained and (
                             (key == retained["key"] and kwargs != retained["intent"])
                             or (retained["outcome"] in {"pending", "uncertain"}
                                 and (key != retained["key"] or kwargs != retained["intent"]))):
-                        raise ReplyPreflightRejected("A reply was already attempted; preserve its original request")
+                        raise SendRecoveryRequired(retained["key"], retained["intent"])
                     if meta.get("whatsapp_explicit_quote_attempted") and (
                             not meta.get("whatsapp_quote_accepted") or key == meta.get("whatsapp_explicit_quote_key")) and (
                             reply_target is None or key != meta.get("whatsapp_explicit_quote_key")
                             or (meta.get("whatsapp_quote_intent") is not None
                                 and kwargs != meta["whatsapp_quote_intent"])):
-                        raise ReplyPreflightRejected("A quoted reply was already attempted; preserve its original request")
+                        raise SendRecoveryRequired(meta.get("whatsapp_explicit_quote_key"), meta.get("whatsapp_quote_intent"), quoted=True)
                 if reply_target is not None and source_bound:
                     meta["whatsapp_quote_intent"] = kwargs.copy()
                     meta["whatsapp_quote_accepted"] = False
