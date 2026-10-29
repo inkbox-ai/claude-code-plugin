@@ -336,3 +336,100 @@ def test_tool_rechecks_ownership_after_persisting_quote_intent(channel, monkeypa
         assert posts(channel) == []
     finally:
         CURRENT_SESSION.reset(token)
+
+
+@pytest.mark.parametrize("kind,answer", [("permission", "yes"), ("poll", "1")])
+def test_accepted_quote_still_allows_separate_permission_and_poll(channel, kind, answer):
+    chat_id, _, meta = admit(channel)
+
+    async def run():
+        session, tool = bind_tool(channel, meta, chat_id)
+        session.receipt_fn = channel.gateway._channel_receipt
+        sent = asyncio.Event()
+        prompt_routes = []
+
+        async def send(chat, text, mode, route):
+            prompt_routes.append(deepcopy(route))
+            await send_reply(channel.gateway, chat, text, route)
+            sent.set()
+
+        session.send_fn = send
+        token = CURRENT_SESSION.set(session)
+        try:
+            tool({"conversation_id": CONVERSATION, "text": "Starting work"}, lambda: None)
+        finally:
+            CURRENT_SESSION.reset(token)
+        assert meta["whatsapp_quote_accepted"]
+        prompt = asyncio.create_task(session._escalate(kind, "Choose an option"))
+        await asyncio.wait_for(sent.wait(), 2)
+        await session.handle_inbound(answer, "whatsapp", {
+            **meta, "message_id": str(UUID(int=98)), "source_event_id": "answer-event",
+            "imessage_event_ids": ["answer-event"], "raw_text": answer})
+        assert await prompt == answer
+        assert len(posts(channel)) == 2
+        tool_request, prompt_request = posts(channel)
+        assert json.loads(prompt_request.content) == {
+            "conversation_id": CONVERSATION, "text": "Choose an option", "reply_to_message_id": MESSAGE}
+        assert prompt_request.headers["Idempotency-Key"] != tool_request.headers["Idempotency-Key"]
+        operation_id = prompt_routes[0]["whatsapp_interaction_id"]
+        expected = "claude-wa-" + hashlib.sha256(json.dumps([
+            channel.gateway.cfg.base_url, IDENTITY, CONVERSATION, ["source-event"],
+            "Choose an option", {"reply_to_message_id": MESSAGE}, operation_id], sort_keys=True).encode()).hexdigest()
+        assert prompt_request.headers["Idempotency-Key"] == expected
+        with pytest.raises(ReplyPreflightRejected):
+            await send_reply(channel.gateway, chat_id, "Automatic final", {**meta, "final_reply": True})
+        assert len(posts(channel)) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("include", [None, True])
+def test_registered_list_tool_can_discover_existing_large_groups(channel, include):
+    from inkbox_claude.channel_tools import build_channel_tools
+    tool = next(t for t in build_channel_tools(channel.client, "agent", channel.gateway.cfg)
+                if t.name == "inkbox_list_whatsapp_conversations")
+    assert tool.input_schema["properties"]["include_groups"]["type"] == "boolean"
+    result = asyncio.run(tool.handler({} if include is None else {"include_groups": include}))
+    assert not result.get("isError"), result
+    request = channel.requests[-1]
+    assert request.url.params["include_groups"] == ("true" if include else "false")
+    rows = json.loads(result["content"][0]["text"])
+    assert len(rows) == (1 if include else 0)
+    if include:
+        assert rows[0]["is_group"] and len(rows[0]["participants"]) == 9
+
+
+def test_interaction_marker_cannot_bypass_unconfirmed_quote_fence(channel):
+    chat_id, _, meta = admit(channel)
+    meta.update(whatsapp_explicit_quote_attempted=True, whatsapp_quote_accepted=False,
+                whatsapp_interaction_id="distinct-permission")
+    with pytest.raises(ReplyPreflightRejected):
+        asyncio.run(send_reply(channel.gateway, chat_id, "Allow action?", meta))
+    assert posts(channel) == []
+
+
+def test_permission_prompt_rechecks_owner_after_source_read(channel):
+    chat_id, _, meta = admit(channel)
+
+    async def run():
+        session, tool = bind_tool(channel, meta, chat_id)
+        session.send_fn = channel.gateway.send_to_contact
+        token = CURRENT_SESSION.set(session)
+        try:
+            tool({"conversation_id": CONVERSATION, "text": "Starting work"}, lambda: None)
+        finally:
+            CURRENT_SESSION.reset(token)
+        original = channel.identity.get_whatsapp_message
+
+        def revoked_source(message_id):
+            value = original(message_id)
+            session._current_turn.cancelled = True
+            return value
+
+        channel.identity.get_whatsapp_message = revoked_source
+        with pytest.raises(PermissionError, match="ownership"):
+            await session._escalate("permission", "Allow action?")
+        assert session.pending is None
+        assert len(posts(channel)) == 1
+
+    asyncio.run(run())

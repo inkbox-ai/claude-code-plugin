@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1698,7 +1699,23 @@ class ContactSession:
         self.pending = pending
         try:
             await self.notify_activity(reply_mode, route, "waiting")
-            await self._reply(prompt_text)
+            if reply_mode == "whatsapp":
+                prompt_route = {**deepcopy(route), "whatsapp_interaction_id": uuid.uuid4().hex}
+
+                def guard():
+                    if (self.pending is not pending or self._current_turn is not pending.owner
+                            or self._client_generation != pending.generation or self._interrupting
+                            or self._shutting_down or (pending.owner is not None and pending.owner.cancelled)):
+                        raise PermissionError("Permission prompt ownership is no longer active")
+
+                token = CHANNEL_DELIVERY_GUARD.set(guard)
+                try:
+                    guard()
+                    await self.send_fn(self.chat_id, prompt_text, reply_mode, prompt_route)
+                finally:
+                    CHANNEL_DELIVERY_GUARD.reset(token)
+            else:
+                await self._reply(prompt_text)
             return await asyncio.wait_for(
                 pending.future, timeout=self.cfg.permission_timeout_s
             )

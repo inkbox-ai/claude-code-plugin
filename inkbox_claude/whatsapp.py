@@ -273,7 +273,9 @@ async def receive(gateway, envelope):
 
 
 async def send_reply(gateway, chat_id, content, meta):
-    if meta.get("whatsapp_explicit_quote_attempted"):
+    if meta.get("whatsapp_explicit_quote_attempted") and not (
+            meta.get("whatsapp_interaction_id") and meta.get("whatsapp_quote_accepted")
+            and not meta.get("final_reply")):
         raise ReplyPreflightRejected("An explicit quoted reply was already attempted; inspect its original receipt instead of sending an automatic replacement")
     from .sessions import CHANNEL_DELIVERY_GUARD
     from .tools import _to_thread_drained
@@ -303,7 +305,7 @@ async def send_reply(gateway, chat_id, content, meta):
     if quote:
         key_parts.append(quote)
     if not meta.get("final_reply"):
-        key_parts.append(uuid.uuid4().hex)
+        key_parts.append(meta.get("whatsapp_interaction_id") or uuid.uuid4().hex)
     key = (
         "claude-wa-"
         + hashlib.sha256(
@@ -533,7 +535,8 @@ def register_tools(register, client, identity_handle, cfg):
         (
             "inkbox_list_whatsapp_conversations",
             "List WhatsApp conversations with local unread counts.",
-            {"limit": integer, "offset": {"type": "integer", "minimum": 0}},
+            {"limit": integer, "offset": {"type": "integer", "minimum": 0},
+             "include_groups": {"type": "boolean", "description": "Include group conversations; defaults to false"}},
             [],
             "list_whatsapp_conversations",
         ),

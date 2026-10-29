@@ -39,6 +39,15 @@ def channel(monkeypatch, tmp_path):
         if path == "/api/v1/identities/agent":
             return httpx.Response(200, json={"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent", "created_at": NOW, "updated_at": NOW})
         assert request.url.params["agent_identity_id"] == IDENTITY
+        if path == "/api/v1/whatsapp/conversations":
+            groups = request.url.params.get("include_groups") == "true"
+            return httpx.Response(200, json=[{
+                "id": CONVERSATION, "agent_identity_id": IDENTITY,
+                "local_number": "+15550000001", "remote_number": None,
+                "participants": [f"+15550000{n:03d}" for n in range(2, 11)],
+                "is_group": True, "created_at": NOW, "updated_at": NOW,
+                "latest_has_media": False, "unread_count": 1, "total_count": 1,
+            }] if groups else [])
         if path == "/api/v1/whatsapp/messages" and request.method == "POST":
             return httpx.Response(201, json={"message": {**state.message, "id": OUTBOUND, "direction": "outbound", "status": "queued"}})
         if path.endswith("/thread") or "/threads/" in path:
