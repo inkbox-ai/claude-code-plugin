@@ -356,6 +356,10 @@ def test_explicit_recipient_reply_keeps_native_final_from_duplicating(setup, mon
 
     gw, _, client = setup
     monkeypatch.setattr("inkbox._message_requests.time.sleep", lambda _: None)
+    if to == "+15555550102":
+        client.whatsapp._http.post.return_value = {"message": {
+            **MESSAGE_WIRE, "conversation_id": "20000000-0000-4000-8000-000000000005",
+            "remote_number": to, "participants": [to]}}
     if status is not None:
         code = "whatsapp_cycle_limit_exceeded" if status == 402 else "whatsapp_unrecognized_policy"
         client.whatsapp._http.post.side_effect = [InkboxAPIError(status, {"error": code})] * (3 if status == 429 else 1) + [{"message": MESSAGE_WIRE}]
@@ -450,3 +454,44 @@ def test_email_policy_rejection_is_status_bound_and_public_fields_only(status, k
               "retry_condition": "recipient_reply_or_configuration", "message": "private-diagnostic"}
     expected = {key: value for key, value in detail.items() if key != "message"} if known else {}
     assert public_quota_error(InkboxAPIError(status, detail)) == expected
+
+
+@pytest.mark.parametrize("status", [201, 409, 429])
+def test_explicit_quote_fence_persists_before_io_even_after_known_rejection(setup, monkeypatch, status):
+    from inkbox import InkboxAPIError
+    from inkbox_claude.sessions import _Turn
+    from inkbox_claude.tools import CURRENT_SESSION
+    from tests.test_sessions import make_session
+    from inkbox_claude.imessage import IMessageState
+    gw, _, client = setup
+    session = make_session([])
+    meta = {"channel":"whatsapp", "conversation_id":CONV, "sender":"+15555550101",
+        "message_id":MESSAGE, "source_event_id":"quote-event", "imessage_event_ids":["quote-event"]}
+    session._current_turn = _Turn(text="Question", mode="whatsapp", reply_meta=meta)
+    session._turn_active = True
+    session.mode, session.reply_meta = "whatsapp", meta
+    store = IMessageState(gw.cfg, channel="whatsapp")
+    store.admit(session.chat_id, "Question", meta)
+    tools = {}
+    register_tools(lambda name, description, properties, required, callback: tools.update({name:callback}), client, "agent", gw.cfg)
+    if status != 201:
+        failure = InkboxAPIError(status, {"error":"whatsapp_daily_limit_exceeded" if status == 429 else "whatsapp_send_pending"}, retry_after="60")
+        failure.idempotency_key = "quote-one"
+        client.whatsapp._http.post.side_effect = failure
+    token = CURRENT_SESSION.set(session)
+    try:
+        args = {"conversation_id":CONV,"reply_to_message_id":MESSAGE,"text":"Answer\n","idempotency_key":"quote-one"}
+        if status == 201:
+            tools["inkbox_send_whatsapp"](args, lambda:None)
+        else:
+            with pytest.raises(InkboxAPIError):
+                tools["inkbox_send_whatsapp"](args, lambda:None)
+        assert session._current_channel_tool_delivery is True and meta["whatsapp_explicit_quote_attempted"] is True
+        with store._db() as db:
+            saved = json.loads(db.execute("SELECT meta FROM receipts WHERE event_id=?",("quote-event",)).fetchone()[0])
+        assert saved["whatsapp_explicit_quote_attempted"] is True
+        with pytest.raises(ValueError, match="explicit quoted reply"):
+            asyncio.run(send_reply(gw, session.chat_id, "Different final", meta))
+        assert client.whatsapp._http.post.call_count == 1
+    finally:
+        CURRENT_SESSION.reset(token)

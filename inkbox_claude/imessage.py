@@ -269,8 +269,10 @@ class IMessageState:
             rows = [db.execute("SELECT * FROM receipts WHERE event_id=?", (event_id,)).fetchone() for event_id in ids]
             if not rows or any(row is None or row["chat_id"] != chat_id or row["state"] != "reply_pending" for row in rows):
                 raise PermissionError("Reply receipt is no longer awaiting delivery")
-            for event_id in ids:
-                db.execute("UPDATE receipts SET state='sending' WHERE event_id=?", (event_id,))
+            for row in rows:
+                merged = {**json.loads(row["meta"]), **meta}
+                db.execute("UPDATE receipts SET state='sending',meta=? WHERE event_id=?",
+                           (_json(merged), row["event_id"]))
 
     def record_outbound(self, message: Any, meta: dict[str, Any], chat_id: str) -> None:
         sent = _outbound(message)

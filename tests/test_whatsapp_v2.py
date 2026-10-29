@@ -46,7 +46,7 @@ def channel(monkeypatch, tmp_path):
                 "thread_root_message_id": MESSAGE, "messages": [state.message], "next_cursor": "opaque-cursor"})
         if path == "/api/v1/whatsapp/reactions":
             return httpx.Response(state.reaction_status, json={"reaction": {**state.reaction, "status": "uncertain"}})
-        if path == f"/api/v1/whatsapp/reactions/{REACTION}":
+        if path == f"/api/v1/whatsapp/reactions/{state.reaction['id']}":
             return httpx.Response(200, json={"reaction": {**state.reaction, **({"status": "removed"} if request.method == "DELETE" else {})}})
         if path == f"/api/v1/whatsapp/messages/{MESSAGE}":
             return httpx.Response(200, json=state.message)

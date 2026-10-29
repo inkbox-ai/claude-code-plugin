@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 from .whatsapp_v2 import V2_OPERATIONS, run_v2, specifications as v2_specifications, send_selector
@@ -54,6 +55,103 @@ def require_method(identity, name):
     if not callable(method):
         raise RuntimeError("WhatsApp requires Inkbox SDK 0.7.24 or newer")
     return method
+
+
+class ReplyPreflightRejected(ValueError):
+    """A definitive rejection before submitting an automatic reply."""
+
+    notice = None
+
+
+class ReplyTooLong(ReplyPreflightRejected):
+    notice = "The answer exceeded WhatsApp's 4000-character limit and was not sent. Please ask for a shorter answer."
+
+
+def local_route_allowed(gateway, meta):
+    if not gateway._sender_allowed(str(meta.get("sender") or "")):
+        return False
+    if meta.get("conversation_kind") != "group":
+        return True
+    participants = meta.get("participants")
+    return (isinstance(participants, list) and bool(participants)
+            and meta.get("sender") in participants
+            and all(isinstance(number, str) and re.fullmatch(r"\+[1-9]\d{6,14}", number)
+                    and gateway._sender_allowed(number) for number in participants))
+
+
+async def validate_reply_access(gateway, meta):
+    if not local_route_allowed(gateway, meta):
+        raise ReplyPreflightRejected("WhatsApp conversation is no longer locally allowed")
+    if meta.get("conversation_kind") != "group":
+        return
+    from .companion import retryable_read
+    from .imessage import SafeReplyPreflightError
+    try:
+        conversation = await asyncio.to_thread(
+            require_method(gateway._identity, "get_whatsapp_conversation"), meta["conversation_id"])
+    except Exception as exc:
+        if retryable_read(exc):
+            raise SafeReplyPreflightError("WhatsApp membership is temporarily unavailable") from None
+        raise ReplyPreflightRejected("WhatsApp conversation membership could not be confirmed") from None
+    if (str(field(conversation, "id")) != meta["conversation_id"]
+            or str(field(conversation, "agent_identity_id")) != str(gateway._identity.id)
+            or field(conversation, "is_group") is not True
+            or field(conversation, "unresolved_participant_count", 0) != 0
+            or not local_route_allowed(gateway, {**meta, "participants": field(conversation, "participants")})):
+        raise ReplyPreflightRejected("WhatsApp conversation membership is no longer locally allowed")
+
+
+def delivery_target(meta, conversation=None, recipient=None):
+    """Correlate canonical selectors without attributing outreach to this turn."""
+    current = str(meta.get("conversation_id") or "")
+    try:
+        canonical = str(uuid.UUID(current))
+    except ValueError:
+        canonical = current
+    if conversation is not None:
+        return current if str(conversation) == canonical else str(conversation)
+    recipients = recipient if isinstance(recipient, list) else [recipient]
+    participants = meta.get("participants") if meta.get("conversation_kind") == "group" else [meta.get("sender")]
+    if (meta.get("channel") == "whatsapp" and current and participants
+            and set(recipients) == set(participants)):
+        return current
+    return str(recipient or "")
+
+
+def reply_source(identity, conversation, message_id):
+    """Persist source ownership only when admitting a new input."""
+    return {"identity_id": str(identity.id), "conversation_id": conversation,
+            "message_id": message_id}
+
+
+def auto_reply_kwargs(identity, meta):
+    """Legacy receipts without a source snapshot keep their original plain intent."""
+    source = meta.get("whatsapp_reply_source")
+    if source is None:
+        return {}
+    target = meta.get("whatsapp_reply_target")
+    if (not isinstance(source, dict) or source.get("identity_id") != str(identity.id)
+            or source.get("conversation_id") != meta.get("conversation_id")
+            or not target or source.get("message_id") != target):
+        raise ReplyPreflightRejected("WhatsApp reply source ownership cannot be verified")
+    try:
+        uuid.UUID(target)
+    except (ValueError, TypeError, AttributeError):
+        raise ReplyPreflightRejected("WhatsApp reply source must be a message ID") from None
+    from .companion import retryable_read
+    from .imessage import SafeReplyPreflightError
+    try:
+        message = require_method(identity, "get_whatsapp_message")(target)
+    except Exception as exc:
+        if retryable_read(exc):
+            raise SafeReplyPreflightError("WhatsApp reply source is temporarily unavailable") from None
+        raise ReplyPreflightRejected("WhatsApp reply source is no longer available") from None
+    if (str(field(message, "id")) != target
+            or str(field(message, "conversation_id")) != source["conversation_id"]
+            or str(field(message, "agent_identity_id")) != source["identity_id"]
+            or field(message, "is_blocked") is True):
+        raise ReplyPreflightRejected("WhatsApp reply source ownership cannot be verified")
+    return {"reply_to_message_id": target}
 
 
 async def receive(gateway, envelope):
@@ -155,6 +253,7 @@ async def receive(gateway, envelope):
             "thread_id": message.get("thread_id"),
             "thread_root_message_id": message.get("thread_root_message_id"),
             "whatsapp_reply_target": message_id,
+            "whatsapp_reply_source": reply_source(identity, conversation, message_id),
             "media": bool(media),
         }
         store = gateway._channel_store("whatsapp")
@@ -174,40 +273,54 @@ async def receive(gateway, envelope):
 
 
 async def send_reply(gateway, chat_id, content, meta):
+    if meta.get("whatsapp_explicit_quote_attempted"):
+        raise ReplyPreflightRejected("An explicit quoted reply was already attempted; inspect its original receipt instead of sending an automatic replacement")
     from .sessions import CHANNEL_DELIVERY_GUARD
     from .tools import _to_thread_drained
     from .prompts import strip_markdown
 
     text = strip_markdown(content)
     if len(text) > 4000:
-        raise ValueError("WhatsApp text must be at most 4000 characters")
+        raise ReplyTooLong("WhatsApp text must be at most 4000 characters")
     conversation = str(meta.get("conversation_id") or "")
     if not conversation or meta.get("companion"):
         raise ValueError("WhatsApp reply requires its original conversation")
     guard = CHANNEL_DELIVERY_GUARD.get()
     if guard is not None:
         guard()
+    await validate_reply_access(gateway, meta)
+    if guard is not None:
+        guard()
     identity = gateway._identity
     method = require_method(identity, "send_whatsapp")
+    quote = await asyncio.to_thread(auto_reply_kwargs, identity, meta)
+    if guard is not None:
+        guard()
     source = meta.get("imessage_event_ids") or [
         meta.get("source_event_id") or meta.get("message_id")
     ]
+    key_parts = [gateway.cfg.base_url, str(identity.id), conversation, source, text]
+    if quote:
+        key_parts.append(quote)
+    if not meta.get("final_reply"):
+        key_parts.append(uuid.uuid4().hex)
     key = (
         "claude-wa-"
         + hashlib.sha256(
             json.dumps(
-                [gateway.cfg.base_url, str(identity.id), conversation, source, text],
+                key_parts,
                 sort_keys=True,
             ).encode()
         ).hexdigest()
     )
+    meta["whatsapp_send_key"] = key
     if meta.get("final_reply"):
         gateway._channel_store("whatsapp").begin_send(meta, chat_id)
 
     def checked():
         if guard is not None:
             guard()
-        return method(conversation_id=conversation, text=text, idempotency_key=key)
+        return method(conversation_id=conversation, text=text, idempotency_key=key, **quote)
 
     sent = await _to_thread_drained(checked)
     try:
@@ -257,6 +370,25 @@ def register_tools(register, client, identity_handle, cfg):
             return {"status": status, "limits": limits}
         if operation == "send_whatsapp":
             recipient, conversation, reply_target, group_name = send_selector(args)
+            session = CURRENT_SESSION.get()
+            turn = getattr(session, "_current_turn", None)
+            meta = getattr(turn, "reply_meta", None) or {}
+            native = (meta.get("channel") == "whatsapp" and conversation is not None
+                      and delivery_target(meta, conversation) == meta.get("conversation_id"))
+            if native and meta.get("companion"):
+                raise ValueError("Use the bound Companion reply tool for this turn")
+            if (native and reply_target is None and args.get("idempotency_key")
+                    and args["idempotency_key"] == meta.get("whatsapp_explicit_quote_key")
+                    and meta.get("whatsapp_quote_intent")):
+                reply_target = meta["whatsapp_quote_intent"].get("reply_to_message_id")
+            if native and meta.get("whatsapp_reply_source") is not None:
+                quote = auto_reply_kwargs(identity, meta)
+                authorize()
+                # A supplied key may belong to an older plain request. Only an
+                # explicit target or a new key can introduce a quote.
+                if reply_target is None and not args.get("idempotency_key"):
+                    reply_target = quote.get("reply_to_message_id")
+                    args["reply_to_message_id"] = reply_target
             selector = {"conversation_id": conversation} if conversation is not None else {"to": recipient}
             if reply_target is not None:
                 selector["reply_to_message_id"] = reply_target
@@ -268,9 +400,6 @@ def register_tools(register, client, identity_handle, cfg):
                 raise ValueError(
                     "Use one recipient or conversation and text or an owned media ID"
                 )
-            session = CURRENT_SESSION.get()
-            turn = getattr(session, "_current_turn", None)
-            meta = getattr(turn, "reply_meta", None) or {}
             source = (
                 meta.get("imessage_event_ids")
                 or meta.get("source_event_id")
@@ -292,13 +421,24 @@ def register_tools(register, client, identity_handle, cfg):
             )
             args["idempotency_key"] = key
             authorize()
-            target = str(args.get("conversation_id") or args.get("to") or "")
-            scalar_recipient = recipient[0] if isinstance(recipient, list) and len(recipient) == 1 else recipient
-            recipient = re.sub(r"[\s().-]", "", str(scalar_recipient or ""))
-            if (meta.get("channel") == "whatsapp" and meta.get("conversation_kind") != "group" and re.fullmatch(r"\+[1-9]\d{6,14}", recipient)
-                    and recipient == meta.get("sender")):
-                target = str(meta.get("conversation_id") or target)
+            target = delivery_target(meta, conversation, recipient)
+            if meta.get("channel") == "whatsapp" and target == meta.get("conversation_id"):
+                if meta.get("whatsapp_explicit_quote_attempted") and (
+                        not meta.get("whatsapp_quote_accepted") or key == meta.get("whatsapp_explicit_quote_key")) and (
+                        reply_target is None or key != meta.get("whatsapp_explicit_quote_key")
+                        or (meta.get("whatsapp_quote_intent") is not None
+                            and kwargs != meta["whatsapp_quote_intent"])):
+                    raise ReplyPreflightRejected("A quoted reply was already attempted; preserve its original request")
+            if reply_target is not None and meta.get("channel") == "whatsapp" and target == meta.get("conversation_id"):
+                meta["whatsapp_quote_intent"] = kwargs.copy()
+                meta["whatsapp_quote_accepted"] = False
+                meta["whatsapp_explicit_quote_attempted"] = True
+                meta["whatsapp_explicit_quote_key"] = key
+                from .imessage import IMessageState
+                IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
+                _mark_tool_delivery("whatsapp", target)
             try:
+                authorize()
                 sent = require_method(identity, operation)(
                     **kwargs, idempotency_key=key
                 )
@@ -309,6 +449,13 @@ def register_tools(register, client, identity_handle, cfg):
                     # answer as a second ordinary send on this conversation.
                     _mark_tool_delivery("whatsapp", target)
                 raise
+            returned_conversation = field(sent, "conversation_id")
+            quoted_current = (reply_target is not None and meta.get("channel") == "whatsapp"
+                              and target == meta.get("conversation_id"))
+            if quoted_current:
+                meta["whatsapp_quote_accepted"] = True
+            if returned_conversation is not None:
+                target = delivery_target(meta, str(returned_conversation))
             _mark_tool_delivery("whatsapp", target)
             if (
                 session is not None
@@ -319,8 +466,9 @@ def register_tools(register, client, identity_handle, cfg):
 
                 try:
                     store = IMessageState(cfg, channel="whatsapp")
+                    if quoted_current:
+                        store.mark(meta, "running", chat_id=session.chat_id)
                     store.record_outbound(sent, meta, session.chat_id)
-                    store.mark(meta, "done", chat_id=session.chat_id)
                 except Exception:
                     logger.warning(
                         "WhatsApp accepted; local tracking needs recovery. Do not resend."
@@ -365,7 +513,7 @@ def register_tools(register, client, identity_handle, cfg):
         ),
         (
             "inkbox_send_whatsapp",
-            "Send a requested direct or dedicated-line group WhatsApp message, optionally quoting a visible message in the selected conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
+            "Send a requested direct or dedicated-line group WhatsApp message, quoting the active source by default in its exact conversation for new request keys. An explicit visible quote is also supported. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
             {
                 "to": {"anyOf": [string("One E.164 recipient"), {"type": "array", "items": string("E.164 group participant"), "minItems": 1, "maxItems": 8, "uniqueItems": True}], "description": "One number, or 2-8 unique numbers for a new group. Existing groups use conversation_id."},
                 "reply_to_message_id": string("Visible message ID to quote; requires conversation_id"),
@@ -416,7 +564,7 @@ def register_tools(register, client, identity_handle, cfg):
         ),
         (
             "inkbox_upload_whatsapp_media",
-            "Upload one local attachment (at most 20 MiB) and retain its owned ID for sending. Do not upload again to recover an uncertain send.",
+            "Upload one local attachment within the current status/limits allowance (5 MiB by default, 20 MiB hard ceiling). Retain its owned ID; do not re-upload after an uncertain send.",
             {"media_path": string("Local file path")},
             ["media_path"],
             "upload_whatsapp_media",
@@ -464,6 +612,7 @@ def record_status(gateway, envelope):
         return
     store = gateway._channel_store("whatsapp")
     with store._db() as db:
+        db.execute("BEGIN IMMEDIATE")
         row = db.execute(
             "SELECT route FROM outbound WHERE message_id=?", (str(message["id"]),)
         ).fetchone()

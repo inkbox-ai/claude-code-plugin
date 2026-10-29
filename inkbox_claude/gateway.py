@@ -1739,11 +1739,16 @@ class InkboxGateway:
                                        f"unconfirmed:{mode}:{event_id}")
                 store.mark_uncertain_notice_buffered(item["meta"], item["chat_id"])
             pending = store.replay_pending()
+            def allowed(meta):
+                if mode == "whatsapp":
+                    from .whatsapp import local_route_allowed
+                    return local_route_allowed(self, meta)
+                return self._sender_allowed(str(meta.get("sender") or ""), str(meta.get("actor_id") or ""))
             for item in store.pending_replies():
                 if item["chat_id"] in blocked_chats:
                     continue
                 meta = item["meta"]
-                if not self._sender_allowed(str(meta.get("sender") or ""), str(meta.get("actor_id") or "")):
+                if not allowed(meta):
                     store.mark(meta, "cancelled")
                     continue
                 session = self.sessions.get(item["chat_id"])
@@ -1752,7 +1757,7 @@ class InkboxGateway:
                 if item["chat_id"] in blocked_chats:
                     continue
                 meta = item["meta"]
-                if self._sender_allowed(str(meta.get("sender") or ""), str(meta.get("actor_id") or "")):
+                if allowed(meta):
                     await self.sessions.get(item["chat_id"]).handle_inbound(item["text"], mode, meta)
                 else:
                     store.mark(meta, "cancelled")

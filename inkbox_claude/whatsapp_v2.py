@@ -117,7 +117,7 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
     import json
     import re
     from aiohttp import web
-    from .whatsapp import field, require_method
+    from .whatsapp import field, require_method, reply_source
 
     reaction = (envelope.get("data") or {}).get("reaction") or {}
     actor = reaction.get("remote_number")
@@ -170,7 +170,8 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
             "reaction": label, "reaction_id": reaction_id, "reaction_revision": reaction["revision"],
             "contact": contact, "agent_identity": None, "contact_memories": [],
             "reply_to_message_id": field(target, "reply_to_message_id"), "thread_id": field(target, "thread_id"),
-            "thread_root_message_id": field(target, "thread_root_message_id"), "whatsapp_reply_target": target_id}
+            "thread_root_message_id": field(target, "thread_root_message_id"), "whatsapp_reply_target": target_id,
+            "whatsapp_reply_source": reply_source(gateway._identity, conversation, target_id)}
         store = gateway._channel_store("whatsapp")
         if not store.admit(chat_id, body, meta):
             gateway._dedup_commit(receipt)
