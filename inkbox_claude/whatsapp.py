@@ -1,4 +1,4 @@
-"""Approved one-to-one WhatsApp routing; delivery notifications never request a reply."""
+"""Dedicated WhatsApp routing; delivery notifications never request a reply."""
 
 from __future__ import annotations
 
@@ -9,13 +9,17 @@ import logging
 import re
 from typing import Any
 
+from .whatsapp_v2 import V2_OPERATIONS, run_v2, specifications as v2_specifications, send_selector
+
 EVENTS = [
     "whatsapp.received",
     "whatsapp.sent",
     "whatsapp.delivered",
     "whatsapp.delivery_failed",
     "whatsapp.delivery_unconfirmed",
+    "whatsapp.reaction_received",
 ]
+
 logger = logging.getLogger(__name__)
 _REJECTED_SEND_CODES = {
     403: {"whatsapp_not_eligible", "whatsapp_access_required", "whatsapp_contact_not_allowed", "whatsapp_media_source_not_allowed"},
@@ -48,7 +52,7 @@ def unsupported(exc):
 def require_method(identity, name):
     method = getattr(identity, name, None)
     if not callable(method):
-        raise RuntimeError("WhatsApp requires Inkbox SDK 0.7.21 or newer")
+        raise RuntimeError("WhatsApp requires Inkbox SDK 0.7.24 or newer")
     return method
 
 
@@ -63,20 +67,22 @@ async def receive(gateway, envelope):
     sender = str(message.get("sender_number") or "")
     identity = gateway._identity
     participants = message.get("participants") or []
+    is_group = message.get("is_group") is True
     if (
         not message_id
         or not event_id
         or not conversation
         or message.get("direction") != "inbound"
-        or message.get("is_group")
-        or len(participants) != 1
-        or participants[0] != sender
-        or sender != message.get("remote_number")
+        or not isinstance(participants, list)
+        or not participants
+        or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9]\d{6,14}", number) is None for number in participants)
+        or sender not in participants
+        or (not is_group and (len(participants) != 1 or sender != message.get("remote_number")))
         or sender == message.get("local_number")
         or str(message.get("agent_identity_id") or "") != str(identity.id)
     ):
         return web.json_response({"ok": True, "ignored": "unsupported-message"})
-    if not gateway._sender_allowed(sender):
+    if not gateway._sender_allowed(sender) or (is_group and any(not gateway._sender_allowed(number) for number in participants)):
         return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
     text = str(message.get("content") or "")
     media = message.get("media") or []
@@ -119,7 +125,7 @@ async def receive(gateway, envelope):
             if gateway.cfg.contact_memories_enabled
             else []
         )
-        chat_id = gateway._chat_key(
+        chat_id = gateway._thread_key("whatsapp", conversation) if is_group else gateway._chat_key(
             data,
             sender,
             gateway._thread_key("whatsapp", conversation),
@@ -136,14 +142,19 @@ async def receive(gateway, envelope):
             "sender": sender,
             "contact": contact,
             "agent_identity": None
-            if contact
+            if contact or is_group
             else gateway._single_agent_identity(
                 gateway._webhook_list(
                     data, "agent_identities", "agentIdentities", "identity_agents"
                 )
             ),
             "contact_memories": memories,
-            "conversation_kind": "direct",
+            "conversation_kind": "group" if is_group else "direct",
+            "participants": participants,
+            "reply_to_message_id": message.get("reply_to_message_id"),
+            "thread_id": message.get("thread_id"),
+            "thread_root_message_id": message.get("thread_root_message_id"),
+            "whatsapp_reply_target": message_id,
             "media": bool(media),
         }
         store = gateway._channel_store("whatsapp")
@@ -172,7 +183,7 @@ async def send_reply(gateway, chat_id, content, meta):
         raise ValueError("WhatsApp text must be at most 4000 characters")
     conversation = str(meta.get("conversation_id") or "")
     if not conversation or meta.get("companion"):
-        raise ValueError("WhatsApp reply requires its original one-to-one conversation")
+        raise ValueError("WhatsApp reply requires its original conversation")
     guard = CHANNEL_DELIVERY_GUARD.get()
     if guard is not None:
         guard()
@@ -223,6 +234,8 @@ def register_tools(register, client, identity_handle, cfg):
         authorize()
         identity = client.get_identity(identity_handle)
         authorize()
+        if operation in V2_OPERATIONS:
+            return run_v2(identity, operation, args, authorize=authorize)
         if operation == "lookup_whatsapp_send":
             return {
                 "message_id": str(
@@ -243,10 +256,13 @@ def register_tools(register, client, identity_handle, cfg):
                 pass  # An older API must not block status or historical reads.
             return {"status": status, "limits": limits}
         if operation == "send_whatsapp":
-            selector = {
-                key: args[key] for key in ("to", "conversation_id") if key in args
-            }
-            if len(selector) != 1 or not (
+            recipient, conversation, reply_target, group_name = send_selector(args)
+            selector = {"conversation_id": conversation} if conversation is not None else {"to": recipient}
+            if reply_target is not None:
+                selector["reply_to_message_id"] = reply_target
+            if group_name is not None:
+                selector["group_name"] = group_name
+            if not (
                 str(args.get("text") or "").strip() or args.get("media_id")
             ):
                 raise ValueError(
@@ -274,10 +290,12 @@ def register_tools(register, client, identity_handle, cfg):
                     ).encode()
                 ).hexdigest()
             )
+            args["idempotency_key"] = key
             authorize()
             target = str(args.get("conversation_id") or args.get("to") or "")
-            recipient = re.sub(r"[\s().-]", "", str(args.get("to") or ""))
-            if (meta.get("channel") == "whatsapp" and re.fullmatch(r"\+[1-9]\d{6,14}", recipient)
+            scalar_recipient = recipient[0] if isinstance(recipient, list) and len(recipient) == 1 else recipient
+            recipient = re.sub(r"[\s().-]", "", str(scalar_recipient or ""))
+            if (meta.get("channel") == "whatsapp" and meta.get("conversation_kind") != "group" and re.fullmatch(r"\+[1-9]\d{6,14}", recipient)
                     and recipient == meta.get("sender")):
                 target = str(meta.get("conversation_id") or target)
             try:
@@ -347,9 +365,11 @@ def register_tools(register, client, identity_handle, cfg):
         ),
         (
             "inkbox_send_whatsapp",
-            "Send a requested one-to-one WhatsApp message. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
+            "Send a requested direct or dedicated-line group WhatsApp message, optionally quoting a visible message in the selected conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
             {
-                "to": string("One E.164 recipient"),
+                "to": {"anyOf": [string("One E.164 recipient"), {"type": "array", "items": string("E.164 group participant"), "minItems": 1, "maxItems": 8, "uniqueItems": True}], "description": "One number, or 2-8 unique numbers for a new group. Existing groups use conversation_id."},
+                "reply_to_message_id": string("Visible message ID to quote; requires conversation_id"),
+                "group_name": {**string("Creation hint for a new group; not a rename"), "minLength": 1, "maxLength": 100},
                 "conversation_id": string(
                     "Existing conversation; mutually exclusive with to"
                 ),
@@ -419,7 +439,7 @@ def register_tools(register, client, identity_handle, cfg):
             "mark_whatsapp_read",
         ),
     ]
-    for name, description, properties, required, operation in specs:
+    for name, description, properties, required, operation in specs + v2_specifications():
         register(
             name,
             description,
@@ -433,9 +453,9 @@ def register_tools(register, client, identity_handle, cfg):
 
 def record_status(gateway, envelope):
     """Correlate content-free delivery facts without starting or retrying model work."""
-    message = (envelope.get("data") or {}).get("message") or {}
-    if envelope.get("event_type") not in EVENTS[1:]:
+    if envelope.get("event_type") not in EVENTS[1:5]:
         return
+    message = (envelope.get("data") or {}).get("message") or {}
     if (
         not message.get("id")
         or str(message.get("agent_identity_id") or "") != str(gateway._identity.id)

@@ -36,7 +36,7 @@ def build_channel_tools(client, identity_handle, cfg):
                 safe = ("Vault is locked", "secret_id must be a UUID", "only login", "no TOTP",
                         "No vault key matched", "not been initialized", "timed out",
                         "The originating turn has ended", "originating conversation", "supplied Companion history",
-                        "WhatsApp requires Inkbox SDK 0.7.21 or newer")
+                        "WhatsApp requires Inkbox SDK 0.7.24 or newer")
                 for marker in safe:
                     if marker.lower() in str(exc).lower():
                         message = marker
@@ -51,6 +51,9 @@ def build_channel_tools(client, identity_handle, cfg):
                     key = getattr(exc, "idempotency_key", None)
                     if key:
                         recovery.update({"idempotency_key": key, "media_id": getattr(exc, "whatsapp_media_id", None), "recovery": "Request not accepted: follow retry_condition, then reuse the original key and media ID." if public_quota_error(exc) else "Read message/send lookup state; do not send a new copy."})
+                if name in {"inkbox_react_whatsapp", "inkbox_unreact_whatsapp"} and args.get("idempotency_key"):
+                    recovery.update(idempotency_key=args["idempotency_key"], reaction_id=args.get("reaction_id"),
+                        target_message_id=args.get("message_id"), recovery="Preserve this operation and key. Recover only by replaying the same operation/key or reading its original reaction receipt; never create a replacement key.")
                 return _error(message, **({"status_code": status} if isinstance(status, int) else {}), **recovery)
         registered.append(tool(name, description, {
             "type": "object", "properties": properties, "required": required,

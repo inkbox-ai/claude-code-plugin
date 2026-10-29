@@ -240,3 +240,15 @@ def test_old_api_rejecting_whatsapp_keeps_other_subscriptions():
     subscriptions = OlderAPI()
     _patched_gateway(_Identity(phone=None, imessage_enabled=True), subscriptions=subscriptions)
     assert [item["event_types"] for item in subscriptions.created] == [gateway.A2A_EVENTS, gateway.CALL_EVENTS, gateway.IMESSAGE_EVENTS]
+
+
+def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
+    class OlderAPI(_FakeSubscriptions):
+        def create(self, **kwargs):
+            if "whatsapp.reaction_received" in kwargs["event_types"]:
+                raise ValueError("Unknown WhatsApp event type")
+            return super().create(**kwargs)
+    subscriptions = OlderAPI()
+    _patched_gateway(_Identity(phone=None, imessage_enabled=False), subscriptions=subscriptions)
+    assert any(row["event_types"] == WHATSAPP_EVENTS[:5] for row in subscriptions.created)
+    assert not any("whatsapp.reaction_received" in row["event_types"] for row in subscriptions.created)

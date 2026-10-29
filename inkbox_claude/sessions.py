@@ -473,7 +473,7 @@ class ContactSession:
         if bot and raw_text.lstrip().startswith(f"<@{bot}>"):
             raw_text = raw_text.lstrip()[len(bot) + 3:].strip()
         command = None if meta.get("reaction") else _control_command(raw_text)
-        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
         if pending_reply and (mode == "whatsapp" or self.pending.route.get("channel") == "whatsapp"):
             pending_reply = mode == self.pending.route.get("channel") and all(
@@ -512,6 +512,14 @@ class ContactSession:
             route = control_turn.reply_meta or {}
             if any(meta.get(k) != route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id")):
                 self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or ""))
+                await self.receipt(mode, meta, "done")
+                return
+        if mode == "whatsapp" and command in {"reset", "resume"}:
+            parked = [*list(self._queue._queue)]
+            parked += [self._batching_turn, self._deferred_turn, self._retrying_turn, self._delivery_turn]
+            if any(turn is not None and turn.mode == "whatsapp" and
+                   any((turn.reply_meta or {}).get(key) != meta.get(key) for key in ("conversation_id", "sender"))
+                   for turn in parked):
                 await self.receipt(mode, meta, "done")
                 return
         if command:
@@ -803,9 +811,15 @@ class ContactSession:
             or self._batching_turn is not None or self._deferred_turn is not None
             or self._retrying_turn is not None or self._delivery_turn is not None
         )
-        reply_mode, _ = self._reply_route()
+        reply_mode, reply_meta = self._reply_route()
+        candidates = [self._current_turn, self._batching_turn, self._deferred_turn,
+                      self._retrying_turn, self._delivery_turn, *list(self._queue._queue)]
+        owned = [turn for turn in candidates if turn is not None and turn.mode == "whatsapp"
+                 and all((turn.reply_meta or {}).get(key) == reply_meta.get(key) for key in ("conversation_id", "sender"))]
         try:
-            await self._abort_in_flight(only_mode=reply_mode if reply_mode == "whatsapp" or (reply_mode == "imessage" and self.cfg.imessage_threaded_replies) else None)
+            await self._abort_in_flight(
+                only_mode=reply_mode if reply_mode == "whatsapp" or (reply_mode == "imessage" and self.cfg.imessage_threaded_replies) else None,
+                only_turns=owned if reply_mode == "whatsapp" else None)
         except Exception:
             if not getattr(self, "_execution_blocked", False) and not self._pending_fenced_owners:
                 raise

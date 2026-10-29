@@ -1,12 +1,16 @@
 # Changelog
 
-## 0.2.15 (unreleased)
+- Dedicated WhatsApp groups, explicit quoted replies and chronological thread reads.
+- Named/custom versioned reactions, actor-scoped peer context, and silent self/delivery callbacks.
+- Preserve original intent and request keys after uncertain sends; automatic replies remain plain.
+
+## 0.2.16 (unreleased)
 
 - Approved dedicated one-to-one WhatsApp: signed incoming messages, automatic replies,
   durable receipt/recovery state, owned attachments, and read-only availability.
 - Add native WhatsApp tools, exact-route approvals/burst controls, temporary media
   renewal, and delivery notifications that never trigger a second agent reply.
-- Require Inkbox SDK 0.7.21; test its reviewed public source candidate without
+- Require Inkbox SDK 0.7.24; test its reviewed public source candidate without
   publishing packages. Historical base-channel compatibility remains separate.
 
 ## 0.2.14

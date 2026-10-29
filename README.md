@@ -612,8 +612,12 @@ before approval so a cached disabled snapshot does not block later access.
 Use one E.164 recipient or an existing conversation, text (maximum 4,000 Unicode
 code points), and at most one owned attachment (20 MiB). Upload first and retain
 the returned media ID. Media URLs expire; retrieve fresh access by media ID.
-An unavailable attachment remains explicit context. Groups, quoted replies,
-reactions, typing, remote read receipts, and WhatsApp calls are not supported.
+An unavailable attachment remains explicit context. Use one E.164 number or 2–8
+unique numbers for a new group; existing groups use `conversation_id`. Explicit
+`reply_to_message_id` quotes a visible message in that conversation. Thread reads
+and named/custom reactions have dedicated tools. Ordinary automatic replies stay
+plain, never a retry fallback for an uncertain explicit quote. Peer reactions are
+context, not new commands. Typing, remote read receipts and calls are unsupported.
 
 Incoming events are authenticated and deduplicated, and ordinary answers are
 journaled before sending. Preserve a logical-send key and media ID after an
@@ -621,6 +625,6 @@ uncertain outcome; do not re-upload or send a new copy. Confirmed sending and
 unknown delivery are different facts. Delivery notifications update local
 correlation only: they do not wake the model or trigger automatic resend.
 
-This draft requires the matching API and the normal Inkbox SDK 0.7.21 release.
+This draft requires the matching API and the normal Inkbox SDK 0.7.24 release.
 CI builds the real reviewed public SDK commit through `tests/ci/candidate_sdk.sh`;
 no package publication or live messaging is part of this change.

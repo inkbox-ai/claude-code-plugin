@@ -124,7 +124,7 @@ def test_received_is_owned_deduplicated_and_retained_even_without_cached_approva
     [
         {"agent_identity_id": "wrong"},
         {"direction": "outbound"},
-        {"is_group": True},
+        {"is_group": True, "participants": ["+15555550102"]},
         {"participants": ["+15555550101", "+15555550102"]},
         {"sender_number": "+15555550100"},
     ],

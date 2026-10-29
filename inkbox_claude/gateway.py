@@ -1087,7 +1087,12 @@ class InkboxGateway:
         except Exception as exc:
             if not unsupported(exc):
                 raise
-            logger.warning("WhatsApp notifications are unavailable; other channels remain active")
+            try:
+                _reconcile({"agent_identity_id": identity.id}, WHATSAPP_EVENTS[:5])
+            except Exception as legacy_error:
+                if not unsupported(legacy_error):
+                    raise
+                logger.warning("WhatsApp notifications are unavailable; other channels remain active")
         logger.info("[bridge] identity events for %s → %s", self.cfg.identity, webhook_url)
 
     def _read_hosted_call_registry(self) -> Dict[str, Any]:
@@ -2009,6 +2014,9 @@ class InkboxGateway:
                     response = await self._on_mail_received(envelope)
                 elif event_type == "text.received":
                     response = await self._on_text_received(envelope)
+                elif event_type == "whatsapp.reaction_received":
+                    from .whatsapp_v2 import receive_reaction
+                    response = await receive_reaction(self, envelope)
                 elif event_type == "whatsapp.received":
                     from .whatsapp import receive
                     response = await receive(self, envelope)
