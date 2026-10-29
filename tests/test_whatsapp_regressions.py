@@ -112,6 +112,11 @@ def test_canonical_explicit_send_correlation(setup, monkeypatch, selector, uncer
         elif selector == "group":
             meta.update(conversation_kind="group", participants=[meta["sender"], "+15555550102"])
             args["to"] = ["+1 (555) 555-0102", meta["sender"]]
+            client.whatsapp._http.get.return_value = {
+                "id": conversation, "agent_identity_id": OWNER, "is_group": True,
+                "local_number": MESSAGE_WIRE["local_number"], "remote_number": None,
+                "participants": meta["participants"], "created_at": MESSAGE_WIRE["created_at"],
+                "updated_at": MESSAGE_WIRE["updated_at"]}
         else:
             args["to"] = [meta["sender"]] if selector == "singleton" else "+15555550103"
         returned = CONV if selector == "other" else conversation

@@ -1700,6 +1700,8 @@ class ContactSession:
         try:
             await self.notify_activity(reply_mode, route, "waiting")
             if reply_mode == "whatsapp":
+                from .whatsapp import validate_reply_fence
+
                 prompt_route = {**deepcopy(route), "whatsapp_interaction_id": uuid.uuid4().hex}
 
                 def guard():
@@ -1707,6 +1709,9 @@ class ContactSession:
                             or self._client_generation != pending.generation or self._interrupting
                             or self._shutting_down or (pending.owner is not None and pending.owner.cancelled)):
                         raise PermissionError("Permission prompt ownership is no longer active")
+                    # Routing is frozen, but send outcomes belong to the live turn.
+                    live_meta = pending.owner.reply_meta if pending.owner is not None else route
+                    validate_reply_fence(live_meta or {}, interaction=True)
 
                 token = CHANNEL_DELIVERY_GUARD.set(guard)
                 try:

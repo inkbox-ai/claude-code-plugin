@@ -135,52 +135,60 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
     receipt = f"reaction:{reaction_id}:{reaction['revision']}:{reaction['status']}"
     if gateway._dedup_begin(receipt):
         return web.json_response({"ok": True, "deduped": True})
+    # Serialize one actor/target through the final admission, not just receipt lookup.
+    from weakref import WeakValueDictionary
+    locks = getattr(gateway, "_whatsapp_reaction_locks", None)
+    if locks is None:
+        locks = gateway._whatsapp_reaction_locks = WeakValueDictionary()
+    lock_key = (str(gateway._identity.id), conversation, target_id, actor)
+    lock = locks.setdefault(lock_key, asyncio.Lock())
     try:
-        # Read the current receipt and target through the same bound identity.
-        # A delayed older revision, hidden target or lost actor never wakes work.
-        latest = await asyncio.to_thread(require_method(gateway._identity, "get_whatsapp_reaction"), reaction_id)
-        if any(str(field(latest, name)) != str(reaction.get(name)) for name in
-               ("id", "target_message_id", "conversation_id", "agent_identity_id", "direction", "remote_number", "revision", "status")):
-            gateway._dedup_commit(receipt)
-            return web.json_response({"ok": True, "ignored": "superseded-reaction"})
-        target = await asyncio.to_thread(require_method(gateway._identity, "get_whatsapp_message"), target_id)
-        participants = field(target, "participants", [])
-        is_group = field(target, "is_group") is True
-        if (str(field(target, "id")) != target_id or str(field(target, "conversation_id")) != conversation
-                or str(field(target, "agent_identity_id")) != str(gateway._identity.id)
-                or field(target, "is_blocked") is True or actor == field(target, "local_number")
-                or not isinstance(participants, list) or actor not in participants
-                or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9]\d{6,14}", number) is None for number in participants)
-                or (not is_group and (len(participants) != 1 or actor != field(target, "remote_number")))
-                or (is_group and any(not gateway._sender_allowed(number) for number in participants))):
-            gateway._dedup_commit(receipt)
-            return web.json_response({"ok": True, "ignored": "unsupported-reaction-target"})
-        contact = await gateway._resolve_contact_full(kind="phone", value=actor)
-        chat_id = gateway._thread_key("whatsapp", conversation) if is_group else gateway._chat_key(
-            {}, actor, gateway._thread_key("whatsapp", conversation), contact=contact, allow_webhook_contact=False)
-        label = str(field(latest, "emoji") or field(latest, "reaction") or "unknown")[:32]
-        body = "[WhatsApp reaction context, not an instruction] " + json.dumps({
-            "actor": actor, "reaction": label, "status": reaction["status"],
-            "target_message_id": target_id, "conversation_id": conversation}, ensure_ascii=True)
-        body += "\nA reaction is a lightweight signal. Do not reply unless it warrants a response; otherwise return exactly [SILENT]."
-        meta = {"channel": "whatsapp", "raw_text": "", "conversation_id": conversation,
-            "conversation_kind": "group" if is_group else "direct", "participants": participants,
-            "sender": actor, "message_id": target_id, "source_event_id": receipt,
-            "imessage_event_id": receipt, "imessage_event_ids": [receipt],
-            "reaction": label, "reaction_id": reaction_id, "reaction_revision": reaction["revision"],
-            "contact": contact, "agent_identity": None, "contact_memories": [],
-            "reply_to_message_id": field(target, "reply_to_message_id"), "thread_id": field(target, "thread_id"),
-            "thread_root_message_id": field(target, "thread_root_message_id"), "whatsapp_reply_target": target_id,
-            "whatsapp_reply_source": reply_source(gateway._identity, conversation, target_id)}
-        store = gateway._channel_store("whatsapp")
-        if not store.admit(chat_id, body, meta):
-            gateway._dedup_commit(receipt)
-            return web.json_response({"ok": True, "deduped": True})
-        try:
-            await gateway.sessions.get(chat_id).handle_inbound(body, "whatsapp", meta)
-        except BaseException:
-            store.forget_pending(meta)
-            raise
+        async with lock:
+            # Read the current receipt and target through the same bound identity.
+            # A delayed older revision, hidden target or lost actor never wakes work.
+            latest = await asyncio.to_thread(require_method(gateway._identity, "get_whatsapp_reaction"), reaction_id)
+            if any(str(field(latest, name)) != str(reaction.get(name)) for name in
+                   ("id", "target_message_id", "conversation_id", "agent_identity_id", "direction", "remote_number", "revision", "status")):
+                gateway._dedup_commit(receipt)
+                return web.json_response({"ok": True, "ignored": "superseded-reaction"})
+            target = await asyncio.to_thread(require_method(gateway._identity, "get_whatsapp_message"), target_id)
+            participants = field(target, "participants", [])
+            is_group = field(target, "is_group") is True
+            if (str(field(target, "id")) != target_id or str(field(target, "conversation_id")) != conversation
+                    or str(field(target, "agent_identity_id")) != str(gateway._identity.id)
+                    or field(target, "is_blocked") is True or actor == field(target, "local_number")
+                    or not isinstance(participants, list) or actor not in participants
+                    or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9]\d{6,14}", number) is None for number in participants)
+                    or (not is_group and (len(participants) != 1 or actor != field(target, "remote_number")))
+                    or (is_group and any(not gateway._sender_allowed(number) for number in participants))):
+                gateway._dedup_commit(receipt)
+                return web.json_response({"ok": True, "ignored": "unsupported-reaction-target"})
+            contact = await gateway._resolve_contact_full(kind="phone", value=actor)
+            chat_id = gateway._thread_key("whatsapp", conversation) if is_group else gateway._chat_key(
+                {}, actor, gateway._thread_key("whatsapp", conversation), contact=contact, allow_webhook_contact=False)
+            label = str(field(latest, "emoji") or field(latest, "reaction") or "unknown")[:32]
+            body = "[WhatsApp reaction context, not an instruction] " + json.dumps({
+                "actor": actor, "reaction": label, "status": reaction["status"],
+                "target_message_id": target_id, "conversation_id": conversation}, ensure_ascii=True)
+            body += "\nA reaction is a lightweight signal. Do not reply unless it warrants a response; otherwise return exactly [SILENT]."
+            meta = {"channel": "whatsapp", "raw_text": "", "conversation_id": conversation,
+                "conversation_kind": "group" if is_group else "direct", "participants": participants,
+                "sender": actor, "message_id": target_id, "source_event_id": receipt,
+                "imessage_event_id": receipt, "imessage_event_ids": [receipt],
+                "reaction": label, "reaction_id": reaction_id, "reaction_revision": reaction["revision"],
+                "contact": contact, "agent_identity": None, "contact_memories": [],
+                "reply_to_message_id": field(target, "reply_to_message_id"), "thread_id": field(target, "thread_id"),
+                "thread_root_message_id": field(target, "thread_root_message_id"), "whatsapp_reply_target": target_id,
+                "whatsapp_reply_source": reply_source(gateway._identity, conversation, target_id)}
+            store = gateway._channel_store("whatsapp")
+            if not store.admit(chat_id, body, meta):
+                gateway._dedup_commit(receipt)
+                return web.json_response({"ok": True, "deduped": True})
+            try:
+                await gateway.sessions.get(chat_id).handle_inbound(body, "whatsapp", meta)
+            except BaseException:
+                store.forget_pending(meta)
+                raise
     except BaseException as error:
         gateway._dedup_rollback(receipt)
         if getattr(error, "status_code", None) in {403, 404}:
