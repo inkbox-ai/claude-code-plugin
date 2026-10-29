@@ -141,9 +141,13 @@ def test_canonical_explicit_send_correlation(setup, monkeypatch, selector, uncer
         session._client = Host()
         store.admit(session.chat_id, "Question", meta)
         await session._run_turn(_Turn(text="Question", mode="whatsapp", reply_meta=meta))
-        expect_final = selector == "other" or (selector == "returned" and uncertain)
+        expect_final = selector in {"other", "group"} and not uncertain
         assert finals == (["Answer"] if expect_final else [])
-        assert row(store)["state"] == "done"
+        blocked_final = uncertain and selector in {"group", "other", "returned"}
+        assert row(store)["state"] == ("failed" if blocked_final else "done")
+        if blocked_final:
+            receipt = row(store)["meta"]["whatsapp_recipient_sends"]["original"]
+            assert receipt["outcome"] == "uncertain" and receipt["key"] == "original"
     asyncio.run(run())
 
 

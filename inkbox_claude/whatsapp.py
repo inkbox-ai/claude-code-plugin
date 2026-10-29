@@ -118,11 +118,39 @@ def delivery_target(meta, conversation=None, recipient=None):
     if conversation is not None:
         return current if str(conversation) == canonical else str(conversation)
     recipients = recipient if isinstance(recipient, list) else [recipient]
-    participants = meta.get("participants") if meta.get("conversation_kind") == "group" else [meta.get("sender")]
-    if (meta.get("channel") == "whatsapp" and current and participants
-            and set(recipients) == set(participants)):
+    if (meta.get("channel") == "whatsapp" and current
+            and meta.get("conversation_kind") != "group"
+            and recipients == [meta.get("sender")] and meta.get("sender")):
         return current
     return str(recipient or "")
+
+
+def source_plain_send(meta):
+    """Older recipient attempts retain their request, not source-reply ownership."""
+    plain = meta.get("whatsapp_plain_send")
+    if plain and "to" in plain.get("intent", {}):
+        if delivery_target(meta, recipient=plain["intent"]["to"]) != meta.get("conversation_id"):
+            return None
+    return plain
+
+
+def validate_send_uncertainty(meta, *, key=None, intent=None):
+    """Unresolved sends fence the owning turn, not just their destination."""
+    attempts = list(meta.get("whatsapp_recipient_sends", {}).values())
+    if meta.get("whatsapp_plain_send"):
+        attempts.append(meta["whatsapp_plain_send"])
+    for previous in attempts:
+        if previous["outcome"] in {"pending", "uncertain"} and (
+                key != previous["key"] or intent != previous["intent"]):
+            raise ReplyPreflightRejected("A send is unresolved; preserve its original request and key")
+    if (meta.get("whatsapp_explicit_quote_attempted")
+            and not meta.get("whatsapp_quote_accepted")
+            and (key is None or key != meta.get("whatsapp_explicit_quote_key")
+                 or intent is None or intent.get("reply_to_message_id") is None
+                 or delivery_target(meta, intent.get("conversation_id")) != meta.get("conversation_id")
+                 or (meta.get("whatsapp_quote_intent") is not None
+                     and intent != meta["whatsapp_quote_intent"]))):
+        raise ReplyPreflightRejected("An explicit quoted reply is unresolved; preserve its original request and key")
 
 
 def reply_source(identity, conversation, message_id):
@@ -281,7 +309,8 @@ async def receive(gateway, envelope):
 
 def validate_reply_fence(meta, *, interaction=False):
     """Only confirmed explicit sends permit a separate human interaction."""
-    plain = meta.get("whatsapp_plain_send")
+    validate_send_uncertainty(meta)
+    plain = source_plain_send(meta)
     if plain and plain["outcome"] != "rejected" and not (
             plain["outcome"] == "accepted" and interaction):
         raise ReplyPreflightRejected("An explicit reply was already attempted; inspect its original receipt instead of sending an automatic replacement")
@@ -362,10 +391,20 @@ def register_tools(register, client, identity_handle, cfg):
 
     def run(args, authorize, operation):
         authorize()
+        session = CURRENT_SESSION.get()
+        turn = getattr(session, "_current_turn", None)
+        meta = getattr(turn, "reply_meta", None) or {}
+
+        def authorize_effect():
+            authorize()
+            validate_send_uncertainty(meta)
+
+        if operation in {"upload_whatsapp_media", "send_whatsapp_reaction", "remove_whatsapp_reaction"}:
+            authorize_effect()
         identity = client.get_identity(identity_handle)
         authorize()
         if operation in V2_OPERATIONS:
-            return run_v2(identity, operation, args, authorize=authorize)
+            return run_v2(identity, operation, args, authorize=authorize_effect)
         if operation == "lookup_whatsapp_send":
             return {
                 "message_id": str(
@@ -387,9 +426,6 @@ def register_tools(register, client, identity_handle, cfg):
             return {"status": status, "limits": limits}
         if operation == "send_whatsapp":
             recipient, conversation, reply_target, group_name = send_selector(args)
-            session = CURRENT_SESSION.get()
-            turn = getattr(session, "_current_turn", None)
-            meta = getattr(turn, "reply_meta", None) or {}
             native = (meta.get("channel") == "whatsapp" and conversation is not None
                       and delivery_target(meta, conversation) == meta.get("conversation_id"))
             if native and meta.get("companion"):
@@ -445,12 +481,31 @@ def register_tools(register, client, identity_handle, cfg):
             authorize()
             target = delivery_target(meta, conversation, recipient)
             source_bound = meta.get("channel") == "whatsapp" and target == meta.get("conversation_id")
+            def recipient_allowed(number):
+                return (cfg.allow_all_users or not cfg.allowed_users
+                        or number.lower() in {user.lower() for user in cfg.allowed_users})
+
+            if recipient is not None and not all(recipient_allowed(number) for number in (
+                    recipient if isinstance(recipient, list) else [recipient])):
+                raise ReplyPreflightRejected("WhatsApp recipients are no longer locally allowed")
+            attempts = meta.get("whatsapp_recipient_sends", {})
+            legacy = meta.get("whatsapp_plain_send")
+            if legacy and source_plain_send(meta) is None:
+                attempts = meta.setdefault("whatsapp_recipient_sends", {})
+                attempts.setdefault(legacy["key"], legacy)
+                # Clear the old slot explicitly so persistence cannot restore it.
+                meta["whatsapp_plain_send"] = None
+            validate_send_uncertainty(meta, key=key, intent=kwargs)
+            for previous in attempts.values():
+                if ((key == previous["key"] and kwargs != previous["intent"])
+                        or (previous["outcome"] in {"pending", "uncertain"}
+                            and (key != previous["key"] or kwargs != previous["intent"]))):
+                    raise ReplyPreflightRejected("A send was already attempted; preserve its original request")
             if source_bound:
-                _validate_reply_access(identity, meta, lambda number: (
-                    cfg.allow_all_users or not cfg.allowed_users
-                    or number.lower() in {user.lower() for user in cfg.allowed_users}))
+                _validate_reply_access(identity, meta, recipient_allowed)
                 authorize()
-                retained = meta.get("whatsapp_plain_send")
+                validate_send_uncertainty(meta, key=key, intent=kwargs)
+                retained = source_plain_send(meta)
                 if retained and (
                         (key == retained["key"] and kwargs != retained["intent"])
                         or (retained["outcome"] in {"pending", "uncertain"}
@@ -471,12 +526,19 @@ def register_tools(register, client, identity_handle, cfg):
                 IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
                 _mark_tool_delivery("whatsapp", target)
             method = require_method(identity, operation)
-            plain = None
+            attempt = None
             prior_uncertainty = False
-            if source_bound and reply_target is None:
+            recipient_attempt = (session is not None and meta.get("channel") == "whatsapp"
+                                 and not source_bound)
+            if (source_bound and reply_target is None) or recipient_attempt:
+                if recipient_attempt:
+                    retained = attempts.get(key)
                 prior_uncertainty = bool(retained and retained["outcome"] in {"pending", "uncertain"})
-                plain = {"key": key, "intent": kwargs.copy(), "outcome": "pending"}
-                meta["whatsapp_plain_send"] = plain
+                attempt = {"key": key, "intent": kwargs.copy(), "outcome": "pending"}
+                if recipient_attempt:
+                    meta.setdefault("whatsapp_recipient_sends", {})[key] = attempt
+                else:
+                    meta["whatsapp_plain_send"] = attempt
                 from .imessage import IMessageState
                 IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
             authorize()
@@ -491,23 +553,31 @@ def register_tools(register, client, identity_handle, cfg):
                     # An unknown outcome must not be followed by the same final
                     # answer as a second ordinary send on this conversation.
                     _mark_tool_delivery("whatsapp", target)
-                if plain is not None:
-                    plain["outcome"] = "rejected" if public_quota_error(exc) and not prior_uncertainty else "uncertain"
+                if attempt is not None:
+                    attempt["outcome"] = "rejected" if public_quota_error(exc) and not prior_uncertainty else "uncertain"
                     try:
                         IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
                     except Exception:
                         logger.warning("WhatsApp send tracking needs recovery; preserve the original request key.")
                 raise
-            if plain is not None:
-                plain["outcome"] = "accepted"
+            if attempt is not None:
+                attempt["outcome"] = "accepted"
             returned_conversation = field(sent, "conversation_id")
             quoted_current = (reply_target is not None and meta.get("channel") == "whatsapp"
                               and target == meta.get("conversation_id"))
             if quoted_current:
                 meta["whatsapp_quote_accepted"] = True
             if returned_conversation is not None:
-                target = delivery_target(meta, str(returned_conversation))
+                returned_target = delivery_target(meta, str(returned_conversation))
+                if not (isinstance(recipient, list) and len(recipient) > 1
+                        and returned_target == meta.get("conversation_id")):
+                    target = returned_target
             _mark_tool_delivery("whatsapp", target)
+            if recipient_attempt:
+                try:
+                    IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
+                except Exception:
+                    logger.warning("WhatsApp accepted; local tracking needs recovery. Do not resend.")
             if (
                 session is not None
                 and meta.get("channel") == "whatsapp"
@@ -517,7 +587,7 @@ def register_tools(register, client, identity_handle, cfg):
 
                 try:
                     store = IMessageState(cfg, channel="whatsapp")
-                    if quoted_current or plain is not None:
+                    if quoted_current or attempt is not None:
                         store.mark(meta, "running", chat_id=session.chat_id)
                     store.record_outbound(sent, meta, session.chat_id)
                 except Exception:
@@ -537,7 +607,7 @@ def register_tools(register, client, identity_handle, cfg):
                 content = stream.read(20 * 1024 * 1024 + 1)
             if len(content) > 20 * 1024 * 1024:
                 raise ValueError("WhatsApp media must be at most 20 MiB")
-            authorize()
+            authorize_effect()
             return require_method(identity, operation)(
                 content=content,
                 filename=path.name,

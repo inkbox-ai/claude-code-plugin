@@ -17,10 +17,11 @@ from tests.test_whatsapp_autoquote import admit, bind_tool, posts
 from tests.test_whatsapp_v2 import channel as channel, CONVERSATION
 
 
+@pytest.mark.parametrize("destination", ["source", "group", "other"])
 @pytest.mark.parametrize("kind", ["permission", "poll"])
 @pytest.mark.parametrize("plain", [False, True])
 @pytest.mark.parametrize("pause_at", ["source", "dispatch"])
-def test_prompt_rechecks_live_send_outcome_and_allows_exact_recovery(channel, monkeypatch, kind, plain, pause_at):
+def test_prompt_rechecks_live_send_outcome_and_allows_exact_recovery(channel, monkeypatch, kind, plain, pause_at, destination):
     chat, _, meta = admit(channel)
     channel.client.get_identity = Mock(return_value=channel.identity)
     session, _ = bind_tool(channel, meta, chat)
@@ -84,6 +85,10 @@ def test_prompt_rechecks_live_send_outcome_and_allows_exact_recovery(channel, mo
 
             channel.client.whatsapp._http.post = lost_response
             uncertain = {"conversation_id": CONVERSATION, "text": "Additional requested message"}
+            if destination == "group":
+                uncertain = {"to": ["+15550000002", "+15550000004"], "text": "New group"}
+            elif destination == "other":
+                uncertain["conversation_id"] = "00000000-0000-0000-0000-000000000077"
             if plain:
                 uncertain["idempotency_key"] = "second-plain"
             result = await tool.handler(uncertain)
@@ -97,8 +102,11 @@ def test_prompt_rechecks_live_send_outcome_and_allows_exact_recovery(channel, mo
                        for r in attempted[1:])
             assert recovery["idempotency_key"] == key
             assert session._current_turn is owner and session._turn_active and not owner.cancelled
-            assert (meta["whatsapp_plain_send"]["outcome"] == "uncertain" if plain
-                    else meta["whatsapp_quote_accepted"] is False)
+            if destination == "source":
+                assert (meta["whatsapp_plain_send"]["outcome"] == "uncertain" if plain
+                        else meta["whatsapp_quote_accepted"] is False)
+            else:
+                assert meta["whatsapp_recipient_sends"][key]["outcome"] == "uncertain"
             channel.client.whatsapp._http.post = original_post
             release.set()
             with pytest.raises(ReplyPreflightRejected):
@@ -113,8 +121,11 @@ def test_prompt_rechecks_live_send_outcome_and_allows_exact_recovery(channel, mo
                 saved = restarted.interrupted()[0]["meta"]
             finally:
                 restarted.close()
-            assert (saved["whatsapp_plain_send"]["key"] if plain
-                    else saved["whatsapp_explicit_quote_key"]) == key
+            if destination == "source":
+                assert (saved["whatsapp_plain_send"]["key"] if plain
+                        else saved["whatsapp_explicit_quote_key"]) == key
+            else:
+                assert saved["whatsapp_recipient_sends"][key]["key"] == key
             owner.reply_meta = saved
             with pytest.raises(ReplyPreflightRejected):
                 await session._escalate(kind, "Allow action?")

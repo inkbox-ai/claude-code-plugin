@@ -33,8 +33,7 @@ def group(channel, participants):
 
 @pytest.mark.parametrize("allowed", [False, True])
 @pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize("selector", ["conversation", "participants"])
-def test_explicit_group_send_rechecks_current_roster(channel, allowed, legacy, selector):
+def test_explicit_group_send_rechecks_current_roster(channel, allowed, legacy):
     chat, _, meta = admit(channel, is_group=True, participants=["+15550000002", "+15550000004"])
     if legacy:
         meta.pop("whatsapp_reply_source")
@@ -45,7 +44,7 @@ def test_explicit_group_send_rechecks_current_roster(channel, allowed, legacy, s
         cfg.allowed_users.append(participants[-1])
     channel.identity.get_whatsapp_conversation = Mock(return_value=group(channel, participants))
     session, tool = bind_tool(channel, meta, chat)
-    args = {"conversation_id": CONVERSATION} if selector == "conversation" else {"to": meta["participants"]}
+    args = {"conversation_id": CONVERSATION}
     token = CURRENT_SESSION.set(session)
     try:
         if allowed:

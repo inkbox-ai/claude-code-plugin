@@ -1415,6 +1415,9 @@ class ContactSession:
             if (turn.cancelled or self._shutting_down or self._delivery_turn is not turn
                     or generation != self._client_generation or getattr(self, "_execution_blocked", False)):
                 raise PermissionError("Reply ownership is no longer active")
+            if mode == "whatsapp":
+                from .whatsapp import validate_reply_fence
+                validate_reply_fence(turn.reply_meta or self.reply_meta)
 
         token = CHANNEL_DELIVERY_GUARD.set(guard)
         try:
@@ -1425,7 +1428,7 @@ class ContactSession:
             if mode == "whatsapp":
                 from .whatsapp import ReplyPreflightRejected
                 if isinstance(exc, ReplyPreflightRejected):
-                    await self.receipt(mode, meta, "failed")
+                    await self.receipt(mode, turn.reply_meta or self.reply_meta, "failed")
                     if exc.notice:
                         try:
                             guard()
