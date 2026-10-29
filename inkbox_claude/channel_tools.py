@@ -17,7 +17,7 @@ def build_channel_tools(client, identity_handle, cfg):
             if set(args) - set(properties):
                 return _error("Unsupported tool arguments")
             try:
-                if name == "inkbox_slack_upload_file":
+                if name == "inkbox_slack_upload_file" or "_whatsapp" in name:
                     session = CURRENT_SESSION.get()
                     owner = getattr(session, "_current_turn", None)
                     generation = getattr(session, "_client_generation", None)
@@ -35,7 +35,8 @@ def build_channel_tools(client, identity_handle, cfg):
                 message = "Operation unavailable. Check access and local configuration."
                 safe = ("Vault is locked", "secret_id must be a UUID", "only login", "no TOTP",
                         "No vault key matched", "not been initialized", "timed out",
-                        "The originating turn has ended", "originating conversation", "supplied Companion history")
+                        "The originating turn has ended", "originating conversation", "supplied Companion history",
+                        "WhatsApp requires Inkbox SDK 0.7.24 or newer")
                 for marker in safe:
                     if marker.lower() in str(exc).lower():
                         message = marker
@@ -43,11 +44,30 @@ def build_channel_tools(client, identity_handle, cfg):
                 if message == "Vault is locked":
                     message = "Vault is locked. Set INKBOX_CLAUDE_VAULT_KEY locally and restart. Never send the key in chat."
                 status = getattr(exc, "status_code", None)
-                return _error(message, **({"status_code": status} if isinstance(status, int) else {}))
+                recovery = {}
+                if "_whatsapp" in name:
+                    from .whatsapp import SendRecoveryRequired, public_quota_error
+                    recovery.update(public_quota_error(exc))
+                    if isinstance(exc, SendRecoveryRequired):
+                        message = str(exc)
+                    key = getattr(exc, "idempotency_key", None)
+                    if key:
+                        hint = "Preserve the original request and key; read message/send lookup state before an exact replay; do not send a new copy."
+                        if public_quota_error(exc):
+                            hint += " Follow retry_condition before reusing the original key and media ID; a rejection does not resolve earlier attempts."
+                        recovery.update({"idempotency_key": key, "media_id": getattr(exc, "whatsapp_media_id", None), "recovery": hint})
+                if (name in {"inkbox_react_whatsapp", "inkbox_unreact_whatsapp"}
+                        and not isinstance(exc, SendRecoveryRequired) and args.get("idempotency_key")):
+                    recovery.update(idempotency_key=args["idempotency_key"], reaction_id=args.get("reaction_id"),
+                        target_message_id=args.get("message_id"), recovery="Preserve this operation and key. Recover only by replaying the same operation/key or reading its original reaction receipt; never create a replacement key.")
+                return _error(message, **({"status_code": status} if isinstance(status, int) else {}), **recovery)
         registered.append(tool(name, description, {
             "type": "object", "properties": properties, "required": required,
             "additionalProperties": False,
         })(handler))
+
+    from .whatsapp import register_tools as register_whatsapp_tools
+    register_whatsapp_tools(register, client, identity_handle, cfg)
 
     if cfg.slack_enabled:
         for spec in SLACK_TOOLS:

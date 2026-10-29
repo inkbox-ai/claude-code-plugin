@@ -238,7 +238,7 @@ Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for event
 
 ## Companion mode
 
-Version 0.2.13 supports Companion mode with Inkbox SDK 0.7.6 or newer. It stays
+Version 0.2.16 supports Companion mode with Inkbox SDK 0.7.24 or newer. It stays
 off until an administrator enables it for the identity and selects a sponsor.
 Use an agent-scoped API key. The bridge loads every initialization-history page,
 including attachment references and notices, before processing the current
@@ -379,7 +379,7 @@ The agent reaches you (or third parties) through an in-process MCP server:
 - `inkbox_list_a2a_tasks` · `inkbox_list_a2a_messages` — page and search this identity's inbound and outbound A2A history, with participant, task, context, role, state, and timestamp filters.
 - `inkbox_a2a_complete` · `inkbox_a2a_ask_caller` · `inkbox_a2a_fail` — commit the outcome of a verified inbound A2A task. These tools are rejected outside that task's isolated session.
 
-The bridge requires Inkbox SDK 0.7.6 or newer, below 1.0.0.
+The bridge requires Inkbox SDK 0.7.24 or newer, below 1.0.0.
 
 ### Phone call voice stack
 
@@ -436,7 +436,7 @@ On a live call, the OpenAI Realtime voice agent additionally gets `consult_agent
 
 ## Development
 
-Development installs and CI use the published Inkbox SDK (`>=0.7.6,<1.0.0`),
+Development installs require Inkbox SDK (`>=0.7.24,<1.0.0`),
 including typed `sender_access` on initialization-history entries. Contract tests
 also exercise the latest Claude Agent SDK and Claude Code CLI.
 
@@ -461,9 +461,9 @@ on the remote connection. Hosted voice and managed speech modes are unchanged.
 
 ## Slack, native iMessage, and Vault
 
-The bridge requires Inkbox SDK **0.7.15+**. Native iMessage and Slack Companion
-also require matching server capabilities. Native Slack task streams are optional
-and require an SDK exposing the complete task-stream interface (**0.7.16+**).
+The bridge requires Inkbox SDK **0.7.24+**, below 1.0.0. Native iMessage and Slack
+Companion also require matching server capabilities. Native Slack task streams
+are optional and require the complete task-stream interface.
 
 ### Slack
 
@@ -593,3 +593,42 @@ before backing up or moving it. Do not delete journals or session IDs to recover
 paused scope. Older releases do not understand the new unconfirmed scheduling
 state; preserve the state directory and use this release for recovery rather than
 assuming a downgrade can safely replay it.
+
+## Dedicated WhatsApp
+
+WhatsApp is available by approval for an agent that already has a dedicated
+personal iMessage number. It uses the same number, not a shared line. Request
+access in the console, then complete the required approval/setup. There is no
+local WhatsApp enable flag or self-service provisioning tool. Once approved,
+the existing gateway receives messages without a restart or credential change.
+
+Normal final responses reply automatically to the originating WhatsApp conversation;
+do not also send them with a tool. Explicit native tools include
+`inkbox_send_whatsapp`, conversation/message reads, owned-media upload/access,
+local mark-read, fresh `inkbox_get_whatsapp_status`, and read-only
+`inkbox_lookup_whatsapp_send` recovery by the original request key. Tools are registered even
+before approval so a cached disabled snapshot does not block later access.
+
+Use one E.164 recipient or an existing conversation, text (maximum 4,000 Unicode
+code points), and at most one owned attachment. The effective attachment limit
+is 5 MiB by default, with a 20 MiB hard ceiling; check `inkbox_get_whatsapp_status`
+for the current limits. Upload first and retain the returned media ID.
+Media URLs expire; retrieve fresh access by media ID.
+An unavailable attachment remains explicit context. Use one E.164 number or 2–8
+unique numbers for a new group; existing groups use `conversation_id`. Explicit
+`reply_to_message_id` quotes a visible message in that conversation. Thread reads
+and named/custom reactions have dedicated tools. New ordinary replies quote their
+source message; legacy saved replies retain their original plain intent. Active-turn
+sends to the exact conversation inherit its source unless an explicit quote or
+existing request key is supplied. Preserve both the target and key when retrying.
+A rejected or uncertain quoted send never creates an automatic replacement. Peer reactions are
+context, not new commands. Typing, remote read receipts and calls are unsupported.
+
+Incoming events are authenticated and deduplicated, and ordinary answers are
+journaled before sending. Preserve a logical-send key and media ID after an
+uncertain outcome; do not re-upload or send a new copy. Confirmed sending and
+unknown delivery are different facts. Delivery notifications update local
+correlation only: they do not wake the model or trigger automatic resend.
+
+WhatsApp groups, quoted replies, threads, and reactions require Inkbox SDK 0.7.24
+or newer and matching server capabilities.

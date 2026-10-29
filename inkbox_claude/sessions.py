@@ -17,7 +17,9 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -134,6 +136,7 @@ class _Turn:
     saved_reply: Optional[str] = None
     cancelled: bool = False
     retry_wake: asyncio.Event = field(default_factory=asyncio.Event)
+    whatsapp_send_lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -473,8 +476,11 @@ class ContactSession:
         if bot and raw_text.lstrip().startswith(f"<@{bot}>"):
             raw_text = raw_text.lstrip()[len(bot) + 3:].strip()
         command = None if meta.get("reaction") else _control_command(raw_text)
-        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
+        if pending_reply and (mode == "whatsapp" or self.pending.route.get("channel") == "whatsapp"):
+            pending_reply = mode == self.pending.route.get("channel") and all(
+                meta.get(k) == self.pending.route.get(k) for k in ("conversation_id", "sender"))
         if pending_reply and mode == "slack":
             pending_reply = all(meta.get(k) == self.pending.route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id"))
         if pending_reply:
@@ -494,21 +500,47 @@ class ContactSession:
         quiet = (is_group and self.cfg.group_reply_mode == "mention" and not command
                  and not pending_reply and not addressed)
         if quiet:
-            self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("message_id") or meta.get("source_event_id") or ""))
+            self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or meta.get("message_id") or ""))
             await self.receipt(mode, meta, "done")
             return
 
         control_turn = self._current_turn or self._delivery_turn or self._retrying_turn
+        scoped_stop = mode == "whatsapp" and command == "stop"
+        if command and not scoped_stop and control_turn is not None and (mode == "whatsapp" or control_turn.mode == "whatsapp"):
+            route = control_turn.reply_meta or {}
+            if mode != control_turn.mode or any(meta.get(k) != route.get(k) for k in ("conversation_id", "sender")):
+                self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or ""))
+                await self.receipt(mode, meta, "done")
+                return
         if command and mode == "slack" and control_turn is not None:
             route = control_turn.reply_meta or {}
             if any(meta.get(k) != route.get(k) for k in ("connection_id", "conversation_id", "thread_ts", "actor_id")):
                 self.buffer_context(frame_inbound(mode, meta, text), str(meta.get("source_event_id") or ""))
                 await self.receipt(mode, meta, "done")
                 return
+        if command in {"reset", "resume", "stop"} and not scoped_stop:
+            parked = self._control_candidates()
+            if any(turn is not None and (mode == "whatsapp" or turn.mode == "whatsapp") and
+                   (mode != turn.mode or any((turn.reply_meta or {}).get(key) != meta.get(key)
+                                             for key in ("conversation_id", "sender")))
+                   for turn in parked):
+                await self.receipt(mode, meta, "done")
+                return
         if command:
+            targets = self.whatsapp_stop_targets(meta) if scoped_stop else None
+            if scoped_stop:
+                from .imessage import IMessageState, _event_ids
+                event_id = meta.get("source_event_id") or meta.get("imessage_event_id") or meta.get("message_id")
+                snapshot = [{"chat_id": self.chat_id, "source_event_ids": [
+                    source for turn in targets for source in _event_ids(turn.reply_meta or {})]}]
+                if not IMessageState(self.cfg, channel="whatsapp").consume_control(event_id, snapshot):
+                    await self.receipt(mode, meta, "done")
+                    return
             await self.receipt(mode, meta, "done")
             token = self._control_route.set((mode, meta))
             try:
+                if scoped_stop:
+                    return await self._stop_turn(owned=targets)
                 handlers = {"reset": self._reset_session, "stop": self._stop_turn,
                             "resume": self._begin_resume, "status": self._report_status,
                             "usage": self._report_usage, "health": self._report_health}
@@ -531,7 +563,7 @@ class ContactSession:
         # delivery-failure recovery) runs to completion and this message just
         # queues behind it.
         running_normal = self._current_turn is not None and self._current_turn.future is None
-        if self._turn_active and self._client is not None and running_normal and not self._interrupting and not (mode == "imessage" and self.cfg.imessage_threaded_replies):
+        if self._turn_active and self._client is not None and running_normal and not self._interrupting and not (mode == "whatsapp" or (mode == "imessage" and self.cfg.imessage_threaded_replies)):
             logger.info("[session %s] new message interrupts the running turn", self.chat_id)
             self._interrupting = True
             try:
@@ -598,7 +630,7 @@ class ContactSession:
 
     async def _batch(self, turn):
         meta = turn.reply_meta or {}
-        if (turn.mode != "imessage" or not self.cfg.imessage_threaded_replies or turn.checkpoint or turn.saved_reply is not None
+        if (not (turn.mode == "whatsapp" or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)) or turn.checkpoint or turn.saved_reply is not None
                 or turn.future or meta.get("companion") or meta.get("media") or meta.get("reaction")):
             return turn
         deadline = turn.queued_at + 2.0
@@ -614,7 +646,7 @@ class ContactSession:
             other = self._queue.get_nowait()
             ometa = other.reply_meta or {}
             from .imessage import compatible_key
-            if (other.mode != "imessage" or other.future or other.checkpoint or other.saved_reply is not None or ometa.get("companion")
+            if (other.mode != turn.mode or other.future or other.checkpoint or other.saved_reply is not None or ometa.get("companion")
                     or ometa.get("media") or ometa.get("reaction") or other.queued_at > deadline
                     or turn.burst_source_count + other.burst_source_count > 8
                     or (turn.burst_text_chars or len(turn.text)) + (other.burst_text_chars or len(other.text)) + 2 > 4000
@@ -655,7 +687,7 @@ class ContactSession:
                 from .companion import retryable_read
                 from .imessage import SafeReplyPreflightError
                 ordinary_channel = (turn.checkpoint is None and turn.future is None
-                    and (turn.mode == "slack" or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)))
+                    and (turn.mode in {"slack", "whatsapp"} or (turn.mode == "imessage" and self.cfg.imessage_threaded_replies)))
                 safe_start = (ordinary_channel and turn.saved_reply is None and not turn.submitted and not turn.execution_observed
                               and retryable_read(exc))
                 safe_reply = (ordinary_channel and turn.saved_reply is not None
@@ -782,7 +814,16 @@ class ContactSession:
         await self._reply("Started a fresh conversation — previous context cleared.")
         return True
 
-    async def _stop_turn(self) -> None:
+    def _control_candidates(self):
+        return [self._current_turn, self._batching_turn, self._deferred_turn,
+                self._retrying_turn, self._delivery_turn,
+                self.pending.owner if self.pending is not None else None, *list(self._queue._queue)]
+
+    def whatsapp_stop_targets(self, meta):
+        return [turn for turn in self._control_candidates() if turn is not None and turn.mode == "whatsapp"
+                and all((turn.reply_meta or {}).get(key) == meta.get(key) for key in ("conversation_id", "sender"))]
+
+    async def _stop_turn(self, owned=None) -> None:
         """Interrupt the running turn (if any) and drop anything queued,
         keeping the conversation context intact.
 
@@ -794,9 +835,15 @@ class ContactSession:
             or self._batching_turn is not None or self._deferred_turn is not None
             or self._retrying_turn is not None or self._delivery_turn is not None
         )
-        reply_mode, _ = self._reply_route()
+        reply_mode, reply_meta = self._reply_route()
+        if reply_mode == "whatsapp":
+            if owned is None:
+                owned = self.whatsapp_stop_targets(reply_meta)
+            had_work = bool(owned)
         try:
-            await self._abort_in_flight(only_mode="imessage" if reply_mode == "imessage" and self.cfg.imessage_threaded_replies else None)
+            await self._abort_in_flight(
+                only_mode=reply_mode if reply_mode == "whatsapp" or (reply_mode == "imessage" and self.cfg.imessage_threaded_replies) else None,
+                only_turns=owned if reply_mode == "whatsapp" else None)
         except Exception:
             if not getattr(self, "_execution_blocked", False) and not self._pending_fenced_owners:
                 raise
@@ -1026,7 +1073,7 @@ class ContactSession:
                 (conversation_id and target == conversation_id)
                 or (target and current and self._phone_key(target) == self._phone_key(current))
             )
-        elif self.mode == "imessage":
+        elif self.mode in {"imessage", "whatsapp"}:
             conversation_id = str(self.reply_meta.get("conversation_id") or "").strip()
             matched = bool(conversation_id and target == conversation_id)
 
@@ -1182,6 +1229,7 @@ class ContactSession:
                     chunks: list[str] = []
                     final: Optional[str] = None
                     completed = False
+                    terminal_observed = False
                     async for message in client.receive_response():
                         auth_failed = (getattr(message, "error", None) == "authentication_failed"
                             or (getattr(message, "is_error", False) and "not logged in" in str(getattr(message, "result", "")).lower()))
@@ -1206,6 +1254,7 @@ class ContactSession:
                                     await self.notify_activity("slack", turn.reply_meta or {},
                                                                "tool:" + block.name)
                         elif isinstance(message, ResultMessage):
+                            terminal_observed = True
                             if turn.checkpoint is not None:
                                 completed = not message.is_error and message.subtype == "success"
                             final = message.result
@@ -1216,6 +1265,8 @@ class ContactSession:
                                     turn.checkpoint("submitted")
                     if turn.checkpoint is not None and (not completed or not self.resume_session_id):
                         raise RuntimeError("Companion host completion could not be confirmed")
+                    if turn.mode == "whatsapp" and not terminal_observed:
+                        raise RuntimeError("WhatsApp host completion could not be confirmed")
                     reply = (final or "\n\n".join(chunks)).strip()
                     break
                 except Exception as exc:
@@ -1279,6 +1330,8 @@ class ContactSession:
                 except asyncio.CancelledError:
                     pass
 
+        if turn.mode == "whatsapp" and turn.reply_meta is not None:
+            turn.reply_meta["host_terminal"] = True
         if turn.mode == "imessage" and self.cfg.imessage_threaded_replies:
             duplicate = any(owner is turn and text == reply and target == (turn.reply_meta or {}).get("imessage_reply_target")
                             for owner, text, target in self._imessage_tool_outputs)
@@ -1316,6 +1369,8 @@ class ContactSession:
                 self.chat_id,
                 self.mode,
             )
+            if turn.mode == "whatsapp":
+                await self.receipt(turn.mode, turn.reply_meta or {}, "done")
             return
         if reply and reply.strip() != "[SILENT]":
             await self.receipt(turn.mode, turn.reply_meta or {}, "reply_pending", reply)
@@ -1362,6 +1417,9 @@ class ContactSession:
             if (turn.cancelled or self._shutting_down or self._delivery_turn is not turn
                     or generation != self._client_generation or getattr(self, "_execution_blocked", False)):
                 raise PermissionError("Reply ownership is no longer active")
+            if mode == "whatsapp":
+                from .whatsapp import validate_reply_fence
+                validate_reply_fence(turn.reply_meta or self.reply_meta)
 
         token = CHANNEL_DELIVERY_GUARD.set(guard)
         try:
@@ -1369,7 +1427,18 @@ class ContactSession:
             await self.send_fn(self.chat_id, reply, mode, {**meta, "final_reply": True})
             await self.receipt(mode, meta, "done")
         except Exception as exc:
-            if mode == "slack" or (mode == "imessage" and self.cfg.imessage_threaded_replies):
+            if mode == "whatsapp":
+                from .whatsapp import ReplyPreflightRejected
+                if isinstance(exc, ReplyPreflightRejected):
+                    await self.receipt(mode, turn.reply_meta or self.reply_meta, "failed")
+                    if exc.notice:
+                        try:
+                            guard()
+                            await self.send_fn(self.chat_id, exc.notice, mode, meta)
+                        except Exception:
+                            logger.warning("WhatsApp reply was rejected before sending; notice could not be confirmed")
+                    return
+            if mode in {"slack", "whatsapp"} or (mode == "imessage" and self.cfg.imessage_threaded_replies):
                 raise
             logger.warning("Reply send rejected (%s)", type(exc).__name__)
             if self.on_send_rejected is not None:
@@ -1635,7 +1704,28 @@ class ContactSession:
         self.pending = pending
         try:
             await self.notify_activity(reply_mode, route, "waiting")
-            await self._reply(prompt_text)
+            if reply_mode == "whatsapp":
+                from .whatsapp import validate_reply_fence
+
+                prompt_route = {**deepcopy(route), "whatsapp_interaction_id": uuid.uuid4().hex}
+
+                def guard():
+                    if (self.pending is not pending or self._current_turn is not pending.owner
+                            or self._client_generation != pending.generation or self._interrupting
+                            or self._shutting_down or (pending.owner is not None and pending.owner.cancelled)):
+                        raise PermissionError("Permission prompt ownership is no longer active")
+                    # Routing is frozen, but send outcomes belong to the live turn.
+                    live_meta = pending.owner.reply_meta if pending.owner is not None else route
+                    validate_reply_fence(live_meta or {}, interaction=True)
+
+                token = CHANNEL_DELIVERY_GUARD.set(guard)
+                try:
+                    guard()
+                    await self.send_fn(self.chat_id, prompt_text, reply_mode, prompt_route)
+                finally:
+                    CHANNEL_DELIVERY_GUARD.reset(token)
+            else:
+                await self._reply(prompt_text)
             return await asyncio.wait_for(
                 pending.future, timeout=self.cfg.permission_timeout_s
             )
