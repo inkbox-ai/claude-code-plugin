@@ -508,3 +508,101 @@ def test_native_final_rechecks_live_group_uncertainty_before_post(channel, monke
         assert not session._current_channel_tool_delivery
     finally:
         CURRENT_SESSION.reset(token)
+
+
+@pytest.mark.parametrize("destination", ["group", "source"])
+def test_overlapping_send_rechecks_uncertainty_before_admission(channel, monkeypatch, destination):
+    import threading
+    from inkbox_claude import whatsapp
+
+    chat, meta, session, tool = setup_group(channel)
+    paused, resume = threading.Event(), threading.Event()
+    original_method = whatsapp.require_method
+    errors = []
+
+    def method(identity, operation):
+        if operation == "send_whatsapp" and threading.current_thread().name == "older-send":
+            paused.set()
+            assert resume.wait(5), "overlapping send was not released"
+        return original_method(identity, operation)
+
+    monkeypatch.setattr(whatsapp, "require_method", method)
+    original_post = corrupt_accepted_response(channel, KeyError)
+    selector = {"to": NUMBERS} if destination == "group" else {"conversation_id": CONVERSATION}
+
+    def older_send():
+        token = CURRENT_SESSION.set(session)
+        try:
+            tool({**selector, "text": "Answer", "idempotency_key": "older-key"}, lambda: None)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            CURRENT_SESSION.reset(token)
+
+    worker = threading.Thread(target=older_send, name="older-send")
+    worker.start()
+    token = CURRENT_SESSION.set(session)
+    try:
+        assert paused.wait(5), "older send did not reach admission"
+        with pytest.raises(KeyError):
+            tool({"to": NUMBERS, "text": "Answer", "idempotency_key": "uncertain-key"}, lambda: None)
+        channel.client.whatsapp._http.post = original_post
+    finally:
+        resume.set()
+        worker.join(5)
+        CURRENT_SESSION.reset(token)
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], ReplyPreflightRejected)
+    assert len(posts(channel)) == 1
+    saved = IMessageState(channel.gateway.cfg, channel="whatsapp").interrupted()[0]["meta"]
+    assert saved["whatsapp_recipient_sends"] == meta["whatsapp_recipient_sends"]
+    assert set(saved["whatsapp_recipient_sends"]) == {"uncertain-key"}
+    assert saved["whatsapp_recipient_sends"]["uncertain-key"]["outcome"] == "uncertain"
+    assert not saved.get("whatsapp_plain_send")
+    with pytest.raises(ReplyPreflightRejected):
+        final(channel, chat, saved, "Source final")
+
+
+def test_pending_send_rejects_overlap_without_waiting_for_network(channel):
+    import threading
+
+    _, meta, session, tool = setup_group(channel)
+    submitted, release = threading.Event(), threading.Event()
+    original_post = channel.client.whatsapp._http.post
+    errors = {}
+
+    def post(*args, **kwargs):
+        submitted.set()
+        assert release.wait(5), "pending send was not released"
+        return original_post(*args, **kwargs)
+
+    channel.client.whatsapp._http.post = post
+
+    def send(key):
+        token = CURRENT_SESSION.set(session)
+        try:
+            tool({"to": NUMBERS, "text": "Answer", "idempotency_key": key}, lambda: None)
+        except Exception as exc:
+            errors[key] = exc
+        finally:
+            CURRENT_SESSION.reset(token)
+
+    first = threading.Thread(target=send, args=("first-key",))
+    second = threading.Thread(target=send, args=("second-key",))
+    first.start()
+    try:
+        assert submitted.wait(5), "first send did not reach submission"
+        second.start()
+        second.join(2)
+        assert not second.is_alive(), "admission waited for an in-flight network call"
+        assert isinstance(errors.get("second-key"), ReplyPreflightRejected)
+    finally:
+        release.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert "first-key" not in errors
+    assert len(posts(channel)) == 1
+    assert set(meta["whatsapp_recipient_sends"]) == {"first-key"}
+    assert meta["whatsapp_recipient_sends"]["first-key"]["outcome"] == "accepted"

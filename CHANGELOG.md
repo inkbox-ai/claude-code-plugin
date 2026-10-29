@@ -2,6 +2,7 @@
 
 ## 0.2.16 (unreleased)
 
+- Keep overlapping WhatsApp send tools from replacing an unresolved request with a new send.
 - Dedicated WhatsApp groups, explicit quoted replies and chronological thread reads.
 - Named/custom versioned reactions, actor-scoped peer context, and silent self/delivery callbacks.
 - Quote the source for newly received messages and exact-conversation tool sends; preserve legacy plain intents and original request keys after uncertainty.

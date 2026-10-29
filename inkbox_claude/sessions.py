@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from copy import deepcopy
@@ -135,6 +136,7 @@ class _Turn:
     saved_reply: Optional[str] = None
     cancelled: bool = False
     retry_wake: asyncio.Event = field(default_factory=asyncio.Event)
+    whatsapp_send_lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
