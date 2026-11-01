@@ -27,12 +27,11 @@ MESSAGE_WIRE = {
     "remote_number": "+15555550101",
     "sender_number": "+15555550100",
     "participants": ["+15555550101"],
-    "is_group": False,
     "content": "Answer",
     "media": [],
     "status": "sent",
     "delivery_state": "unknown",
-    "recipients": [],
+    "recipients": [{"remote_number": "+15555550101", "delivery_status": "sent", "delivery_state": "unknown"}],
     "is_read": False,
     "is_blocked": False,
     "error_code": None,
@@ -343,7 +342,7 @@ def test_lookup_tool_recovers_id_without_sending(setup):
 
 @pytest.mark.parametrize("to,uncertain,status", [
     ("+15555550101", False, None), ("+15555550101", True, None),
-    (" +1 (555) 555-0101 ", False, None), (" +1 (555) 555-0101 ", True, None), ("+15555550102", False, None),
+    ("+15555550102", False, None),
     ("+15555550101", True, 403), ("+15555550101", True, 422), ("+15555550101", True, 429),
     ("+15555550101", True, 402),
 ])

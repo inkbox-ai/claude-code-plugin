@@ -81,16 +81,33 @@ class ReplyTooLong(ReplyPreflightRejected):
     notice = "The answer exceeded WhatsApp's 4000-character limit and was not sent. Please ask for a shorter answer."
 
 
+def unsupported_shape(value):
+    """Reject unsupported persisted or incoming conversation shapes."""
+    values = value if isinstance(value, dict) else vars(value)
+    return (field(value, "is_group") is True
+            or field(value, "conversation_kind") == "group"
+            or bool(field(value, "unresolved_participant_count", 0))
+            or any((key.startswith("group_") or key == "groupName") and item is not None
+                   for key, item in values.items())
+            or any(field(value, key) is not None and (
+                not isinstance(field(value, key), list) or len(field(value, key)) > 1)
+                for key in ("participants", "recipients")))
+
+
+def unsupported_saved_intent(meta):
+    attempts = list(meta.get("whatsapp_recipient_sends", {}).values())
+    if meta.get("whatsapp_plain_send"):
+        attempts.append(meta["whatsapp_plain_send"])
+    intents = [attempt.get("intent", {}) for attempt in attempts]
+    if meta.get("whatsapp_quote_intent"):
+        intents.append(meta["whatsapp_quote_intent"])
+    return any(unsupported_shape(intent) or ("to" in intent and (
+        not isinstance(intent["to"], str)
+        or re.fullmatch(r"\+[1-9][0-9]{6,14}", intent["to"]) is None)) for intent in intents)
+
+
 def _local_route_allowed(sender_allowed, meta):
-    if not sender_allowed(str(meta.get("sender") or "")):
-        return False
-    if meta.get("conversation_kind") != "group":
-        return True
-    participants = meta.get("participants")
-    return (isinstance(participants, list) and bool(participants)
-            and meta.get("sender") in participants
-            and all(isinstance(number, str) and re.fullmatch(r"\+[1-9]\d{6,14}", number)
-                    and sender_allowed(number) for number in participants))
+    return not unsupported_shape(meta) and not unsupported_saved_intent(meta) and sender_allowed(str(meta.get("sender") or ""))
 
 
 def local_route_allowed(gateway, meta):
@@ -99,23 +116,7 @@ def local_route_allowed(gateway, meta):
 
 def _validate_reply_access(identity, meta, sender_allowed):
     if not _local_route_allowed(sender_allowed, meta):
-        raise ReplyPreflightRejected("WhatsApp conversation is no longer locally allowed")
-    if meta.get("conversation_kind") != "group":
-        return
-    from .companion import retryable_read
-    from .imessage import SafeReplyPreflightError
-    try:
-        conversation = require_method(identity, "get_whatsapp_conversation")(meta["conversation_id"])
-    except Exception as exc:
-        if retryable_read(exc):
-            raise SafeReplyPreflightError("WhatsApp membership is temporarily unavailable") from None
-        raise ReplyPreflightRejected("WhatsApp conversation membership could not be confirmed") from None
-    if (str(field(conversation, "id")) != meta["conversation_id"]
-            or str(field(conversation, "agent_identity_id")) != str(identity.id)
-            or field(conversation, "is_group") is not True
-            or field(conversation, "unresolved_participant_count", 0) != 0
-            or not _local_route_allowed(sender_allowed, {**meta, "participants": field(conversation, "participants")})):
-        raise ReplyPreflightRejected("WhatsApp conversation membership is no longer locally allowed")
+        raise ReplyPreflightRejected("WhatsApp direct conversation is no longer locally allowed")
 
 
 async def validate_reply_access(gateway, meta):
@@ -131,10 +132,9 @@ def delivery_target(meta, conversation=None, recipient=None):
         canonical = current
     if conversation is not None:
         return current if str(conversation) == canonical else str(conversation)
-    recipients = recipient if isinstance(recipient, list) else [recipient]
     if (meta.get("channel") == "whatsapp" and current
             and meta.get("conversation_kind") != "group"
-            and recipients == [meta.get("sender")] and meta.get("sender")):
+            and recipient == meta.get("sender") and meta.get("sender")):
         return current
     return str(recipient or "")
 
@@ -150,6 +150,8 @@ def source_plain_send(meta):
 
 def validate_send_uncertainty(meta, *, key=None, intent=None):
     """Unresolved sends fence the owning turn, not just their destination."""
+    if unsupported_saved_intent(meta):
+        raise ReplyPreflightRejected("A saved WhatsApp request is unsupported; inspect its original send receipt without retrying")
     attempts = list(meta.get("whatsapp_recipient_sends", {}).values())
     if meta.get("whatsapp_plain_send"):
         attempts.append(meta["whatsapp_plain_send"])
@@ -198,7 +200,7 @@ def auto_reply_kwargs(identity, meta):
     if (str(field(message, "id")) != target
             or str(field(message, "conversation_id")) != source["conversation_id"]
             or str(field(message, "agent_identity_id")) != source["identity_id"]
-            or field(message, "is_blocked") is True):
+            or field(message, "is_blocked") is True or unsupported_shape(message)):
         raise ReplyPreflightRejected("WhatsApp reply source ownership cannot be verified")
     return {"reply_to_message_id": target}
 
@@ -214,22 +216,22 @@ async def receive(gateway, envelope):
     sender = str(message.get("sender_number") or "")
     identity = gateway._identity
     participants = message.get("participants") or []
-    is_group = message.get("is_group") is True
     if (
-        not message_id
+        unsupported_shape(message)
+        or not message_id
         or not event_id
         or not conversation
         or message.get("direction") != "inbound"
         or not isinstance(participants, list)
         or not participants
-        or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9]\d{6,14}", number) is None for number in participants)
+        or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", number) is None for number in participants)
         or sender not in participants
-        or (not is_group and (len(participants) != 1 or sender != message.get("remote_number")))
+        or len(participants) != 1 or sender != message.get("remote_number")
         or sender == message.get("local_number")
         or str(message.get("agent_identity_id") or "") != str(identity.id)
     ):
         return web.json_response({"ok": True, "ignored": "unsupported-message"})
-    if not gateway._sender_allowed(sender) or (is_group and any(not gateway._sender_allowed(number) for number in participants)):
+    if not gateway._sender_allowed(sender):
         return web.json_response({"ok": True, "ignored": "sender-not-allowed"})
     text = str(message.get("content") or "")
     media = message.get("media") or []
@@ -272,7 +274,7 @@ async def receive(gateway, envelope):
             if gateway.cfg.contact_memories_enabled
             else []
         )
-        chat_id = gateway._thread_key("whatsapp", conversation) if is_group else gateway._chat_key(
+        chat_id = gateway._chat_key(
             data,
             sender,
             gateway._thread_key("whatsapp", conversation),
@@ -289,14 +291,14 @@ async def receive(gateway, envelope):
             "sender": sender,
             "contact": contact,
             "agent_identity": None
-            if contact or is_group
+            if contact
             else gateway._single_agent_identity(
                 gateway._webhook_list(
                     data, "agent_identities", "agentIdentities", "identity_agents"
                 )
             ),
             "contact_memories": memories,
-            "conversation_kind": "group" if is_group else "direct",
+            "conversation_kind": "direct",
             "participants": participants,
             "reply_to_message_id": message.get("reply_to_message_id"),
             "thread_id": message.get("thread_id"),
@@ -323,6 +325,8 @@ async def receive(gateway, envelope):
 
 def validate_reply_fence(meta, *, interaction=False):
     """Only confirmed explicit sends permit a separate human interaction."""
+    if unsupported_shape(meta):
+        raise ReplyPreflightRejected("WhatsApp supports direct messages only")
     validate_send_uncertainty(meta)
     plain = source_plain_send(meta)
     if plain and plain["outcome"] != "rejected" and not (
@@ -411,6 +415,8 @@ def register_tools(register, client, identity_handle, cfg):
 
         def authorize_effect():
             authorize()
+            if meta.get("channel") == "whatsapp" and unsupported_shape(meta):
+                raise ReplyPreflightRejected("WhatsApp supports direct messages only")
             validate_send_uncertainty(meta)
 
         if operation in {"upload_whatsapp_media", "send_whatsapp_reaction", "remove_whatsapp_reaction"}:
@@ -439,7 +445,9 @@ def register_tools(register, client, identity_handle, cfg):
                 pass  # An older API must not block status or historical reads.
             return {"status": status, "limits": limits}
         if operation == "send_whatsapp":
-            recipient, conversation, reply_target, group_name = send_selector(args)
+            if meta.get("channel") == "whatsapp" and unsupported_shape(meta):
+                raise ReplyPreflightRejected("WhatsApp supports direct messages only")
+            recipient, conversation, reply_target = send_selector(args)
             native = (meta.get("channel") == "whatsapp" and conversation is not None
                       and delivery_target(meta, conversation) == meta.get("conversation_id"))
             if native and meta.get("companion"):
@@ -459,8 +467,6 @@ def register_tools(register, client, identity_handle, cfg):
             selector = {"conversation_id": conversation} if conversation is not None else {"to": recipient}
             if reply_target is not None:
                 selector["reply_to_message_id"] = reply_target
-            if group_name is not None:
-                selector["group_name"] = group_name
             if not (
                 str(args.get("text") or "").strip() or args.get("media_id")
             ):
@@ -499,9 +505,8 @@ def register_tools(register, client, identity_handle, cfg):
                 return (cfg.allow_all_users or not cfg.allowed_users
                         or number.lower() in {user.lower() for user in cfg.allowed_users})
 
-            if recipient is not None and not all(recipient_allowed(number) for number in (
-                    recipient if isinstance(recipient, list) else [recipient])):
-                raise ReplyPreflightRejected("WhatsApp recipients are no longer locally allowed")
+            if recipient is not None and not recipient_allowed(recipient):
+                raise ReplyPreflightRejected("WhatsApp recipient is no longer locally allowed")
             if source_bound:
                 _validate_reply_access(identity, meta, recipient_allowed)
             method = require_method(identity, operation)
@@ -588,9 +593,7 @@ def register_tools(register, client, identity_handle, cfg):
                     meta["whatsapp_quote_accepted"] = True
                 if returned_conversation is not None:
                     returned_target = delivery_target(meta, str(returned_conversation))
-                    if not (isinstance(recipient, list) and len(recipient) > 1
-                            and returned_target == meta.get("conversation_id")):
-                        target = returned_target
+                    target = returned_target
                 _mark_tool_delivery("whatsapp", target)
                 if recipient_attempt:
                     try:
@@ -653,13 +656,12 @@ def register_tools(register, client, identity_handle, cfg):
         ),
         (
             "inkbox_send_whatsapp",
-            "Send a requested direct or dedicated-line group WhatsApp message, quoting the active source by default in its exact conversation for new request keys. An explicit visible quote is also supported. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
+            "Send a requested direct WhatsApp message, quoting the active source by default in its exact conversation for new request keys. An explicit visible quote is also supported. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
             {
-                "to": {"anyOf": [string("One E.164 recipient"), {"type": "array", "items": string("E.164 group participant"), "minItems": 1, "maxItems": 8, "uniqueItems": True}], "description": "One number, or 2-8 unique numbers for a new group. Existing groups use conversation_id."},
+                "to": {**string("One E.164 recipient; arrays are not supported"), "pattern": r"^\+[1-9][0-9]{6,14}$"},
                 "reply_to_message_id": string("Visible message ID to quote; requires conversation_id"),
-                "group_name": {**string("Creation hint for a new group; not a rename"), "minLength": 1, "maxLength": 100},
                 "conversation_id": string(
-                    "Existing conversation; mutually exclusive with to"
+                    "Existing direct conversation; mutually exclusive with to"
                 ),
                 "text": {**string("Message text"), "maxLength": 4000},
                 "media_id": string("Owned ID returned by upload"),
@@ -672,15 +674,14 @@ def register_tools(register, client, identity_handle, cfg):
         ),
         (
             "inkbox_list_whatsapp_conversations",
-            "List WhatsApp conversations with local unread counts.",
-            {"limit": integer, "offset": {"type": "integer", "minimum": 0},
-             "include_groups": {"type": "boolean", "description": "Include group conversations; defaults to false"}},
+            "List WhatsApp direct conversations with local unread counts.",
+            {"limit": integer, "offset": {"type": "integer", "minimum": 0}},
             [],
             "list_whatsapp_conversations",
         ),
         (
             "inkbox_get_whatsapp_conversation",
-            "Read metadata for one WhatsApp conversation.",
+            "Read metadata for one WhatsApp direct conversation.",
             {"conversation_id": string("Conversation ID")},
             ["conversation_id"],
             "get_whatsapp_conversation",

@@ -469,6 +469,10 @@ class ContactSession:
             Whether a reset completed, for reset controls; otherwise None.
         """
         meta = deepcopy(meta or {})
+        if mode == "whatsapp":
+            from .whatsapp import unsupported_shape, unsupported_saved_intent
+            if unsupported_shape(meta) or unsupported_saved_intent(meta):
+                return None
         if mode == "imessage" and self.cfg.imessage_threaded_replies:
             meta["imessage_threaded_replies"] = True
         raw_text = str(meta.get("raw_text", text))
@@ -476,7 +480,7 @@ class ContactSession:
         if bot and raw_text.lstrip().startswith(f"<@{bot}>"):
             raw_text = raw_text.lstrip()[len(bot) + 3:].strip()
         command = None if meta.get("reaction") else _control_command(raw_text)
-        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
         if pending_reply and (mode == "whatsapp" or self.pending.route.get("channel") == "whatsapp"):
             pending_reply = mode == self.pending.route.get("channel") and all(

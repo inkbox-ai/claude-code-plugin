@@ -98,7 +98,7 @@ def test_tool_acceptance_does_not_finish_host_receipt(setup, monkeypatch, finish
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("selector", ["uppercase", "singleton", "group", "other", "returned"])
+@pytest.mark.parametrize("selector", ["uppercase", "scalar", "other", "returned"])
 @pytest.mark.parametrize("uncertain", [False, True])
 def test_canonical_explicit_send_correlation(setup, monkeypatch, selector, uncertain):
     monkeypatch.setattr("inkbox._message_requests.time.sleep", lambda _: None)
@@ -109,16 +109,8 @@ def test_canonical_explicit_send_correlation(setup, monkeypatch, selector, uncer
         args = {"text": "Answer", "idempotency_key": "original"}
         if selector == "uppercase":
             args.update(conversation_id=conversation.upper(), reply_to_message_id=MESSAGE)
-        elif selector == "group":
-            meta.update(conversation_kind="group", participants=[meta["sender"], "+15555550102"])
-            args["to"] = ["+1 (555) 555-0102", meta["sender"]]
-            client.whatsapp._http.get.return_value = {
-                "id": conversation, "agent_identity_id": OWNER, "is_group": True,
-                "local_number": MESSAGE_WIRE["local_number"], "remote_number": None,
-                "participants": meta["participants"], "created_at": MESSAGE_WIRE["created_at"],
-                "updated_at": MESSAGE_WIRE["updated_at"]}
         else:
-            args["to"] = [meta["sender"]] if selector == "singleton" else "+15555550103"
+            args["to"] = meta["sender"] if selector == "scalar" else "+15555550103"
         returned = CONV if selector == "other" else conversation
         client.whatsapp._http.post.return_value = {"message": {**MESSAGE_WIRE, "conversation_id": returned}}
         if uncertain:
@@ -141,9 +133,9 @@ def test_canonical_explicit_send_correlation(setup, monkeypatch, selector, uncer
         session._client = Host()
         store.admit(session.chat_id, "Question", meta)
         await session._run_turn(_Turn(text="Question", mode="whatsapp", reply_meta=meta))
-        expect_final = selector in {"other", "group"} and not uncertain
+        expect_final = selector == "other" and not uncertain
         assert finals == (["Answer"] if expect_final else [])
-        blocked_final = uncertain and selector in {"group", "other", "returned"}
+        blocked_final = uncertain and selector in {"other", "returned"}
         assert row(store)["state"] == ("failed" if blocked_final else "done")
         if blocked_final:
             receipt = row(store)["meta"]["whatsapp_recipient_sends"]["original"]
@@ -300,9 +292,8 @@ def test_reaction_does_not_answer_pending_question_or_stop(channel):
         gw = channel.gateway
         session = make_session([])
         session.cfg, session.receipt_fn = gw.cfg, gw._channel_receipt
-        session.cfg.group_reply_mode = "mention"
+        session._worker = Mock(done=Mock(return_value=False))
         gw.sessions = NS(get=lambda _: session)
-        channel.message.update(is_group=True)
         meta = route(sender=channel.reaction["remote_number"], conversation_id=channel.reaction["conversation_id"])
         session.pending = PendingInteraction(kind="permission", sender=meta["sender"], route=meta,
             prompt_text="Allow?", future=asyncio.get_running_loop().create_future())
@@ -310,7 +301,8 @@ def test_reaction_does_not_answer_pending_question_or_stop(channel):
         await receive_reaction(gw, {"data": {"reaction": deepcopy(channel.reaction)}})
         assert not session.pending.future.done()
         session._stop_turn.assert_not_awaited()
-        assert len(session._context) == 1
+        assert session._queue.qsize() == 1
+        assert session._queue.get_nowait().reply_meta["reaction"] == "👍"
     asyncio.run(run())
 
 
@@ -342,35 +334,8 @@ def test_recovered_consumed_stop_finishes_receipt_without_selecting_new_work(set
     asyncio.run(run())
 
 
-def test_reaction_buffer_keeps_actor_revision_and_removal(channel):
-    async def run():
-        gw = channel.gateway
-        session = make_session([])
-        session.cfg = gw.cfg
-        session.cfg.group_reply_mode = "mention"
-        session.receipt_fn = gw._channel_receipt
-        gw.sessions = NS(get=lambda _: session)
-        channel.message.update(is_group=True, participants=["+15550000002", "+15550000003"])
-        session.buffer_context("Original message", TARGET)
-        for actor, revision, status in [("+15550000002", 2, "applied"), ("+15550000003", 2, "applied"), ("+15550000003", 3, "removed")]:
-            channel.reaction.update(remote_number=actor, revision=revision, status=status)
-            if actor.endswith("3"):
-                channel.reaction["id"] = "00000000-0000-0000-0000-000000000006"
-            await receive_reaction(gw, {"data": {"reaction": deepcopy(channel.reaction)}})
-        assert len(session._context) == 4
-        ids = [item["id"] for item in session._context]
-        assert len(set(ids)) == 4 and ids[-1].endswith(":3:removed")
-        assert session._worker is None
-        with gw._channel_store("whatsapp")._db() as db:
-            receipts = db.execute("SELECT event_id,meta FROM receipts").fetchall()
-        assert len(receipts) == 3
-        assert all(r["event_id"].startswith("reaction:") for r in receipts)
-        assert all(json.loads(r["meta"])["message_id"] == TARGET for r in receipts)
-    asyncio.run(run())
-
-
 @pytest.mark.parametrize("phase", ["pending", "reply_pending"])
-def test_recovery_rechecks_all_participants(setup, phase):
+def test_recovery_rejects_saved_group_routes(setup, phase):
     gw, session, _, _, store = harness(setup)
     meta = route(conversation_kind="group", participants=["+15555550101", "+15555550102"])
     store.admit(session.chat_id, "Question", meta)
@@ -384,7 +349,7 @@ def test_recovery_rechecks_all_participants(setup, phase):
 
 
 @pytest.mark.parametrize("final", [False, True])
-def test_current_group_membership_blocks_output_and_permissions(setup, final):
+def test_saved_group_route_blocks_output_and_permissions(setup, final):
     gw, session, client, _, store = harness(setup)
     meta = route(conversation_kind="group", participants=["+15555550101"])
     store.admit(session.chat_id, "Question", meta)

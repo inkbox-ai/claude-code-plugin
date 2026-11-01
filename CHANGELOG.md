@@ -3,7 +3,8 @@
 ## 0.2.16 (unreleased)
 
 - Keep overlapping WhatsApp send tools from replacing an unresolved request with a new send.
-- Dedicated WhatsApp groups, explicit quoted replies and chronological thread reads.
+- WhatsApp direct messages only: reject recipient arrays and unsupported group events, including saved group routes.
+- Explicit quoted replies and chronological thread reads.
 - Named/custom versioned reactions, actor-scoped peer context, and silent self/delivery callbacks.
 - Quote the source for newly received messages and exact-conversation tool sends; preserve legacy plain intents and original request keys after uncertainty.
 - Approved dedicated one-to-one WhatsApp: signed incoming messages, automatic replies,
@@ -11,9 +12,9 @@
 - Add native WhatsApp tools, exact-route approvals/burst controls, temporary media
   renewal, and delivery notifications that never trigger a second agent reply.
 - Require Inkbox SDK 0.7.24 or newer, below 1.0.0.
-- Keep unfinished host work recoverable after explicit sends, scope group controls
-  to their sender, and retain distinct reaction updates and permission prompts.
-- Recheck group access before automatic output; reject overlong replies without
+- Keep unfinished host work recoverable after explicit sends and retain distinct
+  reaction updates and permission prompts.
+- Reject unsupported saved WhatsApp routes and overlong replies without
   repeating them after a restart.
 
 ## 0.2.14

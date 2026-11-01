@@ -17,7 +17,7 @@ from tests.test_whatsapp_autoquote import admit, bind_tool, posts
 from tests.test_whatsapp_v2 import channel as channel, CONVERSATION
 
 
-@pytest.mark.parametrize("destination", ["source", "group", "other"])
+@pytest.mark.parametrize("destination", ["source", "recipient", "other"])
 @pytest.mark.parametrize("kind", ["permission", "poll"])
 @pytest.mark.parametrize("plain", [False, True])
 @pytest.mark.parametrize("pause_at", ["source", "dispatch"])
@@ -85,8 +85,8 @@ def test_prompt_rechecks_live_send_outcome_and_allows_exact_recovery(channel, mo
 
             channel.client.whatsapp._http.post = lost_response
             uncertain = {"conversation_id": CONVERSATION, "text": "Additional requested message"}
-            if destination == "group":
-                uncertain = {"to": ["+15550000002", "+15550000004"], "text": "New group"}
+            if destination == "recipient":
+                uncertain = {"to": "+15550000004", "text": "Requested message"}
             elif destination == "other":
                 uncertain["conversation_id"] = "00000000-0000-0000-0000-000000000077"
             if plain:

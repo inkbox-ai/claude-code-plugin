@@ -39,15 +39,9 @@ def final(channel, chat_id, meta, text="Answer"):
     asyncio.run(send_reply(channel.gateway, chat_id, text, {**meta, "final_reply": True}))
 
 
-@pytest.mark.parametrize("group", [False, True])
 @pytest.mark.parametrize("inbound_quote", [False, True])
-def test_new_final_quotes_trigger_not_parent_and_preserves_destination(channel, group, inbound_quote):
-    changes = {"is_group": group, "reply_to_message_id": str(UUID(int=99)) if inbound_quote else None}
-    if group:
-        changes["participants"] = ["+15550000002", "+15550000003"]
-        channel.identity.get_whatsapp_conversation = Mock(return_value=NS(
-            id=CONVERSATION, agent_identity_id=IDENTITY, is_group=True,
-            participants=changes["participants"], unresolved_participant_count=0))
+def test_new_final_quotes_trigger_not_parent_and_preserves_destination(channel, inbound_quote):
+    changes = {"reply_to_message_id": str(UUID(int=99)) if inbound_quote else None}
     chat_id, _, meta = admit(channel, **changes)
     final(channel, chat_id, meta)
     request = posts(channel)[0]
@@ -383,20 +377,14 @@ def test_accepted_quote_still_allows_separate_permission_and_poll(channel, kind,
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("include", [None, True])
-def test_registered_list_tool_can_discover_existing_large_groups(channel, include):
+def test_registered_list_tool_is_direct_only(channel):
     from inkbox_claude.channel_tools import build_channel_tools
     tool = next(t for t in build_channel_tools(channel.client, "agent", channel.gateway.cfg)
                 if t.name == "inkbox_list_whatsapp_conversations")
-    assert tool.input_schema["properties"]["include_groups"]["type"] == "boolean"
-    result = asyncio.run(tool.handler({} if include is None else {"include_groups": include}))
+    assert "include_groups" not in tool.input_schema["properties"]
+    result = asyncio.run(tool.handler({}))
     assert not result.get("isError"), result
-    request = channel.requests[-1]
-    assert request.url.params["include_groups"] == ("true" if include else "false")
-    rows = json.loads(result["content"][0]["text"])
-    assert len(rows) == (1 if include else 0)
-    if include:
-        assert rows[0]["is_group"] and len(rows[0]["participants"]) == 9
+    assert "include_groups" not in channel.requests[-1].url.params
 
 
 def test_interaction_marker_cannot_bypass_unconfirmed_quote_fence(channel):

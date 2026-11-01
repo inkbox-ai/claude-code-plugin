@@ -614,8 +614,9 @@ code points), and at most one owned attachment. The effective attachment limit
 is 5 MiB by default, with a 20 MiB hard ceiling; check `inkbox_get_whatsapp_status`
 for the current limits. Upload first and retain the returned media ID.
 Media URLs expire; retrieve fresh access by media ID.
-An unavailable attachment remains explicit context. Use one E.164 number or 2–8
-unique numbers for a new group; existing groups use `conversation_id`. Explicit
+An unavailable attachment remains explicit context. WhatsApp supports direct messages only.
+`to` must be one E.164 string; arrays and comma-separated recipients are rejected.
+Use `conversation_id` for an existing direct conversation. Explicit
 `reply_to_message_id` quotes a visible message in that conversation. Thread reads
 and named/custom reactions have dedicated tools. New ordinary replies quote their
 source message; legacy saved replies retain their original plain intent. Active-turn
@@ -629,6 +630,9 @@ journaled before sending. Preserve a logical-send key and media ID after an
 uncertain outcome; do not re-upload or send a new copy. Confirmed sending and
 unknown delivery are different facts. Delivery notifications update local
 correlation only: they do not wake the model or trigger automatic resend.
+Saved group routes and requests with recipient arrays or group selectors are not
+replayed. Inspect their original send receipt without resending or converting them
+to a direct message.
 
-WhatsApp groups, quoted replies, threads, and reactions require Inkbox SDK 0.7.24
+WhatsApp quoted replies, threads, and reactions require Inkbox SDK 0.7.24
 or newer and matching server capabilities.
