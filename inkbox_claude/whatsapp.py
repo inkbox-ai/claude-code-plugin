@@ -54,7 +54,7 @@ def unsupported(exc):
 def require_method(identity, name):
     method = getattr(identity, name, None)
     if not callable(method):
-        raise RuntimeError("WhatsApp requires Inkbox SDK 0.7.24 or newer")
+        raise RuntimeError("WhatsApp requires Inkbox SDK 0.7.26 or newer")
     return method
 
 

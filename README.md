@@ -634,5 +634,6 @@ Saved group routes and requests with recipient arrays or group selectors are not
 replayed. Inspect their original send receipt without resending or converting them
 to a direct message.
 
-WhatsApp quoted replies, threads, and reactions require Inkbox SDK 0.7.24
-or newer and matching server capabilities.
+WhatsApp quoted replies, threads, and reactions require Inkbox SDK 0.7.26
+or newer and matching server capabilities. Until that release is published, use the
+reviewed source candidate; candidate checks do not verify a published-package install.
