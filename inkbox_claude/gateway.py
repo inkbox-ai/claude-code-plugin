@@ -1000,29 +1000,51 @@ class InkboxGateway:
             *,
             subscription_url: str = webhook_url,
         ) -> None:
-            existing = self._inkbox.webhooks.subscriptions.list(**owner_kw)
             desired_families = {
                 event_type.split(".", 1)[0] for event_type in event_types
             }
+            # The legacy identity view omits WhatsApp and mixed receivers.
+            # Limit the wider view to this channel; existing channels retain
+            # their reconciliation behavior.
+            identity_scope = desired_families == {"whatsapp"}
+            list_kw = {**owner_kw, **({"scope": "identity"} if identity_scope else {})}
+            existing = self._inkbox.webhooks.subscriptions.list(**list_kw)
             for sub in existing:
                 if (
                     sub.url == subscription_url
-                    and set(sub.event_types) == set(event_types)
+                    and (set(event_types).issubset(sub.event_types) if identity_scope
+                         else set(sub.event_types) == set(event_types))
                 ):
                     return  # already wired
+            for sub in existing:
                 existing_families = {
                     event_type.split(".", 1)[0] for event_type in sub.event_types
                 }
                 if (
                     sub.url.split("?", 1)[0].endswith(DEFAULT_WEBHOOK_PATH)
                     and desired_families & existing_families
+                    and (not identity_scope or (
+                        existing_families == desired_families
+                        and sub.url.split("?", 1)[0] == subscription_url.split("?", 1)[0]
+                    ))
                 ):
                     # Replace only this event channel. One identity may have
                     # separate iMessage and A2A subscriptions at the same URL.
                     self._inkbox.webhooks.subscriptions.delete(sub.id)
-            self._inkbox.webhooks.subscriptions.create(
-                url=subscription_url, event_types=event_types, **owner_kw
-            )
+            try:
+                self._inkbox.webhooks.subscriptions.create(
+                    url=subscription_url, event_types=event_types, **owner_kw
+                )
+            except Exception as exc:
+                if not identity_scope or getattr(exc, "status_code", None) != 409:
+                    raise
+                # A concurrent creator may have installed the exact receiver.
+                # Adopt only a compatible live row; unrelated conflicts remain
+                # failures and mixed subscriptions are never truncated.
+                for sub in self._inkbox.webhooks.subscriptions.list(**list_kw):
+                    if sub.url == subscription_url and set(event_types).issubset(sub.event_types):
+                        return
+                raise
 
         if identity.mailbox is not None:
             _reconcile({"mailbox_id": identity.mailbox.id}, MAIL_EVENTS)
@@ -1085,6 +1107,11 @@ class InkboxGateway:
         try:
             _reconcile({"agent_identity_id": identity.id}, WHATSAPP_EVENTS)
         except Exception as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith(
+                "Identity-wide webhook subscriptions are not supported by this server yet."
+            ):
+                logger.warning("WhatsApp notifications require identity-scoped subscription support")
+                return
             if not unsupported(exc):
                 raise
             try:

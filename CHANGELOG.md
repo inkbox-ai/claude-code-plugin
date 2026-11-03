@@ -2,6 +2,8 @@
 
 ## 0.2.16 (unreleased)
 
+- Reuse identity-scoped WhatsApp webhook receivers on restart without replacing mixed-channel subscriptions.
+
 - Keep overlapping WhatsApp send tools from replacing an unresolved request with a new send.
 - WhatsApp direct messages only: reject recipient arrays and unsupported group events, including saved group routes.
 - Explicit quoted replies and chronological thread reads.
