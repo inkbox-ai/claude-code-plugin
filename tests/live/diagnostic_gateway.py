@@ -7,6 +7,7 @@ from functools import wraps
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import threading
@@ -21,6 +22,7 @@ PHASES = frozenset({
     "a2a_ingress", "a2a_admission", "a2a_turn", "a2a_card", "a2a_send", "native_tools",
     "startup", "startup_identity", "startup_http", "startup_tunnel",
     "startup_configuration", "startup_recovery", "startup_tasks",
+    "subscription_list", "subscription_create", "subscription_delete", "call_configuration",
 })
 STATUSES = frozenset({"start", "ok", "error", "cancelled", "observed"})
 DETAILS = frozenset({
@@ -28,6 +30,7 @@ DETAILS = frozenset({
     "assistant", "result", "system", "user", "result_error", "result_success",
     "withheld_after_tool", "withheld_after_interrupt", "native_returned",
     "a2a_stale", "a2a_stopped", "a2a_inactive",
+    "subscription_overlap", "subscription_capacity", "subscription_owner",
 })
 TOOLS = frozenset({
     "inkbox_lookup_contact",
@@ -69,6 +72,20 @@ def safe_record(value):
 
 
 def error_kind(error):
+    # Exact/anchored classification only: never include the response text.
+    detail = getattr(error, "detail", None)
+    if getattr(error, "status_code", None) == 409 and isinstance(detail, str):
+        if detail in {
+            "An active subscription already delivers these events to this URL",
+            "An active subscription for one or more of these event types already exists at this URL on this owner",
+            "An active subscription with this URL already exists on this owner",
+        }:
+            return "subscription_overlap"
+        if re.fullmatch(r"Owner already has [0-9]+ active webhook subscriptions \(max [0-9]+\). Delete one before creating another\.", detail):
+            return "subscription_capacity"
+        if detail in {"Subscription owner is unavailable", "Subscription owner changed; refresh and retry",
+                      "Owner is not yet assigned to an organization", "Resource is not assigned to an identity"}:
+            return "subscription_owner"
     for cls, label in ((asyncio.CancelledError, "cancelled"), (TimeoutError, "timeout"),
                        (ConnectionError, "connection"), (PermissionError, "permission"), (ValueError, "value")):
         if isinstance(error, cls):
@@ -242,6 +259,8 @@ def install(path):
     from claude_agent_sdk import ClaudeSDKClient
     from inkbox import Inkbox
     from inkbox.a2a.client import A2AClient
+    from inkbox.agent_identity import AgentIdentity
+    from inkbox.webhook_subscriptions import WebhookSubscriptionsResource
     from inkbox.contacts.resources.contacts import ContactsResource
     from inkbox.mail.resources.messages import MessagesResource
     from inkbox_claude.gateway import InkboxGateway
@@ -262,6 +281,9 @@ def install(path):
                               "_catch_up_a2a_tasks": "startup_tasks"}.items():
             trace.wrap(InkboxGateway, method, phase)
         trace.wrap(Inkbox, "get_identity", "startup_identity")
+        for method in ("list", "create", "delete"):
+            trace.wrap(WebhookSubscriptionsResource, method, f"subscription_{method}")
+        trace.wrap(AgentIdentity, "set_incoming_call_action", "call_configuration")
         trace.wrap(ClaudeSDKClient, "query", "query")
         trace.wrap(A2AClient, "fetch_card", "a2a_card")
         trace.wrap(A2AClient, "send", "a2a_send")

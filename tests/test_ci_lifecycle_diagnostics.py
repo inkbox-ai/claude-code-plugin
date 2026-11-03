@@ -405,3 +405,20 @@ def test_startup_failure_records_only_phase_and_error_category(tmp_path, phase):
     rows = records(path)
     assert [(row["phase"], row["status"]) for row in rows] == [(phase, "start"), (phase, "error")]
     assert rows[-1]["detail"] == "timeout"
+
+
+@pytest.mark.parametrize("detail,category", [
+    ("An active subscription already delivers these events to this URL", "subscription_overlap"),
+    ("Owner already has 10 active webhook subscriptions (max 10). Delete one before creating another.", "subscription_capacity"),
+    ("Subscription owner is unavailable", "subscription_owner"),
+    (SECRET, "other"),
+    ("An active subscription already delivers these events to this URL " + SECRET, "other"),
+    ({"message": SECRET}, "other"),
+])
+def test_configuration_conflicts_emit_only_fixed_category(tmp_path, detail, category):
+    from inkbox.exceptions import InkboxAPIError
+    trace = diagnostics.Trace(tmp_path / "trace")
+    trace.emit("subscription_create", "error", error=InkboxAPIError(409, detail))
+    row = records(tmp_path / "trace")[0]
+    assert row["detail"] == category
+    assert row["http_status"] == 409
