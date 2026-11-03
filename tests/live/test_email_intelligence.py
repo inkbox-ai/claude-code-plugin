@@ -96,6 +96,28 @@ def _observe_contact_tool_presence(candidate: str) -> None:
     print(json.dumps({"contact_tool_presence": {name: name in candidate for name in names}}, sort_keys=True))
 
 
+
+def _contact_ack(candidate: str, action: str, nonce: str) -> bool:
+    """Require the exact acknowledgment, allowing only the public mail footer.
+
+    The SDK documents that stored send/reply bodies can include this branding
+    footer. Never accept a quoted request or arbitrary prose around the nonce.
+    """
+    expected = f"{action} {nonce}"
+    text = candidate.strip()
+    footer = "\n\nsent via inkbox (https://inkbox.ai)"
+    unbranded = text.removesuffix(footer)
+    accepted = unbranded == expected
+    print(json.dumps({"contact_ack": {
+        "action_present": action in text,
+        "nonce_present": nonce in text,
+        "exact_match": text == expected,
+        "branding_footer": text.endswith(footer),
+        "accepted": accepted,
+    }}, sort_keys=True))
+    return accepted
+
+
 def _ask(
     remote,
     aut_email: str,
@@ -330,7 +352,7 @@ def test_contact_crud_tool_use(ctx):
             "Use inkbox_create_contact now. Create a new contact named "
             f"{contact_name} with email {contact_email}. Do not just describe the action. "
             f"After the tool succeeds, reply exactly: CREATED {nonce}",
-            accept=lambda candidate: candidate.strip() == f"created {nonce}",
+            accept=lambda candidate: _contact_ack(candidate, "created", nonce),
         )
         assert "created" in created and nonce in created, created[:500]
         matches = _contacts_by_email(aut, contact_email)
@@ -345,7 +367,7 @@ def test_contact_crud_tool_use(ctx):
             "Use inkbox_update_contact now. Update contactId "
             f"{contact_id} and set notes to {updated_notes}. Do not create a second contact. "
             f"After the tool succeeds, reply exactly: UPDATED {nonce}",
-            accept=lambda candidate: candidate.strip() == f"updated {nonce}",
+            accept=lambda candidate: _contact_ack(candidate, "updated", nonce),
         )
         assert "updated" in updated and nonce in updated, updated[:500]
         fetched = aut.contacts.get(contact_id)
@@ -357,7 +379,7 @@ def test_contact_crud_tool_use(ctx):
             ctx["remote_email"],
             "I confirm this is a temporary test contact. Use inkbox_delete_contact now "
             f"to delete contactId {contact_id}. After the tool succeeds, reply exactly: DELETED {nonce}",
-            accept=lambda candidate: candidate.strip() == f"deleted {nonce}",
+            accept=lambda candidate: _contact_ack(candidate, "deleted", nonce),
         )
         assert "deleted" in deleted and nonce in deleted, deleted[:500]
         contact_removed = not _contacts_by_email(aut, contact_email)

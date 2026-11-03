@@ -145,7 +145,8 @@ def test_presence_vector_uses_only_six_fixed_names(capsys):
 
 
 @pytest.mark.parametrize("complete", [False, True])
-def test_contact_crud_accepts_only_exact_owned_action_nonce_in_separate_email(monkeypatch, complete):
+@pytest.mark.parametrize("footer", ["", "\n\nSent via Inkbox (https://inkbox.ai)"])
+def test_contact_crud_accepts_only_exact_owned_action_nonce_in_separate_email(monkeypatch, complete, footer):
     module = _live_email_module()
     clock = SimpleNamespace(now=0.0)
     monkeypatch.setattr(module, "TIMEOUT_S", 2)
@@ -175,7 +176,7 @@ def test_contact_crud_accepts_only_exact_owned_action_nonce_in_separate_email(mo
                 ("wrong-owner", expected, "other@example.com"),
             ]
             if complete:
-                candidates.append(("exact", expected, "agent@example.com"))
+                candidates.append(("exact", expected + footer, "agent@example.com"))
             self.current = []
             for suffix, body, sender in candidates:
                 item_id = action + suffix
@@ -198,3 +199,26 @@ def test_contact_crud_accepts_only_exact_owned_action_nonce_in_separate_email(mo
             module.test_contact_crud_tool_use(context)
         assert completed == ["created"]
     assert rows == []
+
+
+@pytest.mark.parametrize("body, accepted", [
+    ("created test-nonce", True),
+    ("created test-nonce\n\nsent via inkbox (https://inkbox.ai)", True),
+    ("updated test-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("created wrong-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("> created test-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("reply exactly: created test-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("**created test-nonce**", False),
+    ("created test-nonce extra prose", False),
+    ("created test-nonce\n\nsent via inkbox (https://other.invalid)", False),
+    ("created test-nonce\n\nsent via inkbox (https://inkbox.ai)\n\nsent via inkbox (https://inkbox.ai)", False),
+])
+def test_contact_ack_allows_only_canonical_footer_and_private_diagnostics(capsys, body, accepted):
+    module = _live_email_module()
+    assert module._contact_ack(body, "created", "test-nonce") is accepted
+    output = capsys.readouterr().out
+    assert "test-nonce" not in output and "https://" not in output
+    fields = json.loads(output)["contact_ack"]
+    assert set(fields) == {"action_present", "nonce_present", "exact_match", "branding_footer", "accepted"}
+    assert all(type(value) is bool for value in fields.values())
+    assert fields["accepted"] is accepted
