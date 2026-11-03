@@ -326,3 +326,27 @@ def test_source_rejection_allows_explicit_outreach_without_replacing_source_inte
         assert len(posts(channel)) == 1
     finally:
         CURRENT_SESSION.reset(token)
+
+
+@pytest.mark.parametrize("destination", [{"to": "+15550000099"}, {"conversation_id": "00000000-0000-0000-0000-000000000099"}])
+def test_source_rejected_key_cannot_be_reused_for_outreach_or_poison_exact_retry(channel, destination):
+    chat, _, meta = admit(channel, legacy=False)
+    session, tool = bind_tool(channel, meta, chat)
+    original = channel.identity.send_whatsapp
+    channel.identity.send_whatsapp = Mock(side_effect=InkboxAPIError(429, {"error": "whatsapp_daily_limit_exceeded"}))
+    source = {"text": "Source answer", "idempotency_key": "source-rejected"}
+    token = CURRENT_SESSION.set(session)
+    try:
+        with pytest.raises(InkboxAPIError):
+            tool(dict(source), lambda: None)
+        channel.identity.send_whatsapp = original
+        with pytest.raises(ReplyPreflightRejected):
+            tool({**destination, **source}, lambda: None)
+        assert posts(channel) == []
+        assert not meta.get("whatsapp_recipient_sends")
+        tool(dict(source), lambda: None)
+        assert len(posts(channel)) == 1
+        assert posts(channel)[0].headers["Idempotency-Key"] == source["idempotency_key"]
+        assert json.loads(posts(channel)[0].content) == {"conversation_id": CONVERSATION, "text": source["text"]}
+    finally:
+        CURRENT_SESSION.reset(token)
