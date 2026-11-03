@@ -31,6 +31,7 @@ DETAILS = frozenset({
     "withheld_after_tool", "withheld_after_interrupt", "native_returned",
     "a2a_stale", "a2a_stopped", "a2a_inactive",
     "subscription_overlap", "subscription_capacity", "subscription_owner",
+    "task_started", "task_progress", "task_notification", "background_tasks_changed",
 })
 TOOLS = frozenset({
     "inkbox_lookup_contact",
@@ -64,6 +65,10 @@ def safe_record(value):
     result["detail"] = value.get("detail") if value.get("detail") in DETAILS else "other"
     if value.get("tool") in TOOLS:
         result["tool"] = value["tool"]
+    if result["phase"] == "tool" and result.get("tool") == "Bash":
+        for key in ("background_requested", "foreground_requested", "long_timeout_requested"):
+            if type(value.get(key)) is bool:
+                result[key] = value[key]
     if result["phase"] == "native_tools" and type(value.get("contact_tools")) is dict:
         facts = value["contact_tools"]
         if set(facts) == CONTACT_TOOLS and all(type(v) is bool for v in facts.values()):
@@ -184,7 +189,16 @@ class Trace:
             if phase == "tool":
                 value = args[0].get("tool_name") if args and isinstance(args[0], dict) else None
                 name = value.removeprefix("mcp__inkbox__") if isinstance(value, str) else None
-                self.emit(phase, "observed", session=session, tool=name)
+                facts = {}
+                inputs = args[0].get("tool_input") if args and isinstance(args[0], dict) else None
+                if name == "Bash" and isinstance(inputs, dict):
+                    timeout = inputs.get("timeout")
+                    facts = {
+                        "background_requested": inputs.get("run_in_background") is True,
+                        "foreground_requested": inputs.get("run_in_background") is False,
+                        "long_timeout_requested": type(timeout) is int and timeout >= 180000,
+                    }
+                self.emit(phase, "observed", session=session, tool=name, facts=facts)
             else:
                 self.emit(phase, "start", session=session)
             return session, token
@@ -244,6 +258,10 @@ class Trace:
                     self.observe_native_tools(message)
                     detail = {"AssistantMessage": "assistant", "SystemMessage": "system", "UserMessage": "user",
                               "ResultMessage": "result_error" if getattr(message, "is_error", False) else "result_success"}.get(type(message).__name__, "other")
+                    task_details = {"task_started", "task_progress", "task_notification", "background_tasks_changed"}
+                    subtype = getattr(message, "subtype", None)
+                    if isinstance(subtype, str) and subtype in task_details:
+                        detail = subtype
                     self.emit("message", "observed", detail=detail)
                     yield message
                 self.emit("receive", "ok")

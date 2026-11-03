@@ -272,9 +272,12 @@ def _inbound_progress(a2a: Any, target: Any, timeout: float, run: str) -> None:
     task = _send_task(
         a2a,
         target,
-        "Add 2 + 2. Wait for one minute. Then add 3 + 3. Wait for another "
-        "minute. Finally add the two results together and return the final "
-        f"total. Do not finish before both waits elapse. Include `{completion}` "
+        "Use the native Bash tool in the foreground with run_in_background=false "
+        "and timeout=180000 milliseconds. In one foreground command, add 2 + 2, "
+        "wait 65 seconds, then add 3 + 3, wait another 65 seconds, and finally "
+        "add the two results together. Do not detach the command or use shell &. "
+        "Wait for the command's completed result before answering; starting it "
+        f"is not completion. Include `{completion}` "
         "and the exact expression `4 + 6 = 10` in the final answer.",
     )
     try:
