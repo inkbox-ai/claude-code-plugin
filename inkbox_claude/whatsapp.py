@@ -151,7 +151,10 @@ def source_plain_send(meta):
 def validate_send_uncertainty(meta, *, key=None, intent=None):
     """Unresolved sends fence the owning turn, not just their destination."""
     source_attempt = source_plain_send(meta) if meta.get("whatsapp_reply_source") is not None else None
-    if (source_attempt and source_attempt["outcome"] == "rejected"
+    source_destination = (intent is None or not (intent.get("conversation_id") or intent.get("to"))
+                          or delivery_target(meta, intent.get("conversation_id"), intent.get("to"))
+                          == meta.get("conversation_id"))
+    if (source_attempt and source_attempt["outcome"] == "rejected" and source_destination
             and (key != source_attempt["key"] or intent != source_attempt["intent"])):
         raise SendRecoveryRequired(source_attempt["key"], source_attempt["intent"])
     if unsupported_saved_intent(meta):

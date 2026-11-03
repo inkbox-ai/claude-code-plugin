@@ -303,3 +303,26 @@ def test_source_owned_plain_rejection_fences_replacement_across_restart(channel,
         assert json.loads(posts(channel)[0].content) == saved["whatsapp_plain_send"]["intent"]
     finally:
         CURRENT_SESSION.reset(token)
+
+
+@pytest.mark.parametrize("destination", [{"to": "+15550000099"}, {"conversation_id": "00000000-0000-0000-0000-000000000099"}])
+def test_source_rejection_allows_explicit_outreach_without_replacing_source_intent(channel, destination):
+    chat, _, meta = admit(channel, legacy=False)
+    session, tool = bind_tool(channel, meta, chat)
+    original = channel.identity.send_whatsapp
+    channel.identity.send_whatsapp = Mock(side_effect=InkboxAPIError(429, {"error": "whatsapp_daily_limit_exceeded"}))
+    token = CURRENT_SESSION.set(session)
+    try:
+        with pytest.raises(InkboxAPIError):
+            tool({"text": "Source answer", "idempotency_key": "source-rejected"}, lambda: None)
+        retained = deepcopy(meta["whatsapp_plain_send"])
+        channel.identity.send_whatsapp = original
+        tool({**destination, "text": "Requested outreach", "idempotency_key": "outreach"}, lambda: None)
+        assert len(posts(channel)) == 1
+        assert json.loads(posts(channel)[0].content) == {**destination, "text": "Requested outreach"}
+        assert meta["whatsapp_plain_send"] == retained
+        with pytest.raises(ReplyPreflightRejected):
+            asyncio.run(send_reply(channel.gateway, chat, "Automatic final", {**meta, "final_reply": True}))
+        assert len(posts(channel)) == 1
+    finally:
+        CURRENT_SESSION.reset(token)
