@@ -1,4 +1,4 @@
-"""Source-anchored replies retain intent across tool calls and bridge restarts."""
+"""Saved quoted replies retain their intent across upgrades, tool calls and restarts."""
 
 import asyncio
 from copy import deepcopy
@@ -21,12 +21,15 @@ from tests.test_sessions import make_session
 from tests.test_whatsapp_v2 import channel as channel, MESSAGE, CONVERSATION, IDENTITY
 
 
-def admit(channel, **changes):
+def admit(channel, *, legacy=True, **changes):
     message = {**channel.message, "content": "Question", **changes}
     channel.message = message
     asyncio.run(receive(channel.gateway, {"id": "source-event", "data": {"message": message}}))
     text, _, meta = channel.inbound.call_args.args
     chat_id = channel.gateway.sessions.get.call_args.args[0]
+    if legacy:
+        # Reconstruct a receipt admitted before plain replies became the default.
+        meta["whatsapp_reply_source"].pop("reply_style", None)
     return chat_id, text, meta
 
 
@@ -40,7 +43,7 @@ def final(channel, chat_id, meta, text="Answer"):
 
 
 @pytest.mark.parametrize("inbound_quote", [False, True])
-def test_new_final_quotes_trigger_not_parent_and_preserves_destination(channel, inbound_quote):
+def test_saved_quoted_final_preserves_trigger_and_destination(channel, inbound_quote):
     changes = {"reply_to_message_id": str(UUID(int=99)) if inbound_quote else None}
     chat_id, _, meta = admit(channel, **changes)
     final(channel, chat_id, meta)
@@ -191,11 +194,12 @@ def test_tool_quote_fence_survives_failure_restart_and_blocks_replacements(chann
         CURRENT_SESSION.reset(token)
 
 
-def test_new_reaction_quotes_verified_message_not_reaction_receipt(channel):
+def test_saved_reaction_quote_keeps_verified_message_not_reaction_receipt(channel):
     asyncio.run(receive_reaction(channel.gateway, {"data": {"reaction": deepcopy(channel.reaction)}}))
     _, _, meta = channel.inbound.call_args.args
     chat_id = channel.gateway.sessions.get.call_args.args[0]
     assert meta["source_event_id"].startswith("reaction:")
+    meta["whatsapp_reply_source"].pop("reply_style", None)
     final(channel, chat_id, meta)
     assert json.loads(posts(channel)[0].content)["reply_to_message_id"] == MESSAGE
 
@@ -221,11 +225,12 @@ def test_burst_keeps_first_trigger_anchor_and_all_receipts(channel):
     asyncio.run(run())
 
 
-def test_new_tool_quote_suppresses_normal_host_final(channel):
+def test_saved_tool_quote_suppresses_normal_host_final(channel):
     from tests.test_native_channel_sessions import Client
     async def run():
         await receive(channel.gateway, {"id": "source-event", "data": {"message": channel.message}})
         _, _, meta = channel.inbound.call_args.args
+        meta["whatsapp_reply_source"].pop("reply_style", None)
         chat_id = channel.gateway.sessions.get.call_args.args[0]
         session, tool = bind_tool(channel, meta, chat_id)
         session.receipt_fn = channel.gateway._channel_receipt

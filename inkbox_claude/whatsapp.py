@@ -172,11 +172,11 @@ def validate_send_uncertainty(meta, *, key=None, intent=None):
 def reply_source(identity, conversation, message_id):
     """Persist source ownership only when admitting a new input."""
     return {"identity_id": str(identity.id), "conversation_id": conversation,
-            "message_id": message_id}
+            "message_id": message_id, "reply_style": "plain"}
 
 
 def auto_reply_kwargs(identity, meta):
-    """Legacy receipts without a source snapshot keep their original plain intent."""
+    """Validate the source and preserve the reply style saved with each input."""
     source = meta.get("whatsapp_reply_source")
     if source is None:
         return {}
@@ -202,7 +202,7 @@ def auto_reply_kwargs(identity, meta):
             or str(field(message, "agent_identity_id")) != source["identity_id"]
             or field(message, "is_blocked") is True or unsupported_shape(message)):
         raise ReplyPreflightRejected("WhatsApp reply source ownership cannot be verified")
-    return {"reply_to_message_id": target}
+    return {} if source.get("reply_style") == "plain" else {"reply_to_message_id": target}
 
 
 async def receive(gateway, envelope):
@@ -447,6 +447,10 @@ def register_tools(register, client, identity_handle, cfg):
         if operation == "send_whatsapp":
             if meta.get("channel") == "whatsapp" and unsupported_shape(meta):
                 raise ReplyPreflightRejected("WhatsApp supports direct messages only")
+            if ("to" not in args and "conversation_id" not in args
+                    and turn is not None and meta.get("channel") == "whatsapp"
+                    and meta.get("conversation_id")):
+                args["conversation_id"] = meta["conversation_id"]
             recipient, conversation, reply_target = send_selector(args)
             native = (meta.get("channel") == "whatsapp" and conversation is not None
                       and delivery_target(meta, conversation) == meta.get("conversation_id"))
@@ -656,10 +660,10 @@ def register_tools(register, client, identity_handle, cfg):
         ),
         (
             "inkbox_send_whatsapp",
-            "Send a requested direct WhatsApp message, quoting the active source by default in its exact conversation for new request keys. An explicit visible quote is also supported. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
+            "Send a requested direct WhatsApp message. New sends are plain by default. Set reply_to_message_id selectively for an older message, multiple requests, or a specific attachment. Omit the destination to use the active WhatsApp conversation. Your normal final response already replies automatically. Use one recipient or conversation; text and one owned media ID are optional individually. Preserve the returned request key and media ID after uncertainty; never retry as a new message.",
             {
                 "to": {**string("One E.164 recipient; arrays are not supported"), "pattern": r"^\+[1-9][0-9]{6,14}$"},
-                "reply_to_message_id": string("Visible message ID to quote; requires conversation_id"),
+                "reply_to_message_id": string("Optional visible message ID to quote selectively; omit for plain messages. Requires conversation_id"),
                 "conversation_id": string(
                     "Existing direct conversation; mutually exclusive with to"
                 ),
