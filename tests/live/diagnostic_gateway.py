@@ -19,6 +19,8 @@ PHASES = frozenset({
     "contacts_create", "contacts_update", "contacts_delete", "contacts_get",
     "mail_send", "mail_get", "message", "automatic_reply",
     "a2a_ingress", "a2a_admission", "a2a_turn", "a2a_card", "a2a_send", "native_tools",
+    "startup", "startup_identity", "startup_http", "startup_tunnel",
+    "startup_configuration", "startup_recovery", "startup_tasks",
 })
 STATUSES = frozenset({"start", "ok", "error", "cancelled", "observed"})
 DETAILS = frozenset({
@@ -238,6 +240,7 @@ class Trace:
 
 def install(path):
     from claude_agent_sdk import ClaudeSDKClient
+    from inkbox import Inkbox
     from inkbox.a2a.client import A2AClient
     from inkbox.contacts.resources.contacts import ContactsResource
     from inkbox.mail.resources.messages import MessagesResource
@@ -252,8 +255,13 @@ def install(path):
             trace.wrap(ContactSession, method, phase, session_method=True)
         for method, phase in {"_on_mail_received": "mail_ingress", "_fetch_mail_body": "mail_fetch",
                               "_on_a2a_event": "a2a_ingress", "_a2a_authoritative_admission": "a2a_admission",
-                              "_run_a2a_turn": "a2a_turn"}.items():
+                              "_run_a2a_turn": "a2a_turn", "run": "startup",
+                              "_start_http_server": "startup_http", "_open_tunnel": "startup_tunnel",
+                              "_patch_identity_objects": "startup_configuration",
+                              "_recover_channel_inputs": "startup_recovery",
+                              "_catch_up_a2a_tasks": "startup_tasks"}.items():
             trace.wrap(InkboxGateway, method, phase)
+        trace.wrap(Inkbox, "get_identity", "startup_identity")
         trace.wrap(ClaudeSDKClient, "query", "query")
         trace.wrap(A2AClient, "fetch_card", "a2a_card")
         trace.wrap(A2AClient, "send", "a2a_send")

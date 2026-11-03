@@ -389,3 +389,19 @@ def test_init_list_presence_report_reprojects_fixed_boolean_schema(tmp_path, cap
     rows = [json.loads(line) for line in output.splitlines()]
     assert rows[0]["contact_tools"] == known
     assert "contact_tools" not in rows[1] and "contact_tools" not in rows[2]
+
+
+@pytest.mark.parametrize("phase", ["startup", "startup_identity", "startup_http", "startup_tunnel",
+                                  "startup_configuration", "startup_recovery", "startup_tasks"])
+def test_startup_failure_records_only_phase_and_error_category(tmp_path, phase):
+    class Startup:
+        async def connect(self, credential):
+            raise TimeoutError(credential)
+    path = tmp_path / "startup-trace"
+    trace = diagnostics.Trace(path)
+    trace.wrap(Startup, "connect", phase)
+    with pytest.raises(TimeoutError):
+        asyncio.run(Startup().connect(SECRET))
+    rows = records(path)
+    assert [(row["phase"], row["status"]) for row in rows] == [(phase, "start"), (phase, "error")]
+    assert rows[-1]["detail"] == "timeout"
