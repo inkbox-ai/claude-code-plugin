@@ -22,6 +22,11 @@ on:
         default: false
   workflow_dispatch:
     inputs:
+      exclude_phone_calls:
+        description: "Run non-phone channels only when phone validation is explicitly deferred"
+        required: false
+        type: boolean
+        default: false
       timeout_s:
         description: "Per-question reply timeout (seconds)"
         required: false
@@ -129,6 +134,7 @@ jobs:
           REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
           CLAUDE_CODE_INKBOX_API_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_API_KEY }}
           LIVE_EMAIL_TIMEOUT: ${{ inputs.timeout_s || '150' }}
+          EXCLUDE_PHONE_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.exclude_phone_calls == true }}
           LIVE_REAL_MODEL: ${{ matrix.leg == 'real' && '1' || '' }}
           LIVE_CONTACT_CRUD: ${{ matrix.leg == 'real' && '1' || '' }}
           # The delivery-failure retry tests read the gateway log for the loop's
@@ -138,7 +144,15 @@ jobs:
           GATEWAY_LOG: /tmp/gateway.log
           AUT_INKBOX_SIGNING_KEY: ${{ secrets.CLAUDE_CODE_INKBOX_SIGNING_KEY }}
           AUT_WEBHOOK_URL: http://127.0.0.1:8767/webhook
-        run: python3 -m pytest tests/live -v
+        run: |
+          args=()
+          if [ "$EXCLUDE_PHONE_CALLS" = "true" ]; then
+            args+=(
+              --deselect=tests/live/test_cross_channel.py::test_email_request_gets_call
+              --deselect=tests/live/test_cross_channel.py::test_sms_request_gets_call
+            )
+          fi
+          python3 -m pytest tests/live -v "${args[@]}"
 
       - name: Real Claude native Vault contract
         if: matrix.leg == 'real'
