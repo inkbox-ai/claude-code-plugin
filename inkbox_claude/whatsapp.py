@@ -150,6 +150,10 @@ def source_plain_send(meta):
 
 def validate_send_uncertainty(meta, *, key=None, intent=None):
     """Unresolved sends fence the owning turn, not just their destination."""
+    source_attempt = source_plain_send(meta) if meta.get("whatsapp_reply_source") is not None else None
+    if (source_attempt and source_attempt["outcome"] == "rejected"
+            and (key != source_attempt["key"] or intent != source_attempt["intent"])):
+        raise SendRecoveryRequired(source_attempt["key"], source_attempt["intent"])
     if unsupported_saved_intent(meta):
         raise ReplyPreflightRejected("A saved WhatsApp request is unsupported; inspect its original send receipt without retrying")
     attempts = list(meta.get("whatsapp_recipient_sends", {}).values())
@@ -575,9 +579,10 @@ def register_tools(register, client, identity_handle, cfg):
             except Exception as exc:
                 exc.idempotency_key = key
                 exc.whatsapp_media_id = args.get("media_id")
-                if prior_uncertainty or not public_quota_error(exc):
-                    # An unknown outcome must not be followed by the same final
-                    # answer as a second ordinary send on this conversation.
+                if (prior_uncertainty or not public_quota_error(exc)
+                        or (source_bound and meta.get("whatsapp_reply_source") is not None)):
+                    # Uncertain or source-owned rejected sends must not be
+                    # replaced by an automatic final with a fresh request key.
                     _mark_tool_delivery("whatsapp", target)
                 with send_lock:
                     if attempt is not None:

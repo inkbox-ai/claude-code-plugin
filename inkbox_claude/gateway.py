@@ -1025,7 +1025,7 @@ class InkboxGateway:
                     and desired_families & existing_families
                     and (not identity_scope or (
                         existing_families == desired_families
-                        and sub.url.split("?", 1)[0] == subscription_url.split("?", 1)[0]
+                        and sub.url == subscription_url
                     ))
                 ):
                     # Replace only this event channel. One identity may have

@@ -313,8 +313,9 @@ def test_whatsapp_unavailable_identity_scope_keeps_other_channels_without_blind_
     assert [item["event_types"] for item in subscriptions.created] == [gateway.A2A_EVENTS, gateway.CALL_EVENTS]
 
 
-def test_whatsapp_receiver_at_other_destination_is_preserved():
-    foreign = types.SimpleNamespace(id="foreign", url="https://other.example/webhook", event_types=WHATSAPP_EVENTS)
+@pytest.mark.parametrize("url", ["https://other.example/webhook", "https://agent.example/webhook?receiver=other"])
+def test_whatsapp_receiver_at_other_destination_is_preserved(url):
+    foreign = types.SimpleNamespace(id="foreign", url=url, event_types=WHATSAPP_EVENTS)
     class Subscriptions(_FakeSubscriptions):
         def list(self, **owner):
             return [foreign] if owner.get("scope") == "identity" else []

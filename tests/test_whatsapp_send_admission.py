@@ -268,3 +268,38 @@ def test_plain_intent_is_durable_before_post(channel):
         assert len(posts(channel)) == 1
     finally:
         CURRENT_SESSION.reset(token)
+
+
+@pytest.mark.parametrize("selector", ["implicit", "conversation", "sender"])
+def test_source_owned_plain_rejection_fences_replacement_across_restart(channel, selector):
+    chat, _, meta = admit(channel, legacy=False)
+    session, tool = bind_tool(channel, meta, chat)
+    original = channel.identity.send_whatsapp
+    rejected = Mock(side_effect=InkboxAPIError(429, {"error": "whatsapp_daily_limit_exceeded"}))
+    channel.identity.send_whatsapp = rejected
+    args = {"text": "Answer", "idempotency_key": "source-rejected"}
+    if selector == "conversation":
+        args["conversation_id"] = CONVERSATION
+    elif selector == "sender":
+        args["to"] = meta["sender"]
+    token = CURRENT_SESSION.set(session)
+    try:
+        with pytest.raises(InkboxAPIError):
+            tool(dict(args), lambda: None)
+        assert session._current_channel_tool_delivery
+        saved = IMessageState(channel.gateway.cfg, channel="whatsapp").interrupted()[0]["meta"]
+        assert saved["whatsapp_plain_send"]["outcome"] == "rejected"
+        session._current_turn.reply_meta = saved
+        for change in ({"idempotency_key": "replacement"}, {"text": "Changed"}):
+            with pytest.raises(ReplyPreflightRejected):
+                tool({**args, **change}, lambda: None)
+        with pytest.raises(ReplyPreflightRejected):
+            asyncio.run(send_reply(channel.gateway, chat, "Automatic final", {**saved, "final_reply": True}))
+        assert rejected.call_count == 1
+        channel.identity.send_whatsapp = original
+        tool(dict(args), lambda: None)
+        assert len(posts(channel)) == 1
+        assert posts(channel)[0].headers["Idempotency-Key"] == "source-rejected"
+        assert json.loads(posts(channel)[0].content) == saved["whatsapp_plain_send"]["intent"]
+    finally:
+        CURRENT_SESSION.reset(token)
