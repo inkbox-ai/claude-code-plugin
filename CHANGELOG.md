@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.16 (unreleased)
+
+- Reuse identity-scoped WhatsApp webhook receivers on restart without replacing mixed-channel subscriptions.
+
+- Keep overlapping WhatsApp send tools from replacing an unresolved request with a new send.
+- WhatsApp direct messages only: reject recipient arrays and unsupported group events, including saved group routes.
+- Explicit quoted replies and chronological thread reads.
+- Named/custom versioned reactions, actor-scoped peer context, and silent self/delivery callbacks.
+- Use plain replies by default; quote selectively with an explicit target, and preserve saved plain or quoted requests after uncertainty.
+- Approved dedicated one-to-one WhatsApp: signed incoming messages, automatic replies,
+  durable receipt/recovery state, owned attachments, and read-only availability.
+- Add native WhatsApp tools, exact-route approvals/burst controls, temporary media
+  renewal, and delivery notifications that never trigger a second agent reply.
+- Require Inkbox SDK 0.7.26 or newer, below 1.0.0.
+- Keep unfinished host work recoverable after explicit sends and retain distinct
+  reaction updates and permission prompts.
+- Reject unsupported saved WhatsApp routes and overlong replies without
+  repeating them after a restart.
+
 ## 0.2.14
 
 ### Added

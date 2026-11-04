@@ -7,6 +7,7 @@ from functools import wraps
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import threading
@@ -19,6 +20,9 @@ PHASES = frozenset({
     "contacts_create", "contacts_update", "contacts_delete", "contacts_get",
     "mail_send", "mail_get", "message", "automatic_reply",
     "a2a_ingress", "a2a_admission", "a2a_turn", "a2a_card", "a2a_send", "native_tools",
+    "startup", "startup_identity", "startup_http", "startup_tunnel",
+    "startup_configuration", "startup_recovery", "startup_tasks",
+    "subscription_list", "subscription_create", "subscription_delete", "call_configuration",
 })
 STATUSES = frozenset({"start", "ok", "error", "cancelled", "observed"})
 DETAILS = frozenset({
@@ -26,6 +30,8 @@ DETAILS = frozenset({
     "assistant", "result", "system", "user", "result_error", "result_success",
     "withheld_after_tool", "withheld_after_interrupt", "native_returned",
     "a2a_stale", "a2a_stopped", "a2a_inactive",
+    "subscription_overlap", "subscription_capacity", "subscription_owner",
+    "task_started", "task_progress", "task_notification", "background_tasks_changed",
 })
 TOOLS = frozenset({
     "inkbox_lookup_contact",
@@ -59,6 +65,10 @@ def safe_record(value):
     result["detail"] = value.get("detail") if value.get("detail") in DETAILS else "other"
     if value.get("tool") in TOOLS:
         result["tool"] = value["tool"]
+    if result["phase"] == "tool" and result.get("tool") == "Bash":
+        for key in ("background_requested", "foreground_requested", "long_timeout_requested"):
+            if type(value.get(key)) is bool:
+                result[key] = value[key]
     if result["phase"] == "native_tools" and type(value.get("contact_tools")) is dict:
         facts = value["contact_tools"]
         if set(facts) == CONTACT_TOOLS and all(type(v) is bool for v in facts.values()):
@@ -67,6 +77,20 @@ def safe_record(value):
 
 
 def error_kind(error):
+    # Exact/anchored classification only: never include the response text.
+    detail = getattr(error, "detail", None)
+    if getattr(error, "status_code", None) == 409 and isinstance(detail, str):
+        if detail in {
+            "An active subscription already delivers these events to this URL",
+            "An active subscription for one or more of these event types already exists at this URL on this owner",
+            "An active subscription with this URL already exists on this owner",
+        }:
+            return "subscription_overlap"
+        if re.fullmatch(r"Owner already has [0-9]+ active webhook subscriptions \(max [0-9]+\). Delete one before creating another\.", detail):
+            return "subscription_capacity"
+        if detail in {"Subscription owner is unavailable", "Subscription owner changed; refresh and retry",
+                      "Owner is not yet assigned to an organization", "Resource is not assigned to an identity"}:
+            return "subscription_owner"
     for cls, label in ((asyncio.CancelledError, "cancelled"), (TimeoutError, "timeout"),
                        (ConnectionError, "connection"), (PermissionError, "permission"), (ValueError, "value")):
         if isinstance(error, cls):
@@ -165,7 +189,16 @@ class Trace:
             if phase == "tool":
                 value = args[0].get("tool_name") if args and isinstance(args[0], dict) else None
                 name = value.removeprefix("mcp__inkbox__") if isinstance(value, str) else None
-                self.emit(phase, "observed", session=session, tool=name)
+                facts = {}
+                inputs = args[0].get("tool_input") if args and isinstance(args[0], dict) else None
+                if name == "Bash" and isinstance(inputs, dict):
+                    timeout = inputs.get("timeout")
+                    facts = {
+                        "background_requested": inputs.get("run_in_background") is True,
+                        "foreground_requested": inputs.get("run_in_background") is False,
+                        "long_timeout_requested": type(timeout) is int and timeout >= 180000,
+                    }
+                self.emit(phase, "observed", session=session, tool=name, facts=facts)
             else:
                 self.emit(phase, "start", session=session)
             return session, token
@@ -225,6 +258,10 @@ class Trace:
                     self.observe_native_tools(message)
                     detail = {"AssistantMessage": "assistant", "SystemMessage": "system", "UserMessage": "user",
                               "ResultMessage": "result_error" if getattr(message, "is_error", False) else "result_success"}.get(type(message).__name__, "other")
+                    task_details = {"task_started", "task_progress", "task_notification", "background_tasks_changed"}
+                    subtype = getattr(message, "subtype", None)
+                    if isinstance(subtype, str) and subtype in task_details:
+                        detail = subtype
                     self.emit("message", "observed", detail=detail)
                     yield message
                 self.emit("receive", "ok")
@@ -238,7 +275,10 @@ class Trace:
 
 def install(path):
     from claude_agent_sdk import ClaudeSDKClient
+    from inkbox import Inkbox
     from inkbox.a2a.client import A2AClient
+    from inkbox.agent_identity import AgentIdentity
+    from inkbox.webhook_subscriptions import WebhookSubscriptionsResource
     from inkbox.contacts.resources.contacts import ContactsResource
     from inkbox.mail.resources.messages import MessagesResource
     from inkbox_claude.gateway import InkboxGateway
@@ -252,8 +292,16 @@ def install(path):
             trace.wrap(ContactSession, method, phase, session_method=True)
         for method, phase in {"_on_mail_received": "mail_ingress", "_fetch_mail_body": "mail_fetch",
                               "_on_a2a_event": "a2a_ingress", "_a2a_authoritative_admission": "a2a_admission",
-                              "_run_a2a_turn": "a2a_turn"}.items():
+                              "_run_a2a_turn": "a2a_turn", "run": "startup",
+                              "_start_http_server": "startup_http", "_open_tunnel": "startup_tunnel",
+                              "_patch_identity_objects": "startup_configuration",
+                              "_recover_channel_inputs": "startup_recovery",
+                              "_catch_up_a2a_tasks": "startup_tasks"}.items():
             trace.wrap(InkboxGateway, method, phase)
+        trace.wrap(Inkbox, "get_identity", "startup_identity")
+        for method in ("list", "create", "delete"):
+            trace.wrap(WebhookSubscriptionsResource, method, f"subscription_{method}")
+        trace.wrap(AgentIdentity, "set_incoming_call_action", "call_configuration")
         trace.wrap(ClaudeSDKClient, "query", "query")
         trace.wrap(A2AClient, "fetch_card", "a2a_card")
         trace.wrap(A2AClient, "send", "a2a_send")

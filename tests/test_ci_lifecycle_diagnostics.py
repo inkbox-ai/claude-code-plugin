@@ -389,3 +389,71 @@ def test_init_list_presence_report_reprojects_fixed_boolean_schema(tmp_path, cap
     rows = [json.loads(line) for line in output.splitlines()]
     assert rows[0]["contact_tools"] == known
     assert "contact_tools" not in rows[1] and "contact_tools" not in rows[2]
+
+
+@pytest.mark.parametrize("phase", ["startup", "startup_identity", "startup_http", "startup_tunnel",
+                                  "startup_configuration", "startup_recovery", "startup_tasks"])
+def test_startup_failure_records_only_phase_and_error_category(tmp_path, phase):
+    class Startup:
+        async def connect(self, credential):
+            raise TimeoutError(credential)
+    path = tmp_path / "startup-trace"
+    trace = diagnostics.Trace(path)
+    trace.wrap(Startup, "connect", phase)
+    with pytest.raises(TimeoutError):
+        asyncio.run(Startup().connect(SECRET))
+    rows = records(path)
+    assert [(row["phase"], row["status"]) for row in rows] == [(phase, "start"), (phase, "error")]
+    assert rows[-1]["detail"] == "timeout"
+
+
+@pytest.mark.parametrize("detail,category", [
+    ("An active subscription already delivers these events to this URL", "subscription_overlap"),
+    ("Owner already has 10 active webhook subscriptions (max 10). Delete one before creating another.", "subscription_capacity"),
+    ("Subscription owner is unavailable", "subscription_owner"),
+    (SECRET, "other"),
+    ("An active subscription already delivers these events to this URL " + SECRET, "other"),
+    ({"message": SECRET}, "other"),
+])
+def test_configuration_conflicts_emit_only_fixed_category(tmp_path, detail, category):
+    from inkbox.exceptions import InkboxAPIError
+    trace = diagnostics.Trace(tmp_path / "trace")
+    trace.emit("subscription_create", "error", error=InkboxAPIError(409, detail))
+    row = records(tmp_path / "trace")[0]
+    assert row["detail"] == category
+    assert row["http_status"] == 409
+
+
+@pytest.mark.parametrize('flag', [True, False, None, SECRET])
+def test_bash_trace_reports_only_bounded_background_and_timeout_facts(tmp_path, flag):
+    class Session:
+        async def hook(self, data): return data
+    path = tmp_path / 'trace'
+    trace = diagnostics.Trace(path)
+    trace.wrap(Session, 'hook', 'tool', session_method=True)
+    value = {'tool_name': 'Bash', 'tool_input': {
+        'command': SECRET, 'run_in_background': flag, 'timeout': 180000}}
+    assert asyncio.run(Session().hook(value)) is value
+    row = records(path)[0]
+    assert row['background_requested'] is (flag is True)
+    assert row['foreground_requested'] is (flag is False)
+    assert row['long_timeout_requested'] is True
+    assert 'command' not in row and 'timeout' not in row
+    tampered = diagnostics.safe_record({'phase': 'tool', 'status': 'observed', 'tool': 'Read',
+        'background_requested': True, 'long_timeout_requested': SECRET})
+    assert 'background_requested' not in tampered and 'long_timeout_requested' not in tampered
+
+
+def test_receive_diagnostics_preserve_native_task_events_without_payloads(tmp_path):
+    class Host:
+        async def receive_response(self):
+            for subtype in ('task_started', 'background_tasks_changed', 'task_progress', 'task_notification', SECRET):
+                yield SimpleNamespace(subtype=subtype, data=SECRET)
+    path = tmp_path / 'trace'
+    trace = diagnostics.Trace(path)
+    trace.wrap_receive(Host)
+    async def run(): return [message async for message in Host().receive_response()]
+    messages = asyncio.run(run())
+    assert len(messages) == 5 and all(message.data == SECRET for message in messages)
+    assert [row['detail'] for row in records(path) if row['phase'] == 'message'] == [
+        'task_started', 'background_tasks_changed', 'task_progress', 'task_notification', 'other']

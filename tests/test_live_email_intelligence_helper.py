@@ -142,3 +142,83 @@ def test_presence_vector_uses_only_six_fixed_names(capsys):
     assert "synthetic-private" not in output
     fields = json.loads(output)["contact_tool_presence"]
     assert len(fields) == 6 and sum(fields.values()) == 1 and fields["inkbox_get_contact"] is True
+
+
+@pytest.mark.parametrize("complete", [False, True])
+@pytest.mark.parametrize("footer", ["", "\n\nSent via Inkbox (https://inkbox.ai)"])
+def test_contact_crud_accepts_only_exact_owned_action_nonce_in_separate_email(monkeypatch, complete, footer):
+    module = _live_email_module()
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(module, "TIMEOUT_S", 2)
+    monkeypatch.setattr(module, "POLL_EVERY_S", 1)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(module.time, "sleep", lambda n: setattr(clock, "now", clock.now + n))
+    rows, completed = [], []
+
+    class Messages:
+        current = []
+        bodies = {}
+        def list(self, _mailbox, direction=None):
+            return self.current
+        def send(self, _mailbox, **kwargs):
+            expected = kwargs["body_text"].rsplit("reply exactly: ", 1)[1].lower()
+            action, nonce = expected.split()
+            completed.append(action)
+            if action == "created":
+                rows.append(SimpleNamespace(id="contact-1", notes=""))
+            elif action == "updated":
+                rows[0].notes = "updated-notes-" + nonce
+            else:
+                rows.clear()
+            candidates = [
+                ("wrong-nonce", action + " cc-live-wrong", "agent@example.com"),
+                ("wrong-action", "wrong " + nonce, "agent@example.com"),
+                ("wrong-owner", expected, "other@example.com"),
+            ]
+            if complete:
+                candidates.append(("exact", expected + footer, "agent@example.com"))
+            self.current = []
+            for suffix, body, sender in candidates:
+                item_id = action + suffix
+                self.bodies[item_id] = body
+                self.current.append(SimpleNamespace(id=item_id, thread_id="tool-thread", subject="Tool result", from_address=sender))
+            return SimpleNamespace(thread_id="request-thread")
+        def get(self, _mailbox, message_id):
+            return SimpleNamespace(body_text=self.bodies[message_id])
+
+    monkeypatch.setattr(module, "_contacts_by_email", lambda *_: rows)
+    monkeypatch.setattr(module, "_delete_contacts_by_email", lambda *_: rows.clear())
+    context = {"remote": SimpleNamespace(messages=Messages()),
+               "aut": SimpleNamespace(contacts=SimpleNamespace(get=lambda _: rows[0])),
+               "aut_email": "agent@example.com", "remote_email": "driver@example.com"}
+    if complete:
+        module.test_contact_crud_tool_use(context)
+        assert completed == ["created", "updated", "deleted"]
+    else:
+        with pytest.raises(pytest.fail.Exception, match="no acceptable reply"):
+            module.test_contact_crud_tool_use(context)
+        assert completed == ["created"]
+    assert rows == []
+
+
+@pytest.mark.parametrize("body, accepted", [
+    ("created test-nonce", True),
+    ("created test-nonce\n\nsent via inkbox (https://inkbox.ai)", True),
+    ("updated test-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("created wrong-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("> created test-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("reply exactly: created test-nonce\n\nsent via inkbox (https://inkbox.ai)", False),
+    ("**created test-nonce**", False),
+    ("created test-nonce extra prose", False),
+    ("created test-nonce\n\nsent via inkbox (https://other.invalid)", False),
+    ("created test-nonce\n\nsent via inkbox (https://inkbox.ai)\n\nsent via inkbox (https://inkbox.ai)", False),
+])
+def test_contact_ack_allows_only_canonical_footer_and_private_diagnostics(capsys, body, accepted):
+    module = _live_email_module()
+    assert module._contact_ack(body, "created", "test-nonce") is accepted
+    output = capsys.readouterr().out
+    assert "test-nonce" not in output and "https://" not in output
+    fields = json.loads(output)["contact_ack"]
+    assert set(fields) == {"action_present", "nonce_present", "exact_match", "branding_footer", "accepted"}
+    assert all(type(value) is bool for value in fields.values())
+    assert fields["accepted"] is accepted

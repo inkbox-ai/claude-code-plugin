@@ -269,14 +269,18 @@ class IMessageState:
             rows = [db.execute("SELECT * FROM receipts WHERE event_id=?", (event_id,)).fetchone() for event_id in ids]
             if not rows or any(row is None or row["chat_id"] != chat_id or row["state"] != "reply_pending" for row in rows):
                 raise PermissionError("Reply receipt is no longer awaiting delivery")
-            for event_id in ids:
-                db.execute("UPDATE receipts SET state='sending' WHERE event_id=?", (event_id,))
+            for row in rows:
+                merged = {**json.loads(row["meta"]), **meta}
+                db.execute("UPDATE receipts SET state='sending',meta=? WHERE event_id=?",
+                           (_json(merged), row["event_id"]))
 
     def record_outbound(self, message: Any, meta: dict[str, Any], chat_id: str) -> None:
         sent = _outbound(message)
         if not sent["id"]:
             return
         route = {"chat_id": chat_id, "meta": meta, "message_id": sent.pop("id"), **sent}
+        if meta.get("channel") == "whatsapp":
+            route["delivery_state"] = _field(message, "delivery_state")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT route FROM outbound WHERE message_id=?", (route["message_id"],)).fetchone()
@@ -285,9 +289,14 @@ class IMessageState:
             elif json.loads(row["route"]).get("unknown_route"):
                 # Delivery callbacks can win the race with the accepted-send
                 # response. Fill its missing route without undoing that failure.
-                route["status"] = json.loads(row["route"])["status"]
+                previous = json.loads(row["route"])
+                route["status"] = previous["status"]
+                if "delivery_state" in previous:
+                    route["delivery_state"] = previous["delivery_state"]
+                if "updated_at" in previous:
+                    route["updated_at"] = previous["updated_at"]
                 db.execute("UPDATE outbound SET route=? WHERE message_id=?", (_json(route), route["message_id"]))
-                if route["status"] == "failed":
+                if route["status"] == "failed" and meta.get("channel") != "whatsapp":
                     self._stage_failure_notice(db, route["message_id"], route)
 
     def lookup_outbound(self, message_id: str) -> dict[str, Any] | None:
@@ -378,5 +387,5 @@ def compatible_key(meta):
     message = meta.get("message_id") or meta.get("source_message_id")
     parent, root = meta.get("reply_to_message_id"), meta.get("thread_root_message_id")
     context = (root or meta.get("thread_id") or parent) if parent or (root and message and root != message) else None
-    return tuple(meta.get(k) for k in ("sender", "conversation_id", "conversation_kind", "sender_access",
+    return tuple(meta.get(k) for k in ("channel", "sender", "conversation_id", "conversation_kind", "sender_access",
         "companion_scope_id", "companion_activation_id", "identity_id")) + (context,)

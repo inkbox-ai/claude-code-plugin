@@ -105,6 +105,7 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
                 getattr(mailbox, "email_address", None),
                 getattr(phone, "number", None),
                 "imessage" if getattr(identity, "imessage_enabled", False) else None,
+                "whatsapp" if getattr(identity, "whatsapp_enabled", False) else None,
             ])) or "no channels provisioned"
             checks.append(("identity reachable", True, detail))
             if cfg.imessage_threaded_replies:
