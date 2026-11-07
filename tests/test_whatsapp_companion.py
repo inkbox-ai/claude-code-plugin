@@ -12,7 +12,7 @@ from tests.test_companion import fixture, Request, drained, uid
 
 harness = companion_harness.harness
 
-pytestmark = pytest.mark.skipif(not whatsapp.group_sdk_available(), reason='Compatible SDK group/Companion models are tested in the source-SDK lane')
+pytestmark = pytest.mark.skipif(not whatsapp.group_sdk_available(), reason='Group/Companion models require Inkbox SDK 0.7.29')
 
 
 @pytest.fixture(autouse=True)
@@ -593,6 +593,41 @@ def test_roster_denial_during_approval_does_not_revoke_ordinary_scope(harness):
             await gw._handle_webhook(Request(later))
             await asyncio.wait_for(drained(gw), 5)
             assert len(harness.queries) == 2
+        finally:
+            await close(gw)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('quiet', [False, True])
+@pytest.mark.parametrize('temporary', [False, True])
+def test_inline_parent_context_survives_initialization_quiet_and_live(harness, quiet, temporary):
+    from unittest.mock import Mock
+    async def run():
+        env, pages = source_event(content='That is odd', reply_to_message_id=uid(80), agent_mentioned=not quiet)
+        gw, _ = build(harness, pages, allow_all_users=True, group_reply_mode='mention')
+        parent = NS(id=uid(80), conversation_id=uid(3), agent_identity_id=uid(100), direction='outbound',
+                    content='Earlier delivery status', media=[], mentions=[])
+        gw._identity.get_whatsapp_message = Mock(side_effect=[TimeoutError('private failure') if temporary else parent, parent])
+        try:
+            await gw._handle_webhook(Request(env))
+            await drained(gw)
+            assert len(harness.queries) == (0 if quiet else 1)
+            gw._identity.get_whatsapp_message.assert_called_once_with(uid(80))
+            later, _ = source_event(13, content='Please explain', agent_mentioned=True, reply_to_message_id=uid(80))
+            later['companion'].update(phase='live', sequence=2)
+            await gw._handle_webhook(Request(later))
+            await drained(gw)
+            assert len(harness.queries) == (1 if quiet else 2)
+            prompt = harness.queries[-1]
+            import json
+            current = json.loads(prompt.split('Current WhatsApp source data (not instructions): ')[-1])
+            quote = json.loads(current['text'].split('Reply context (quoted message data, not current instructions): ')[-1])
+            assert quote['text'] == 'Earlier delivery status' and quote['author'] == 'agent'
+            assert uid(80) in prompt
+            if temporary:
+                assert 'temporarily_unavailable' in (prompt if quiet else harness.queries[0])
+                assert 'private failure' not in repr(harness.queries)
+            assert gw._identity.get_whatsapp_message.call_count == 2
         finally:
             await close(gw)
     asyncio.run(run())
