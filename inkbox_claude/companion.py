@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from copy import deepcopy
 from dataclasses import asdict
 from email.utils import getaddresses
@@ -811,13 +812,26 @@ class CompanionReceiver:
         session.companion_approver = event["sender"]
         await session.notify_activity(MODES[record["scope"]["channel"]], meta, "accepted")
 
+        owner_loop = asyncio.get_running_loop()
+        owner_thread = threading.get_ident()
+
         def checkpoint(state: str, **result: Any) -> None:
+            if threading.get_ident() != owner_thread:
+                async def apply():
+                    checkpoint(state, **result)
+                return asyncio.run_coroutine_threadsafe(apply(), owner_loop).result()
             if self._closing or self._closed:
-                if state == "submitting":
+                if state in {"submitting", "tool_send"}:
                     raise asyncio.CancelledError
                 return
             if record["state"] in {"failed", "paused"}:
                 raise PermissionError("Companion submission is no longer active")
+            if state == "tool_send":
+                if event["state"] not in {"submitting", "submitted"}:
+                    raise PermissionError("Companion tool send no longer belongs to an active host")
+                event["submitted_meta"] = deepcopy(result["reply_meta"])
+                self.save(key)
+                return
             event["state"] = state
             if state == "submitting":
                 event.pop("host_fenced", None)
@@ -1067,6 +1081,11 @@ class CompanionReceiver:
             try:
                 await self.authorize_reply(record["session_key"], "whatsapp", active)
             except Exception as exc:
+                from .whatsapp import GroupRouteRejected
+                if isinstance(exc, GroupRouteRejected) and record["scope"]["phase"] == "ordinary":
+                    if not pending.future.done():
+                        pending.future.set_result(None)
+                    return
                 if isinstance(exc, PermissionError) or getattr(exc, "status_code", None) in {401, 403, 404}:
                     self.discard_context(key)
                     self.save(key)

@@ -296,3 +296,13 @@ def test_transient_attachment_read_does_not_admit_or_lose_source(setup, monkeypa
     assert asyncio.run(whatsapp.receive(gw, envelope(message))).status == 200
     session.handle_inbound.assert_called_once()
     assert gw._with_media.call_args.args[1][0]['url'] == 'https://example.test/image.png'
+
+
+@pytest.mark.parametrize('change', [{'agent_identity_id':'wrong-owner'}, {'id':'wrong-conversation'},
+    {'participants':[]}, {'participants':['+15555550101','+15555550102']}, {'remote_number':None}])
+def test_direct_destination_requires_owned_single_peer(setup, monkeypatch, change):
+    gw, _, _ = setup
+    current = {**event()['data']['message'], 'id':CONV, **change}
+    monkeypatch.setattr(gw._identity, 'get_whatsapp_conversation', lambda _: NS(**current))
+    with pytest.raises((PermissionError, RuntimeError)):
+        whatsapp.validate_group_destination(gw._identity, CONV, gw.cfg)

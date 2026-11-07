@@ -281,6 +281,14 @@ def validate_group_destination(identity, conversation, cfg, *, client=None, rout
     if not is_group(current):
         if sponsored:
             raise PermissionError("WhatsApp Companion requires its admitted group")
+        peer = field(current, "remote_number")
+        allowed = {user.lower() for user in cfg.allowed_users}
+        if (unsupported_shape(current) or str(field(current, "id")) != conversation
+                or str(field(current, "agent_identity_id")) != str(identity.id)
+                or not isinstance(peer, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", peer) is None
+                or field(current, "participants") != [peer]
+                or (not cfg.allow_all_users and allowed and peer.lower() not in allowed)):
+            raise GroupRouteRejected("WhatsApp conversation recipient is not allowed")
         return
     if field(current, "unresolved_participant_count") or not field(current, "participants"):
         from .imessage import SafeReplyPreflightError
@@ -671,6 +679,16 @@ def register_tools(register, client, identity_handle, cfg):
         turn = getattr(session, "_current_turn", None)
         meta = getattr(turn, "reply_meta", None) or {}
 
+        def persist_send_state():
+            if meta.get("companion"):
+                if turn is None or not callable(turn.checkpoint):
+                    raise PermissionError("Companion send checkpoint is unavailable")
+                from copy import deepcopy
+                turn.checkpoint("tool_send", reply_meta=deepcopy(meta))
+            else:
+                from .imessage import IMessageState
+                IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
+
         def authorize_effect():
             authorize()
             if meta.get("channel") == "whatsapp" and unsupported_shape(meta):
@@ -822,7 +840,7 @@ def register_tools(register, client, identity_handle, cfg):
                     meta["whatsapp_explicit_quote_attempted"] = True
                     meta["whatsapp_explicit_quote_key"] = key
                     from .imessage import IMessageState
-                    IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
+                    persist_send_state()
                     _mark_tool_delivery("whatsapp", target)
                 if (source_bound and reply_target is None) or recipient_attempt:
                     if recipient_attempt:
@@ -834,7 +852,7 @@ def register_tools(register, client, identity_handle, cfg):
                     else:
                         meta["whatsapp_plain_send"] = attempt
                     from .imessage import IMessageState
-                    IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
+                    persist_send_state()
             authorize()
             try:
                 sent = method(
@@ -852,7 +870,7 @@ def register_tools(register, client, identity_handle, cfg):
                     if attempt is not None:
                         attempt["outcome"] = "rejected" if public_quota_error(exc) and not prior_uncertainty else "uncertain"
                         try:
-                            IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
+                            persist_send_state()
                         except Exception:
                             logger.warning("WhatsApp send tracking needs recovery; preserve the original request key.")
                 raise
@@ -870,7 +888,7 @@ def register_tools(register, client, identity_handle, cfg):
                 _mark_tool_delivery("whatsapp", target)
                 if recipient_attempt:
                     try:
-                        IMessageState(cfg, channel="whatsapp").mark(meta, "running", chat_id=session.chat_id)
+                        persist_send_state()
                     except Exception:
                         logger.warning("WhatsApp accepted; local tracking needs recovery. Do not resend.")
                 if (
@@ -883,7 +901,7 @@ def register_tools(register, client, identity_handle, cfg):
                     try:
                         store = IMessageState(cfg, channel="whatsapp")
                         if quoted_current or attempt is not None:
-                            store.mark(meta, "running", chat_id=session.chat_id)
+                            persist_send_state()
                         store.record_outbound(sent, meta, session.chat_id)
                     except Exception:
                         logger.warning(
