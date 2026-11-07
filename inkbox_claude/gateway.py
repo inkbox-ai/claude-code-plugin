@@ -1969,8 +1969,6 @@ class InkboxGateway:
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
                 return web.Response(status=401, text="WhatsApp events require a valid signature")
-            if envelope.get("companion") is not None:
-                return web.Response(status=400, text="Unsupported WhatsApp event")
         if str(envelope.get("event_type") or "").startswith("slack."):
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
@@ -2009,6 +2007,11 @@ class InkboxGateway:
                 if str(envelope.get("event_type") or "").startswith("slack."):
                     from .slack_companion import normalize_envelope
                     envelope = await asyncio.to_thread(normalize_envelope, self._inkbox, self.cfg.identity, envelope)
+                if envelope.get("event_type") == "whatsapp.received":
+                    from .whatsapp import prepare_companion
+                    envelope = await prepare_companion(self, envelope)
+                    if envelope is None:
+                        return web.json_response({"ok": True, "ignored": "unsupported-whatsapp-group"})
                 result = self._companion_receiver().accept(envelope)
             except ValueError:
                 return web.Response(status=400, text="Invalid Companion event")

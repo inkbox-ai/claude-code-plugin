@@ -614,9 +614,13 @@ code points), and at most one owned attachment. The effective attachment limit
 is 5 MiB by default, with a 20 MiB hard ceiling; check `inkbox_get_whatsapp_status`
 for the current limits. Upload first and retain the returned media ID.
 Media URLs expire; retrieve fresh access by media ID.
-An unavailable attachment remains explicit context. WhatsApp supports direct messages only.
+An unavailable attachment remains explicit context. Existing WhatsApp groups use their
+conversation UUID, with group names displayed as labels—not recipient selectors.
+The agent must already be a member and another participant must have sent an
+inbound message before outbound group messages are allowed. Group creation and
+membership changes are not supported.
 `to` must be one E.164 string; arrays and comma-separated recipients are rejected.
-Use `conversation_id` for an existing direct conversation, or omit the destination
+Use `conversation_id` for an existing direct or group conversation, or omit the destination
 to use the active WhatsApp conversation. Explicit
 `reply_to_message_id` quotes a visible message in that conversation. Thread reads
 and named/custom reactions have dedicated tools. New ordinary replies and active-turn sends are plain chat messages. Quote selectively
@@ -632,9 +636,27 @@ journaled before sending. Preserve a logical-send key and media ID after an
 uncertain outcome; do not re-upload or send a new copy. Confirmed sending and
 unknown delivery are different facts. Delivery notifications update local
 correlation only: they do not wake the model or trigger automatic resend.
-Saved group routes and requests with recipient arrays or group selectors are not
-replayed. Inspect their original send receipt without resending or converting them
-to a direct message.
+Unverifiable saved routes and requests with recipient arrays or group-name selectors
+are not replayed or converted to direct messages. Inspect the original send receipt.
 
 WhatsApp quoted replies, threads, and reactions require Inkbox SDK 0.7.26
-or newer and matching server capabilities. CI installs the published SDK.
+or newer and matching server capabilities. Existing groups, native mentions and
+WhatsApp Companion require SDK 0.7.29 or a compatible source build. Older SDKs
+retain ordinary direct sends, but group-containing lists require the newer models;
+unsupported group deliveries are acknowledged without becoming direct messages.
+CI checks both the published SDK and the compatible source contract.
+
+Group sessions are isolated by conversation. The default `group_reply_mode=auto`
+lets Claude decide whether a response is useful or remain `[SILENT]`; `mention`
+requires a current native self-mention or the configured typed handle. Mentioning
+someone else does not wake the agent. Names are presentation only: verified mention
+numbers may resolve to contact names, the agent uses its configured handle, and
+unresolved mentions stay explicit. Raw source text is preserved. This rendering also
+applies to direct chats without adding a mention gate or importing mention-target notes.
+
+WhatsApp uses the existing Companion setting and `companion_response_mode`: `safe`
+allows directly admitted senders to trigger responses; `relaxed` also permits
+sponsored messages within their current group grant. Neither mode bypasses explicit
+blocks, current membership, sponsor authorization, or destination checks. History
+is context rather than instructions. Saved answers resume after transient preflight
+failures without rerunning Claude; unknown send outcomes remain unconfirmed and are never automatically resent.

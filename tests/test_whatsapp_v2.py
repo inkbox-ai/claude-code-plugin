@@ -39,6 +39,10 @@ def channel(monkeypatch, tmp_path):
         if path == "/api/v1/identities/agent":
             return httpx.Response(200, json={"id": IDENTITY, "organization_id": "org_example", "agent_handle": "agent", "created_at": NOW, "updated_at": NOW})
         assert request.url.params["agent_identity_id"] == IDENTITY
+        if request.method == "GET" and path.startswith("/api/v1/whatsapp/conversations/") and "/threads/" not in path:
+            return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1], "agent_identity_id": IDENTITY,
+                "local_number": "+15550000001", "remote_number": "+15550000002", "participants": ["+15550000002"],
+                "created_at": NOW, "updated_at": NOW})
         if path == "/api/v1/whatsapp/conversations":
             return httpx.Response(200, json=[])
         if path == "/api/v1/whatsapp/messages" and request.method == "POST":

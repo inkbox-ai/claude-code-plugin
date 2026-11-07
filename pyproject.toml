@@ -1,6 +1,6 @@
 [project]
 name = "claude-code-plugin"
-version = "0.2.16"
+version = "0.2.17"
 description = "Inkbox bridge for Claude Code — talk to your coding agent over email, Slack, SMS, iMessage, WhatsApp, and voice"
 requires-python = ">=3.11"
 dependencies = [
