@@ -34,7 +34,7 @@ def run_v2(identity: Any, operation: str, args: dict[str, Any], *, authorize: Ca
     """Call the bound SDK once, preserving explicit keys and actual receipt status."""
     method = getattr(identity, operation, None)
     if not callable(method):
-        raise RuntimeError("WhatsApp threads and reactions require Inkbox SDK 0.7.26 or newer")
+        raise RuntimeError("WhatsApp threads and reactions require Inkbox SDK 0.7.29 or newer")
     if operation in {"get_whatsapp_thread", "get_whatsapp_conversation_thread"}:
         limit = args.get("limit", 50)
         if type(limit) is not int or not 1 <= limit <= 200:
