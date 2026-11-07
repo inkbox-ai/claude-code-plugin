@@ -476,11 +476,15 @@ class ContactSession:
         if mode == "imessage" and self.cfg.imessage_threaded_replies:
             meta["imessage_threaded_replies"] = True
         raw_text = str(meta.get("raw_text", text))
+        mention_text = raw_text
+        if mode == "whatsapp" and not meta.get("reaction"):
+            from .whatsapp import control_text
+            raw_text = control_text(raw_text, meta, self.identity_info.get("handle") or self.cfg.identity)
         bot = meta.get("slack_bot_user_id") if mode == "slack" else None
         if bot and raw_text.lstrip().startswith(f"<@{bot}>"):
             raw_text = raw_text.lstrip()[len(bot) + 3:].strip()
         command = None if meta.get("reaction") else _control_command(raw_text)
-        is_group = mode in {"sms", "imessage", "slack"} and meta.get("conversation_kind") == "group"
+        is_group = mode in {"sms", "imessage", "slack", "whatsapp"} and meta.get("conversation_kind") == "group"
         pending_reply = self.pending is not None and not self.pending.future.done()
         if pending_reply and (mode == "whatsapp" or self.pending.route.get("channel") == "whatsapp"):
             pending_reply = mode == self.pending.route.get("channel") and all(
@@ -501,6 +505,9 @@ class ContactSession:
             await self._abort_in_flight(only_turns=[self.pending.owner or self._current_turn])
             pending_reply = False
         addressed = meta.get("slack_mentioned") if mode == "slack" else mentions_agent(raw_text, self.identity_info.get("handle") or self.cfg.identity)
+        if mode == "whatsapp":
+            from .whatsapp import mentioned
+            addressed = mentioned(mention_text, meta, self.identity_info.get("handle") or self.cfg.identity)
         quiet = (is_group and self.cfg.group_reply_mode == "mention" and not command
                  and not pending_reply and not addressed)
         if quiet:
@@ -662,6 +669,9 @@ class ContactSession:
             turn.text += "\n\n" + other.text
             for field in ("imessage_event_ids", "imessage_sources"):
                 meta[field] = list(meta.get(field, [])) + list(ometa.get(field, []))
+            if turn.mode == "whatsapp":
+                meta["whatsapp_mentioned"] = meta.get("whatsapp_mentioned") is True or ometa.get("whatsapp_mentioned") is True
+                meta["mentions"] = list(meta.get("mentions") or []) + list(ometa.get("mentions") or [])
             quiet_until = other.queued_at + .75
             if time.monotonic() >= deadline:
                 return turn
@@ -1344,7 +1354,8 @@ class ContactSession:
                 reply = ""
         if turn.checkpoint is not None:
             reply = "" if self._current_channel_tool_delivery or self._interrupting else reply
-            turn.checkpoint("generated", reply=reply, cancelled=self._interrupting)
+            turn.checkpoint("generated", reply=reply, cancelled=self._interrupting,
+                            **({"reply_meta": deepcopy(turn.reply_meta)} if turn.mode == "whatsapp" else {}))
             return reply
 
         # Route the result. Capture turns hand the text back to their waiter and

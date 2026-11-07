@@ -85,6 +85,11 @@ def setup(tmp_path, monkeypatch):
     identity = client.get_identity("agent")
     client.whatsapp._http = MagicMock()
     client.whatsapp._http.post.return_value = {"message": MESSAGE_WIRE}
+    client.whatsapp._http.get.return_value = {
+        "id": CONV, "agent_identity_id": OWNER, "local_number": "+15555550100",
+        "remote_number": "+15555550101", "participants": ["+15555550101"],
+        "created_at": TIME, "updated_at": TIME,
+    }
     gw = InkboxGateway(
         BridgeConfig(identity="agent", allow_all_users=True, require_signature=False)
     )

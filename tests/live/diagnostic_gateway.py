@@ -37,11 +37,12 @@ TOOLS = frozenset({
     "inkbox_lookup_contact",
     "inkbox_create_contact", "inkbox_update_contact", "inkbox_delete_contact",
     "inkbox_get_contact", "inkbox_list_contacts", "inkbox_send_email", "inkbox_send_sms",
-    "inkbox_send_imessage", "inkbox_start_call", "AskUserQuestion", "Bash", "Read",
+    "inkbox_send_imessage", "inkbox_start_call", "AskUserQuestion", "Bash", "Read", "ToolSearch",
     "inkbox_a2a_call", "inkbox_a2a_check", "inkbox_a2a_reply",
     "inkbox_a2a_complete", "inkbox_a2a_ask_caller", "inkbox_a2a_fail",
     "inkbox_list_a2a_tasks", "inkbox_list_a2a_messages",
 })
+A2A_TOOLS = frozenset({"inkbox_a2a_call", "inkbox_a2a_check", "inkbox_a2a_reply", "inkbox_a2a_complete", "inkbox_a2a_fail"})
 CONTACT_TOOLS = frozenset({
     "inkbox_lookup_contact", "inkbox_list_contacts", "inkbox_get_contact",
     "inkbox_create_contact", "inkbox_update_contact", "inkbox_delete_contact",
@@ -73,6 +74,10 @@ def safe_record(value):
         facts = value["contact_tools"]
         if set(facts) == CONTACT_TOOLS and all(type(v) is bool for v in facts.values()):
             result["contact_tools"] = {name: facts[name] for name in sorted(CONTACT_TOOLS)}
+    if result["phase"] == "native_tools" and type(value.get("a2a_tools")) is dict:
+        facts = value["a2a_tools"]
+        if set(facts) == A2A_TOOLS and all(type(v) is bool for v in facts.values()):
+            result["a2a_tools"] = {name: facts[name] for name in sorted(A2A_TOOLS)}
     return result
 
 
@@ -172,6 +177,8 @@ class Trace:
                 return
             self.emit("native_tools", "observed", facts={"contact_tools": {
                 name: name in tools or "mcp__inkbox__" + name in tools for name in CONTACT_TOOLS
+            }, "a2a_tools": {
+                name: name in tools or "mcp__inkbox__" + name in tools for name in A2A_TOOLS
             }})
         except Exception:
             pass

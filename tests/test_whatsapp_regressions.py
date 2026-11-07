@@ -105,6 +105,7 @@ def test_canonical_explicit_send_correlation(setup, monkeypatch, selector, uncer
     async def run():
         gw, session, client, registry, store = harness(setup)
         conversation = "abcdefab-cdef-4abc-8abc-abcdefabcdef"
+        client.whatsapp._http.get.return_value = {**client.whatsapp._http.get.return_value, "id": conversation}
         meta = route(conversation_id=conversation)
         args = {"text": "Answer", "idempotency_key": "original"}
         if selector == "uppercase":

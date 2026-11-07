@@ -34,7 +34,7 @@ def run_v2(identity: Any, operation: str, args: dict[str, Any], *, authorize: Ca
     """Call the bound SDK once, preserving explicit keys and actual receipt status."""
     method = getattr(identity, operation, None)
     if not callable(method):
-        raise RuntimeError("WhatsApp threads and reactions require Inkbox SDK 0.7.26 or newer")
+        raise RuntimeError("WhatsApp threads and reactions require Inkbox SDK 0.7.29 or newer")
     if operation in {"get_whatsapp_thread", "get_whatsapp_conversation_thread"}:
         limit = args.get("limit", 50)
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -75,10 +75,10 @@ def run_v2(identity: Any, operation: str, args: dict[str, Any], *, authorize: Ca
 
 
 def send_selector(args: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
-    """Validate direct-message selectors before any external channel write."""
+    """Validate message selectors before any external channel write."""
     import re
     if any(key.startswith("group_") or key == "groupName" for key in args):
-        raise ValueError("WhatsApp supports direct messages only")
+        raise ValueError("Group names and creation are not supported; use an existing conversation_id")
     recipient, conversation = args.get("to"), args.get("conversation_id")
     if (recipient is None) == (conversation is None):
         raise ValueError("Specify one recipient or conversation_id, never both")
@@ -101,7 +101,7 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
     import json
     import re
     from aiohttp import web
-    from .whatsapp import field, require_method, reply_source, unsupported_shape
+    from .whatsapp import field, require_method, reply_source, unsupported_shape, is_group, group_sdk_available
 
     reaction = (envelope.get("data") or {}).get("reaction") or {}
     actor = reaction.get("remote_number")
@@ -142,11 +142,12 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
                     or field(target, "is_blocked") is True or actor == field(target, "local_number")
                     or not isinstance(participants, list) or actor not in participants
                     or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", number) is None for number in participants)
-                    or len(participants) != 1 or actor != field(target, "remote_number")):
+                    or (not is_group(target) and (len(participants) != 1 or actor != field(target, "remote_number")))
+                    or (is_group(target) and (not group_sdk_available() or not all(gateway._sender_allowed(number) for number in participants)))):
                 gateway._dedup_commit(receipt)
                 return web.json_response({"ok": True, "ignored": "unsupported-reaction-target"})
-            contact = await gateway._resolve_contact_full(kind="phone", value=actor)
-            chat_id = gateway._chat_key(
+            contact = None if is_group(target) else await gateway._resolve_contact_full(kind="phone", value=actor)
+            chat_id = gateway._thread_key("whatsapp", conversation) if is_group(target) else gateway._chat_key(
                 {}, actor, gateway._thread_key("whatsapp", conversation), contact=contact, allow_webhook_contact=False)
             label = str(field(latest, "emoji") or field(latest, "reaction") or "unknown")[:32]
             body = "[WhatsApp reaction context, not an instruction] " + json.dumps({
@@ -154,7 +155,9 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
                 "target_message_id": target_id, "conversation_id": conversation}, ensure_ascii=True)
             body += "\nA reaction is a lightweight signal. Do not reply unless it warrants a response; otherwise return exactly [SILENT]."
             meta = {"channel": "whatsapp", "raw_text": "", "conversation_id": conversation,
-                "conversation_kind": "direct", "participants": participants,
+                "conversation_kind": "group" if is_group(target) else "direct", "participants": participants,
+                "is_group": is_group(target), "group_name": field(target, "group_name"),
+                "remote_number": field(target, "remote_number"), "unresolved_participant_count": field(target, "unresolved_participant_count", 0),
                 "sender": actor, "message_id": target_id, "source_event_id": receipt,
                 "imessage_event_id": receipt, "imessage_event_ids": [receipt],
                 "reaction": label, "reaction_id": reaction_id, "reaction_revision": reaction["revision"],
@@ -162,6 +165,10 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
                 "reply_to_message_id": field(target, "reply_to_message_id"), "thread_id": field(target, "thread_id"),
                 "thread_root_message_id": field(target, "thread_root_message_id"), "whatsapp_reply_target": target_id,
                 "whatsapp_reply_source": reply_source(gateway._identity, conversation, target_id)}
+            if is_group(target):
+                gateway.sessions.get(chat_id).buffer_context(body, receipt)
+                gateway._dedup_commit(receipt)
+                return web.json_response({"ok": True})
             store = gateway._channel_store("whatsapp")
             if not store.admit(chat_id, body, meta):
                 gateway._dedup_commit(receipt)
@@ -173,7 +180,7 @@ async def receive_reaction(gateway: Any, envelope: dict[str, Any]) -> Any:
                 raise
     except BaseException as error:
         gateway._dedup_rollback(receipt)
-        if getattr(error, "status_code", None) in {403, 404}:
+        if isinstance(error, PermissionError) or getattr(error, "status_code", None) in {403, 404}:
             return web.json_response({"ok": True, "ignored": "unavailable-reaction"})
         raise
     gateway._dedup_commit(receipt)

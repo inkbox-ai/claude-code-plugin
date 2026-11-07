@@ -457,3 +457,16 @@ def test_receive_diagnostics_preserve_native_task_events_without_payloads(tmp_pa
     assert len(messages) == 5 and all(message.data == SECRET for message in messages)
     assert [row['detail'] for row in records(path) if row['phase'] == 'message'] == [
         'task_started', 'background_tasks_changed', 'task_progress', 'task_notification', 'other']
+
+
+def test_a2a_tool_presence_is_boolean_only_and_search_is_named(tmp_path):
+    from claude_agent_sdk import SystemMessage
+    path = tmp_path / 'a2a-trace'
+    trace = diagnostics.Trace(path)
+    trace.observe_native_tools(SystemMessage(subtype='init', data={
+        'tools': ['mcp__inkbox__inkbox_a2a_call', SECRET]}))
+    trace.emit('tool', 'observed', tool='ToolSearch', facts={'arguments': SECRET})
+    rows = records(path)
+    assert rows[0]['a2a_tools'] == {name: name == 'inkbox_a2a_call' for name in diagnostics.A2A_TOOLS}
+    assert rows[1]['tool'] == 'ToolSearch'
+    assert SECRET not in path.read_text()

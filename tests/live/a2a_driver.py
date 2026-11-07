@@ -138,9 +138,11 @@ def _send_task(a2a: Any, target: Any, text: str) -> Any:
     return result.task
 
 
-def _find_inbound_task(identity: Any, token: str, timeout: float) -> Any:
+def _find_inbound_task(identity: Any, token: str, timeout: float, *, ensure_outer_open=None) -> Any:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if ensure_outer_open is not None:
+            ensure_outer_open()
         page = identity.a2a_tasks(direction="inbound", q=token, limit=10)
         for item in page.items:
             task = identity.a2a_task(item.id)
@@ -363,7 +365,8 @@ def _outbound_single(
     )
     inner = None
     try:
-        inner = _find_inbound_task(remote_identity, inner_token, timeout)
+        inner = _find_inbound_task(remote_identity, inner_token, timeout,
+                                   ensure_outer_open=lambda: _assert_outer_is_open(a2a, target, outer.id))
         _assert_outer_is_open(a2a, target, outer.id)
         remote_identity.a2a_reply(
             inner.id,
@@ -408,7 +411,8 @@ def _outbound_multi(
     )
     inner = None
     try:
-        inner = _find_inbound_task(remote_identity, inner_token, timeout)
+        inner = _find_inbound_task(remote_identity, inner_token, timeout,
+                                   ensure_outer_open=lambda: _assert_outer_is_open(a2a, target, outer.id))
         _assert_outer_is_open(a2a, target, outer.id)
         remote_identity.a2a_reply(
             inner.id,

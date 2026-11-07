@@ -36,7 +36,8 @@ def build_channel_tools(client, identity_handle, cfg):
                 safe = ("Vault is locked", "secret_id must be a UUID", "only login", "no TOTP",
                         "No vault key matched", "not been initialized", "timed out",
                         "The originating turn has ended", "originating conversation", "supplied Companion history",
-                        "WhatsApp requires Inkbox SDK 0.7.26 or newer")
+                        "WhatsApp requires Inkbox SDK 0.7.29 or newer",
+                        "WhatsApp groups require Inkbox SDK 0.7.29 or newer")
                 for marker in safe:
                     if marker.lower() in str(exc).lower():
                         message = marker

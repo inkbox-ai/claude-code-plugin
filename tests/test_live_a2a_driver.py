@@ -34,3 +34,13 @@ def test_foreground_scenario_retains_progress_and_completion_requirements(monkey
     assert 'run_in_background=false' in prompts[0] and 'timeout=180000' in prompts[0]
     assert prompts[0].count('65 seconds') == 2
     assert "Wait for the command's completed result before answering" in prompts[0]
+
+
+def test_outbound_wait_reports_stopped_outer_instead_of_remote_timeout():
+    from unittest.mock import Mock
+    identity = SimpleNamespace(a2a_tasks=Mock())
+    def stopped():
+        raise AssertionError('Outer A2A task stopped before delegation')
+    with pytest.raises(AssertionError, match='stopped before delegation'):
+        driver._find_inbound_task(identity, 'synthetic-token', 300, ensure_outer_open=stopped)
+    identity.a2a_tasks.assert_not_called()

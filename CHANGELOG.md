@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.2.16 (unreleased)
+## 0.2.17 (unreleased)
+
+- Support existing inbound-admitted WhatsApp groups, conversation-isolated context, native mentions and readable mention names in groups and direct chats.
+- Reuse native Claude session, permission and Companion checkpoints for group history, safe/relaxed attention, current grant validation and saved-answer recovery.
+- Preserve group media, explicit quotes and reactions with actual-destination checks and idempotent send recovery. No group creation.
+- Require published Inkbox SDK 0.7.29 or newer and verify its group contract.
+- Show inline-reply author, text and attachment metadata in direct and group context, including quiet Companion history. Keep unavailable parents explicit without blocking current messages, and preserve per-conversation arrival order.
+
+## 0.2.16
 
 - Reuse identity-scoped WhatsApp webhook receivers on restart without replacing mixed-channel subscriptions.
 

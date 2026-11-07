@@ -447,6 +447,9 @@ def build_inkbox_mcp_server(
         if session is None or not session.reply_meta.get("companion") or not session._turn_active:
             return _error("No active Companion conversation.")
         try:
+            if session.mode == "whatsapp":
+                native = next(tool for tool in channel_tools if tool.name == "inkbox_send_whatsapp")
+                return await native.handler({"conversation_id": session.reply_meta["conversation_id"], "text": str(args["text"])})
             await session.send_fn(
                 session.chat_id, str(args["text"]), session.mode, deepcopy(session.reply_meta),
             )
@@ -1301,7 +1304,8 @@ def build_inkbox_mcp_server(
         inkbox_a2a_fail,
     ]
     from .channel_tools import build_channel_tools
-    tools.extend(build_channel_tools(client, identity_handle, cfg))
+    channel_tools = build_channel_tools(client, identity_handle, cfg)
+    tools.extend(channel_tools)
     from . import __version__
 
     server = create_sdk_mcp_server(name="inkbox", version=__version__, tools=tools)
