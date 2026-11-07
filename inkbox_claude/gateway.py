@@ -1986,6 +1986,9 @@ class InkboxGateway:
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key,
                 ):
                     return web.Response(status=401, text="Companion events require a valid signature")
+                if str(envelope.get("event_type") or "").startswith("whatsapp."):
+                    from .whatsapp import record_status
+                    record_status(self, envelope)
                 try:
                     self._companion.record_delivery_failure(envelope, failure_scopes)
                 except RuntimeError:

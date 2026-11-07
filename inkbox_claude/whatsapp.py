@@ -167,14 +167,17 @@ async def with_media(gateway, message, text):
     refreshed = []
     for item in media:
         if item.get("status") == "unavailable":
-            text += "\n[WhatsApp attachment unavailable]"
+            text += f"\n[WhatsApp attachment {item.get('id', 'unknown')} unavailable]"
             continue
         try:
             fresh = await asyncio.to_thread(
                 require_method(identity, "get_whatsapp_media"), item["id"]
             )
-        except Exception:
-            text += "\n[WhatsApp attachment unavailable; do not guess its contents]"
+        except Exception as exc:
+            from .companion import retryable_read
+            if retryable_read(exc) or getattr(exc, "status_code", None) == 409:
+                raise
+            text += f"\n[WhatsApp attachment {item['id']} unavailable; do not guess its contents]"
             continue
         if field(fresh, "status") == "ready" and field(fresh, "url"):
             refreshed.append(
@@ -185,7 +188,7 @@ async def with_media(gateway, message, text):
                 }
             )
         else:
-            text += "\n[WhatsApp attachment unavailable]"
+            text += f"\n[WhatsApp attachment {item.get('id', 'unknown')} unavailable]"
     image_paths = []
     body = await gateway._with_media(
         text, refreshed, prefix=f"whatsapp-{message_id}"
@@ -207,7 +210,8 @@ async def prepare_companion(gateway, envelope, *, enrich=False):
             or str(message.get("agent_identity_id")) != str(gateway._identity.id)
             or not isinstance(participants, list)):
         raise PermissionError("Invalid WhatsApp Companion group source")
-    if (not group_sdk_available() or unsupported_shape(message) or not participants
+    if (message.get("sender_access") not in {"direct", "sponsored"}
+            or not group_sdk_available() or unsupported_shape(message) or not participants
             or any(not isinstance(number, str) or re.fullmatch(r"\+[1-9][0-9]{6,14}", number) is None for number in participants)
             or sender not in participants or sender == message.get("local_number")):
         return None  # Current local admission can change without invalidating the signed event.
@@ -258,24 +262,36 @@ def authorize_companion(client, cfg, meta):
     return True
 
 
+class GroupRouteRejected(PermissionError):
+    """This receipt is not currently permitted; later ordinary receipts may be."""
+
+
 def validate_group_destination(identity, conversation, cfg, *, client=None, route=None):
     """Check the actual destination, including explicit outreach from another chat."""
     sponsored = bool(route and route.get("companion") and route.get("companion_activation_id")
                      and route.get("conversation_id") == conversation)
     if sponsored:
         authorize_companion(client, cfg, route)
-    current = require_group_metadata(require_method(identity, "get_whatsapp_conversation")(conversation))
+    try:
+        current = require_group_metadata(require_method(identity, "get_whatsapp_conversation")(conversation))
+    except Exception as exc:
+        if route and route.get("companion") and not route.get("companion_activation_id") and getattr(exc, "status_code", None) in {403, 404}:
+            raise GroupRouteRejected("WhatsApp conversation is not currently permitted") from None
+        raise
     if not is_group(current):
         if sponsored:
             raise PermissionError("WhatsApp Companion requires its admitted group")
         return
+    if field(current, "unresolved_participant_count") or not field(current, "participants"):
+        from .imessage import SafeReplyPreflightError
+        raise SafeReplyPreflightError("WhatsApp group membership proof is temporarily unavailable")
     allowed = {user.lower() for user in cfg.allowed_users}
     if (unsupported_shape(current) or str(field(current, "id")) != conversation
             or str(field(current, "agent_identity_id")) != str(identity.id)
             or not field(current, "participants")
             or (not sponsored and not cfg.allow_all_users and allowed
                 and any(number.lower() not in allowed for number in field(current, "participants")))):
-        raise PermissionError("WhatsApp conversation participants are not allowed")
+        raise GroupRouteRejected("WhatsApp conversation participants are not allowed")
 
 
 
@@ -436,7 +452,7 @@ def auto_reply_kwargs(identity, meta):
     if (str(field(message, "id")) != target
             or str(field(message, "conversation_id")) != source["conversation_id"]
             or str(field(message, "agent_identity_id")) != source["identity_id"]
-            or (field(message, "is_blocked") is True and not (meta.get("companion_activation_id") and is_group(message)))
+            or (field(message, "is_blocked") is True and not (meta.get("companion_activation_id") and is_group(message) and field(message, "sender_access") == "sponsored"))
             or unsupported_shape(require_group_metadata(message))):
         raise ReplyPreflightRejected("WhatsApp reply source ownership cannot be verified")
     return {} if source.get("reply_style") == "plain" else {"reply_to_message_id": target}
@@ -599,8 +615,10 @@ async def send_reply(gateway, chat_id, content, meta):
     key_parts = [gateway.cfg.base_url, str(identity.id), conversation, source, text]
     if quote:
         key_parts.append(quote)
-    if not meta.get("final_reply") and not meta.get("companion"):
-        key_parts.append(meta.get("whatsapp_interaction_id") or uuid.uuid4().hex)
+    if meta.get("whatsapp_interaction_id"):
+        key_parts.append(meta["whatsapp_interaction_id"])
+    elif not meta.get("final_reply") and not meta.get("companion"):
+        key_parts.append(uuid.uuid4().hex)
     key = (
         "claude-wa-"
         + hashlib.sha256(

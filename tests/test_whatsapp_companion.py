@@ -228,3 +228,208 @@ def test_current_grant_revocation_prevents_host_submission(harness):
         finally:
             await close(gw)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('kind,answer,prior_send', [('permission', 'yes', False), ('poll', '1', False), ('permission', 'yes', True)])
+def test_native_companion_interaction_sends_prompt_and_accepts_self_mention(harness, monkeypatch, kind, answer, prior_send):
+    async def run():
+        env, pages = source_event(agent_mentioned=True)
+        gw, _ = build(harness, pages, allow_all_users=True, group_reply_mode='mention')
+        prompts, replies = asyncio.Event(), []
+        from inkbox_claude import tools as tools_mod
+        monkeypatch.setattr(tools_mod, 'create_sdk_mcp_server', lambda **kwargs: kwargs)
+        server, _ = tools_mod.build_inkbox_mcp_server(gw._inkbox, 'agent', gw.cfg)
+        native = next(tool for tool in server['tools'] if tool.name == 'inkbox_reply_companion')
+        async def receive(client):
+            if len(harness.queries) != 1:
+                return
+            session = next(iter(gw.sessions.sessions.values()))
+            if prior_send:
+                token = tools_mod.CURRENT_SESSION.set(session)
+                try:
+                    result = await native.handler({'text':'Progress before permission'})
+                    assert 'error' not in result['content'][0]['text']
+                finally:
+                    tools_mod.CURRENT_SESSION.reset(token)
+            task = asyncio.create_task(session._escalate(kind, 'Approve this action?'))
+            for _ in range(100):
+                if len(harness.outputs) >= 1 + int(prior_send) or task.done():
+                    break
+                await asyncio.sleep(.01)
+            prompts.set()
+            replies.append(await task)
+        harness.hooks.receive = receive
+        try:
+            await gw._handle_webhook(Request(env))
+            await asyncio.wait_for(prompts.wait(), 5)
+            assert len(harness.outputs) == 1 + int(prior_send)
+            assert harness.outputs[-1][1]['conversation_id'] == uid(3)
+            reply, _ = source_event(13, content='@123 ' + answer, agent_mentioned=True,
+                mentions=[{'text':'@123','phone_number':None,'is_agent':True}])
+            reply['companion'].update(phase='live', sequence=2)
+            await gw._handle_webhook(Request(reply))
+            await asyncio.gather(*list(gw._companion.approval_jobs))
+            await asyncio.wait_for(drained(gw), 5)
+            assert replies == [answer]
+        finally:
+            await close(gw)
+    asyncio.run(run())
+
+
+def test_unresolved_current_roster_retains_source_until_proof_recovers(harness):
+    async def run():
+        env, pages = source_event()
+        gw, _ = build(harness, pages, allow_all_users=True)
+        receiver = gw._companion_receiver()
+        receiver.schedule = lambda key: None
+        lookup = gw._identity.get_whatsapp_conversation
+        def unresolved(conversation):
+            result = lookup(conversation)
+            result.unresolved_participant_count = 1
+            return result
+        gw._identity.get_whatsapp_conversation = unresolved
+        try:
+            receiver.accept(env)
+            key = next(iter(receiver.records))
+            assert await receiver.drain_once(key)
+            assert receiver.records[key]['events'][uid(12)]['state'] == 'pending'
+            assert not receiver.records[key].get('revoked') and not harness.queries
+            gw._identity.get_whatsapp_conversation = lookup
+            await receiver.drain_once(key)
+            assert len(harness.queries) == 1
+        finally:
+            await close(gw)
+    asyncio.run(run())
+
+
+def test_ordinary_roster_denial_does_not_poison_later_receipts(harness):
+    async def run():
+        env, pages = source_event()
+        env['companion'].update(phase='ordinary')
+        env['companion'].pop('activation_id')
+        gw, _ = build(harness, pages, allowed_users=['+15555550101'])
+        receiver = gw._companion_receiver()
+        receiver.schedule = lambda key: None
+        try:
+            receiver.accept(env)
+            key = next(iter(receiver.records))
+            await receiver.drain_once(key)
+            assert receiver.records[key]['events'][uid(12)]['state'] == 'discarded'
+            assert not receiver.records[key].get('revoked')
+            gw.cfg.allowed_users.append('+15555550102')
+            later = deepcopy(env)
+            later['data']['message']['id'] = uid(13)
+            later['companion']['sequence'] = 2
+            receiver.accept(later)
+            await receiver.drain_once(key)
+            assert len(harness.queries) == 1
+        finally:
+            await close(gw)
+    asyncio.run(run())
+
+
+def test_revoked_receipt_still_deduplicates_signed_ordinary_downgrade(harness):
+    async def run():
+        env, pages = source_event()
+        gw, _ = build(harness, pages, allow_all_users=True)
+        receiver = gw._companion_receiver()
+        receiver.schedule = lambda key: None
+        try:
+            receiver.accept(env)
+            key = next(iter(receiver.records))
+            receiver.discard_context(key)
+            receiver.save(key)
+            ordinary = deepcopy(env)
+            ordinary['companion'].update(phase='ordinary')
+            ordinary['companion'].pop('activation_id')
+            assert receiver.accept(ordinary)['deduped']
+            ordinary['data']['message']['content'] = 'changed source'
+            with pytest.raises(ValueError, match='authority'):
+                receiver.accept(ordinary)
+            assert not harness.queries
+        finally:
+            await close(gw)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('access,expected', [('sponsored',1), ('direct',0), (None,0), ('unknown',0)])
+def test_retained_receipt_denial_only_waived_for_current_sponsored_source(harness, access, expected):
+    async def run():
+        env, pages = source_event(sender_access=access, is_blocked=True)
+        gw, _ = build(harness, pages, allow_all_users=True, companion_response_mode='relaxed')
+        gw._identity.get_whatsapp_message = lambda _: NS(**env['data']['message'])
+        harness.hooks.reply = 'Scoped group response'
+        try:
+            await gw._handle_webhook(Request(env))
+            await drained(gw)
+            assert len(harness.outputs) == expected
+            if expected:
+                assert '[SILENT]' in harness.queries[0]
+        finally:
+            await close(gw)
+    asyncio.run(run())
+
+
+def test_generic_companion_reply_uses_native_uncertain_send_fence(harness, monkeypatch):
+    from inkbox_claude import tools as tools_mod
+    async def run():
+        env, pages = source_event()
+        gw, _ = build(harness, pages, allow_all_users=True)
+        monkeypatch.setattr(tools_mod, 'create_sdk_mcp_server', lambda **kwargs: kwargs)
+        server, _ = tools_mod.build_inkbox_mcp_server(gw._inkbox, 'agent', gw.cfg)
+        tool = next(tool for tool in server['tools'] if tool.name == 'inkbox_reply_companion')
+        writes, results = [], []
+        def send(**kwargs):
+            writes.append(kwargs)
+            raise __import__('httpx').ReadTimeout('Unknown POST outcome')
+        gw._identity.send_whatsapp = send
+        harness.hooks.reply = 'Do not send this replacement'
+        async def receive(client):
+            session = next(iter(gw.sessions.sessions.values()))
+            token = tools_mod.CURRENT_SESSION.set(session)
+            try:
+                results.append(await tool.handler({'text':'Explicit group response'}))
+            finally:
+                tools_mod.CURRENT_SESSION.reset(token)
+        harness.hooks.receive = receive
+        try:
+            await gw._handle_webhook(Request(env))
+            rows = await drained(gw)
+            assert len(harness.queries) == 1 and len(writes) == 1
+            assert writes[0]['text'] == 'Explicit group response', (writes, results, rows)
+            assert 'idempotency_key' in results[0]['content'][0]['text']
+            assert rows[0]['events'][uid(12)]['reply_meta']['whatsapp_plain_send']['outcome'] == 'uncertain'
+            await gw._companion.close()
+            gw._companion = type(gw._companion)(gw)
+            restored = next(iter(gw._companion.records.values()))
+            assert restored['events'][uid(12)]['reply_meta']['whatsapp_plain_send']['key'] == writes[0]['idempotency_key']
+            await gw._companion.drain_once(next(iter(gw._companion.records)))
+            assert len(writes) == 1 and len(harness.queries) == 1
+        finally:
+            await close(gw)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('quarantined', [False, True])
+def test_companion_delivery_failure_also_updates_native_receipt(harness, quarantined):
+    async def run():
+        env, pages = source_event()
+        gw, _ = build(harness, pages, allow_all_users=True)
+        receiver = gw._companion_receiver()
+        receiver.schedule = lambda key: None
+        try:
+            receiver.accept(env)
+            if quarantined:
+                receiver.quarantined.add('corrupt-receipt')
+                receiver.quarantined_routes['corrupt-receipt'] = None
+            failure = {'event_type':'whatsapp.delivery_failed', 'data':{'message':{
+                **env['data']['message'], 'id':uid(90), 'direction':'outbound', 'status':'failed',
+                'delivery_state':'failed', 'updated_at':'2026-01-01T01:00:00Z'}}}
+            assert (await gw._handle_webhook(Request(failure))).status == (503 if quarantined else 200)
+            assert gw._channel_store('whatsapp').lookup_outbound(uid(90))['status'] == 'failed'
+            if not quarantined:
+                assert next(iter(receiver.records.values()))['last_delivery_failure']['message_id'] == uid(90)
+            assert not harness.queries and not harness.outputs
+        finally:
+            await close(gw)
+    asyncio.run(run())

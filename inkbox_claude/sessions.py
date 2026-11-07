@@ -1354,7 +1354,8 @@ class ContactSession:
                 reply = ""
         if turn.checkpoint is not None:
             reply = "" if self._current_channel_tool_delivery or self._interrupting else reply
-            turn.checkpoint("generated", reply=reply, cancelled=self._interrupting)
+            turn.checkpoint("generated", reply=reply, cancelled=self._interrupting,
+                            **({"reply_meta": deepcopy(turn.reply_meta)} if turn.mode == "whatsapp" else {}))
             return reply
 
         # Route the result. Capture turns hand the text back to their waiter and

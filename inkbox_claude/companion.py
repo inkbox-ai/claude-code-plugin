@@ -84,6 +84,13 @@ def require_uuid(value: Any) -> None:
         raise ValueError("Invalid Companion identifier")
 
 
+def ordinary_authority(scope: dict, message: dict, sender: str) -> str:
+    normalized = {**scope, "phase": "ordinary"}
+    normalized.pop("activation_id", None)
+    normalized.pop("reply_context", None)
+    return authority(normalized, message, sender)
+
+
 def authority(scope: dict, message: dict, sender: str) -> str:
     """Fingerprint immutable routing without retaining message content."""
     source_fields = SOURCE_FIELDS if scope.get("channel") != "whatsapp" else (
@@ -401,10 +408,8 @@ class CompanionReceiver:
                         for k in ("scope_id", "conversation_id", "channel"))):
                     previous = old["events"].get(message["id"])
                     if previous and previous["scope"]["sequence"] == scope["sequence"]:
-                        compare_scope = {**previous["scope"], "phase": "ordinary"}
-                        compare_scope.pop("activation_id", None)
-                        compare_scope.pop("reply_context", None)
-                        if authority(compare_scope, previous["message"], previous["sender"]) != authority(scope, message, sender):
+                        original = previous.get("ordinary_authority") or ordinary_authority(previous["scope"], previous["message"], previous["sender"])
+                        if original != authority(scope, message, sender):
                             raise ValueError("Companion source authority changed")
                         if previous["state"] == "pending" and not previous.get("submitted_meta"):
                             previous["state"] = "discarded"
@@ -445,6 +450,7 @@ class CompanionReceiver:
                 "state": "pending",
                 "submission_id": f"companion:{key}:{event_id}",
                 "authority": fingerprint,
+                **({"ordinary_authority": ordinary_authority(scope, message, sender)} if scope["channel"] == "whatsapp" else {}),
             }
             if record.get("revoked"):
                 self.discard_context(key)
@@ -590,11 +596,16 @@ class CompanionReceiver:
     async def authorize_reply(self, chat_id: str, mode: str, meta: dict) -> None:
         """Validate the saved signed turn route without another network lookup."""
         key = chat_id.removeprefix("companion:")
+        # Native prompts and tools add journal state without changing the bound route.
+        local_send_state = ({"whatsapp_interaction_id", "whatsapp_send_key", "whatsapp_recipient_sends",
+            "whatsapp_plain_send", "whatsapp_quote_intent", "whatsapp_quote_accepted",
+            "whatsapp_explicit_quote_attempted", "whatsapp_explicit_quote_key"} if mode == "whatsapp" else set())
         record = self.records.get(key)
         if (self._closing or self._closed or record is None
                 or record["state"] in {"failed", "paused"}
                 or mode != MODES[record["scope"]["channel"]]
-                or self.active_replies.get(chat_id) != meta):
+                or ({k: v for k, v in (self.active_replies.get(chat_id) or {}).items() if k not in local_send_state}
+                    != {k: v for k, v in meta.items() if k not in local_send_state})):
             raise PermissionError("No authorized Companion reply target")
         sender = record.get("sponsor") or meta.get("sender", "")
         if not self.author_allowed(record, sender):
@@ -702,6 +713,8 @@ class CompanionReceiver:
             f"Reply context: {json.dumps(meta['reply_context'])}\n"
             f"Notices: {json.dumps(notices)}\n\n{text}"
         )
+        if meta.get("channel") == "whatsapp":
+            prompt += "\nReply only when addressed or a useful response is expected; for ordinary chatter return exactly [SILENT]."
         if len(prompt.encode()) > self.gateway.cfg.companion_max_bytes:
             raise ValueError("Companion initialization exceeds the configured input byte limit")
         return prompt
@@ -798,7 +811,7 @@ class CompanionReceiver:
         session.companion_approver = event["sender"]
         await session.notify_activity(MODES[record["scope"]["channel"]], meta, "accepted")
 
-        def checkpoint(state: str, **result: str) -> None:
+        def checkpoint(state: str, **result: Any) -> None:
             if self._closing or self._closed:
                 if state == "submitting":
                     raise asyncio.CancelledError
@@ -814,7 +827,7 @@ class CompanionReceiver:
             if session.resume_session_id:
                 record["host_session_id"] = session.resume_session_id
             if state == "generated":
-                event.update(reply=result["reply"], reply_meta=deepcopy(meta), cancelled=bool(result.get("cancelled")), host_terminal=True)
+                event.update(reply=result["reply"], reply_meta=deepcopy(result.get("reply_meta", meta)), cancelled=bool(result.get("cancelled")), host_terminal=True)
                 record["context"] = []
                 record.pop("retry_count", None)
             self.save(key)
@@ -979,6 +992,11 @@ class CompanionReceiver:
             uncertain = any(event["state"] in {"submitting", "submitted", "sending"} for event in record["events"].values())
             retry = False
             whatsapp_read_conflict = record["scope"]["channel"] == "whatsapp" and getattr(exc, "status_code", None) == 409
+            from .whatsapp import GroupRouteRejected
+            if isinstance(exc, GroupRouteRejected) and record["scope"]["phase"] == "ordinary":
+                event["state"] = "discarded"
+                self.save(key)
+                return True
             if record.get("revoked") or isinstance(exc, PermissionError) or (getattr(exc, "status_code", None) in REVOKED_STATUSES and not whatsapp_read_conflict):
                 self.discard_context(key)
             elif uncertain:

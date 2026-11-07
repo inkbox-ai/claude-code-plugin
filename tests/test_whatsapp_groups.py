@@ -277,3 +277,22 @@ def test_mention_lookup_failure_does_not_log_number_or_remote_error(setup, caplo
     assert '+15555550109' not in caplog.text
     assert 'private remote detail' not in caplog.text
     assert 'contact lookup unavailable' in caplog.text
+
+
+@pytest.mark.parametrize('status', [503, 409])
+def test_transient_attachment_read_does_not_admit_or_lose_source(setup, monkeypatch, status):
+    from inkbox import InkboxAPIError
+    from tests.test_whatsapp import MEDIA
+    gw, session, _ = setup
+    monkeypatch.setattr(whatsapp, 'group_sdk_available', lambda: True)
+    reader = MagicMock(side_effect=InkboxAPIError(status, {'error':'temporarily_unavailable'}))
+    monkeypatch.setattr(gw._identity, 'get_whatsapp_media', reader)
+    message = group(media=[{'id':MEDIA, 'status':'ready'}])
+    with pytest.raises(InkboxAPIError):
+        asyncio.run(whatsapp.receive(gw, envelope(message)))
+    session.handle_inbound.assert_not_called()
+    reader.side_effect = None
+    reader.return_value = NS(status='ready', url='https://example.test/image.png', content_type='image/png', size=3)
+    assert asyncio.run(whatsapp.receive(gw, envelope(message))).status == 200
+    session.handle_inbound.assert_called_once()
+    assert gw._with_media.call_args.args[1][0]['url'] == 'https://example.test/image.png'
