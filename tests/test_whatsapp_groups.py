@@ -255,3 +255,25 @@ def test_group_reaction_is_quiet_context_not_a_new_command(setup, monkeypatch):
     session.buffer_context.assert_called_once()
     assert '/stop' not in session.buffer_context.call_args.args[0]
     gw._resolve_contact_full.assert_not_called()
+
+
+def test_mcp_wrapper_keeps_actionable_group_sdk_requirement(setup, monkeypatch):
+    from inkbox_claude.channel_tools import build_channel_tools
+    gw, _, client = setup
+    monkeypatch.setattr(whatsapp, 'group_sdk_available', lambda: False)
+    monkeypatch.setattr(client, 'get_identity', lambda _: gw._identity)
+    monkeypatch.setattr(gw._identity, 'get_whatsapp_conversation', lambda **kwargs: NS(**{**group(), 'id': CONV}))
+    tool = next(tool for tool in build_channel_tools(client, 'agent', gw.cfg) if tool.name == 'inkbox_get_whatsapp_conversation')
+    result = asyncio.run(tool.handler({'conversation_id': CONV}))
+    assert 'WhatsApp groups require Inkbox SDK 0.7.29 or newer' in result['content'][0]['text']
+
+
+def test_mention_lookup_failure_does_not_log_number_or_remote_error(setup, caplog):
+    from inkbox_claude.gateway import InkboxGateway
+    gw, _, client = setup
+    client.contacts.lookup = MagicMock(side_effect=RuntimeError('private remote detail'))
+    caplog.set_level('DEBUG', logger='inkbox_claude.gateway')
+    assert asyncio.run(InkboxGateway._resolve_contact_full(gw, kind='phone', value='+15555550109')) is None
+    assert '+15555550109' not in caplog.text
+    assert 'private remote detail' not in caplog.text
+    assert 'contact lookup unavailable' in caplog.text
