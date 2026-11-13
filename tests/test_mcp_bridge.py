@@ -153,3 +153,52 @@ def test_catalog_publication_preserves_previous_generation_on_collision(
         assert owner.remote is None
 
     asyncio.run(run())
+
+
+def test_native_bridge_validates_full_remote_schema(tmp_path, monkeypatch):
+    from inkbox.remote_mcp import RemoteMcp
+
+    async def run():
+        owner = bridge(tmp_path, monkeypatch)
+        remote = RemoteMcp(
+            api_key="synthetic",
+            base_url="https://example.test",
+            identity="identity",
+            journal_path=tmp_path / "schema.sqlite",
+        )
+        remote._catalog = (
+            {
+                "name": "remote_example",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string", "minLength": 2}},
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+            },
+        )
+
+        async def unexpected(*args, **kwargs):
+            pytest.fail("Invalid arguments must not reach the transport")
+
+        remote.request = unexpected
+        owner.remote = remote
+        owner.remote_names = {"remote_example"}
+        owner.bind(
+            {
+                "session_id": "session",
+                "prompt_id": "prompt",
+                "tool_name": "mcp__inkbox__remote_example",
+            },
+            "toolu_invalid",
+        )
+        with pytest.raises(RemoteToolError, match="remote schema"):
+            await owner.call(
+                {
+                    "name": "remote_example",
+                    "arguments": {"text": "x"},
+                    "_meta": {"claudecode/toolUseId": "toolu_invalid"},
+                }
+            )
+
+    asyncio.run(run())
