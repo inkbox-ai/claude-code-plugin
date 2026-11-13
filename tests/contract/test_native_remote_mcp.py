@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
+import httpx
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -107,6 +108,7 @@ def test_native_http_preserves_call_identity_and_approval(
                     "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{model.server_port}",
                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                     "DISABLE_AUTOUPDATER": "1",
+                    "ENABLE_TOOL_SEARCH": "false",
                 },
             )
         )
@@ -133,7 +135,20 @@ def test_native_http_preserves_call_identity_and_approval(
                         "inputSchema": {"type": "object"},
                     }
                 ]
+                owner.remote_names = {"changed"}
                 await client.reconnect_mcp_server("inkbox")
+                status = await client.get_mcp_status()
+                assert status["mcpServers"][0]["status"] == "connected"
+                assert [tool["name"] for tool in status["mcpServers"][0]["tools"]] == ["changed"]
+                async with httpx.AsyncClient() as transport:
+                    response = await transport.post(config["url"], headers=config["headers"], json={
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "example", "arguments": {"value": "synthetic"},
+                                   "_meta": {"claudecode/toolUseId": "toolu_wait"}},
+                    })
+                result = response.json()
+                assert "error" in result or result.get("result", {}).get("isError") is True
+                assert len(calls) == 1
                 await client.query(
                     "Inspect the changed catalog without executing anything."
                 )
@@ -142,19 +157,20 @@ def test_native_http_preserves_call_identity_and_approval(
                         assert not msg.is_error
                         break
                 tools = {tool["name"]: tool for tool in Model.captured_tools[-1]}
-                assert "mcp__inkbox__example" not in tools
+                # Prior tool definitions can remain in the conversation history.
                 assert tools["mcp__inkbox__changed"]["description"] == "Changed example"
                 descriptors.clear()
+                owner.remote_names = set()
                 await client.reconnect_mcp_server("inkbox")
+                status = await client.get_mcp_status()
+                assert status["mcpServers"][0]["status"] == "connected"
+                assert status["mcpServers"][0]["tools"] == []
                 await client.query("Inspect the empty remote catalog.")
                 async for msg in client.receive_response():
                     if isinstance(msg, ResultMessage):
                         assert not msg.is_error
                         break
-                assert not any(
-                    tool["name"].startswith("mcp__inkbox__")
-                    for tool in Model.captured_tools[-1]
-                )
+                assert len(calls) == 1
         finally:
             await client.disconnect()
             await owner.close()

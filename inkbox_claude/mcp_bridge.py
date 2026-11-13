@@ -99,13 +99,25 @@ class McpBridge:
             await self.refresh()
         return self.tools
 
+    async def local_request(self, request):
+        lookup = getattr(self.local, "get_request_handler", None)
+        if lookup is not None:
+            entry = lookup(request.method)
+            if entry is None:
+                raise RemoteToolError("The local tool method is unavailable")
+            params = request.params.model_dump(by_alias=True) if request.params else {}
+            # SDK-created local handlers do not use an MCP connection context.
+            return await entry.handler(None, entry.params_type.model_validate(params))
+        result = await self.local.request_handlers[type(request)](request)
+        return result.root
+
     async def refresh(self):
-        result = await self.local.request_handlers[ListToolsRequest](
+        result = await self.local_request(
             ListToolsRequest(method="tools/list")
         )
         local = [
             tool.model_dump(mode="json", by_alias=True, exclude_none=True)
-            for tool in result.root.tools
+            for tool in result.tools
         ]
         try:
             account = await asyncio.wait_for(asyncio.to_thread(self.client.whoami), 5)
@@ -218,13 +230,13 @@ class McpBridge:
         session_token = CURRENT_SESSION.set(self.session)
         a2a_token = A2A_TURN_CONTEXT.set(getattr(turn, "a2a_context", None))
         try:
-            result = await self.local.request_handlers[CallToolRequest](
+            result = await self.local_request(
                 CallToolRequest(
                     method="tools/call",
                     params=CallToolRequestParams(name=name, arguments=arguments),
                 )
             )
-            return result.root.model_dump(mode="json", by_alias=True, exclude_none=True)
+            return result.model_dump(mode="json", by_alias=True, exclude_none=True)
         finally:
             A2A_TURN_CONTEXT.reset(a2a_token)
             CURRENT_SESSION.reset(session_token)
