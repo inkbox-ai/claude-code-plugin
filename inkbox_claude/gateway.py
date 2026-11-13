@@ -26,7 +26,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import threading
 import time
 import uuid
@@ -951,13 +950,12 @@ class InkboxGateway:
         # mute those before the runtime starts so real errors stand out.
         _install_tunnel_log_filter()
         state_dir = _tunnel_state_dir()
-        # Wipe SDK tunnel state so a stale tunnel_id can't wedge reconnects.
-        shutil.rmtree(state_dir, ignore_errors=True)
-        state_dir.mkdir(parents=True, exist_ok=True)
 
         name = self.cfg.tunnel_name or self.cfg.identity
-        self._tunnel = await asyncio.to_thread(
-            inkbox_tunnel_connect,
+        from .tunnel_bootstrap import connect_tunnel
+
+        self._tunnel = await connect_tunnel(
+            self, inkbox_tunnel_connect,
             self._inkbox,
             name=name,
             forward_to=f"http://127.0.0.1:{self.cfg.port}",

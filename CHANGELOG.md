@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.18
+
+- Reuse valid tunnel certificates across reconnects and renew mismatched or expired state with Inkbox SDK 0.7.38 or newer.
+- Bound tunnel startup and reconcile cancelled attempts before reconnecting, including late listener cleanup.
+
 ## 0.2.17 (unreleased)
 
 - Support existing inbound-admitted WhatsApp groups, conversation-isolated context, native mentions and readable mention names in groups and direct chats.

@@ -1,13 +1,13 @@
 [project]
 name = "claude-code-plugin"
-version = "0.2.17"
+version = "0.2.18"
 description = "Inkbox bridge for Claude Code — talk to your coding agent over email, Slack, SMS, iMessage, WhatsApp, and voice"
 requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9",
   "psutil>=5.9,<8",
   "audioop-lts>=0.2.1; python_version >= '3.13'",
-  "inkbox>=0.7.29,<1.0.0",
+  "inkbox>=0.7.38,<1.0.0",
   "claude-agent-sdk>=0.1.0",
   "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]
@@ -25,3 +25,6 @@ inkbox_claude = ["assets/*.png"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.uv.sources]
+inkbox = { git = "https://github.com/inkbox-ai/inkbox.git", rev = "c35cb8334412e63fb329470acccf264429d337ca", subdirectory = "sdk/python" }

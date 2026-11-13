@@ -71,7 +71,7 @@ jobs:
         run: |
           tests/ci/retry_install.sh uv pip install --system \
             \
-            -e . "inkbox>=0.7.29,<1.0.0" pytest
+            -e . "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@c35cb8334412e63fb329470acccf264429d337ca#subdirectory=sdk/python" pytest
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
