@@ -423,7 +423,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'", specifier = ">=0.2.1" },
     { name = "claude-agent-sdk", specifier = ">=0.1.0" },
-    { name = "inkbox", git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=c35cb8334412e63fb329470acccf264429d337ca" },
+    { name = "inkbox", git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=64bbc6d76c03dd970a14004777f7c6505226d101" },
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "segno", specifier = ">=1.5" },
 ]
@@ -699,7 +699,7 @@ wheels = [
 [[package]]
 name = "inkbox"
 version = "0.7.38"
-source = { git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=c35cb8334412e63fb329470acccf264429d337ca#c35cb8334412e63fb329470acccf264429d337ca" }
+source = { git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=64bbc6d76c03dd970a14004777f7c6505226d101#64bbc6d76c03dd970a14004777f7c6505226d101" }
 dependencies = [
     { name = "argon2-cffi" },
     { name = "certifi" },
@@ -707,6 +707,7 @@ dependencies = [
     { name = "h11" },
     { name = "h2" },
     { name = "httpx" },
+    { name = "jsonschema" },
 ]
 
 [[package]]

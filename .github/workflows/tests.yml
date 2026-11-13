@@ -29,7 +29,7 @@ jobs:
           version: "latest"
 
       - name: Install test deps
-        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "psutil>=5.9,<8" "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@c35cb8334412e63fb329470acccf264429d337ca#subdirectory=sdk/python"
+        run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "psutil>=5.9,<8" "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
 
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.
@@ -61,7 +61,7 @@ jobs:
       - name: Install bridge + latest SDK
         run: |
           tests/ci/retry_install.sh uv pip install --system \
-            -e . "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@c35cb8334412e63fb329470acccf264429d337ca#subdirectory=sdk/python" pytest
+            -e . "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python" pytest
           tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 
       - name: Install latest Claude Code CLI
@@ -109,8 +109,8 @@ jobs:
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code
       - name: Install compatible public SDK contract
         run: |
-          tests/ci/retry_install.sh uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@c35cb8334412e63fb329470acccf264429d337ca#subdirectory=sdk/python"
-          tests/ci/retry_install.sh uv pip install --system --reinstall-package inkbox "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@c35cb8334412e63fb329470acccf264429d337ca#subdirectory=sdk/python"
+          tests/ci/retry_install.sh uv pip install --system -e . pytest httpx "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
+          tests/ci/retry_install.sh uv pip install --system --reinstall-package inkbox "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@64bbc6d76c03dd970a14004777f7c6505226d101#subdirectory=sdk/python"
       - name: Full offline suite with group-capable SDK
         run: pytest -q --ignore=tests/contract --ignore=tests/live
       - name: Native host contracts with compatible SDK

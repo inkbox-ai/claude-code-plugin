@@ -667,3 +667,5 @@ sponsored messages within their current group grant. Neither mode bypasses expli
 blocks, current membership, sponsor authorization, or destination checks. History
 is context rather than instructions. Saved answers resume after transient preflight
 failures without rerunning Claude; unknown send outcomes remain unconfirmed and are never automatically resent.
+
+See [Remote Inkbox tools](REMOTE_TOOLS.md) for discovery, permissions, retained local capabilities and retry behavior.

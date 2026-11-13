@@ -20,6 +20,8 @@ The bridge's runtime core:
 
 from __future__ import annotations
 
+from . import managed_work
+
 import asyncio
 import hashlib
 import json
@@ -1274,7 +1276,7 @@ class InkboxGateway:
         event_id: str,
         payload: Dict[str, Any],
     ) -> None:
-        task = asyncio.create_task(
+        task = managed_work.spawn(
             self._run_hosted_call_completion(call_id, event_id, payload),
             name=f"hosted-call-completion:{call_id}",
         )
@@ -1287,7 +1289,7 @@ class InkboxGateway:
         event_id: str,
         payload: Dict[str, Any],
     ) -> None:
-        task = asyncio.create_task(
+        task = managed_work.spawn(
             self._run_hosted_sms_correction_recovery(call_id, event_id, payload),
             name=f"hosted-sms-correction:{call_id}",
         )
@@ -1971,19 +1973,26 @@ class InkboxGateway:
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
                 return web.Response(status=401, text="Slack events require a valid signature")
-            if not self.cfg.slack_enabled:
-                return web.json_response({"ok": True, "ignored": "slack-disabled"})
         if envelope.get("companion") is not None and source != "inkbox":
             return web.Response(status=401, text="Companion events require a valid Inkbox signature")
 
+        strict = envelope.get("companion") is not None or (
+            source == "inkbox" and self._companion is not None
+            and bool(self._companion.delivery_failure_scopes(envelope)))
+        if strict and not self.cfg.require_signature and not provider.verify(
+            body=body, headers=dict(request.headers),
+            url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key,
+        ):
+            return web.Response(status=401, text="Companion events require a valid signature")
+        return await self._dispatch_verified(envelope, source, request.headers.get("X-Inkbox-Request-Id", ""))
+
+    async def _dispatch_verified(self, envelope: Dict[str, Any], source: Optional[str], request_id: str) -> "web.Response":
+        """Dispatch an envelope whose source was verified by the receiving transport."""
+        if str(envelope.get("event_type") or "").startswith("slack.") and not self.cfg.slack_enabled:
+            return web.json_response({"ok": True, "ignored": "slack-disabled"})
         if source == "inkbox" and self._companion is not None:
             failure_scopes = self._companion.delivery_failure_scopes(envelope)
             if failure_scopes:
-                if not self.cfg.require_signature and not provider.verify(
-                    body=body, headers=dict(request.headers),
-                    url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key,
-                ):
-                    return web.Response(status=401, text="Companion events require a valid signature")
                 if str(envelope.get("event_type") or "").startswith("whatsapp."):
                     from .whatsapp import record_status
                     record_status(self, envelope)
@@ -1996,12 +2005,6 @@ class InkboxGateway:
         data = envelope.get("data")
         has_companion = envelope.get("companion") is not None
         if source == "inkbox" and has_companion:
-            # Companion authority always requires a signature, including local test configurations.
-            if not self.cfg.require_signature and not provider.verify(
-                body=body, headers=dict(request.headers),
-                url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key,
-            ):
-                return web.Response(status=401, text="Companion events require a valid signature")
             if self.sessions is None:
                 return web.Response(status=503, text="Companion receiver is starting")
             try:
@@ -2022,7 +2025,6 @@ class InkboxGateway:
                 return web.Response(status=503, text="Companion receiver is temporarily unavailable")
             return web.json_response(result)
 
-        request_id = request.headers.get("X-Inkbox-Request-Id", "")
         if self._dedup_begin(request_id):
             return web.json_response({"ok": True, "deduped": True})
 
@@ -2840,6 +2842,7 @@ class InkboxGateway:
             "conversation_id": conversation_id or None,
             "to": sender,
             "sender": sender,
+            "recipients": [value for value in participants if value != local_phone] if is_group and local_phone else [sender] if not is_group else [],
             "conversation_kind": "group" if is_group else "direct",
             "contact": contact,
             "agent_identity": agent_identity,
@@ -3231,7 +3234,7 @@ class InkboxGateway:
             saved_mode, saved_route = session._reply_route()
             if saved_mode == mode and (not conversation_id or saved_route.get("conversation_id") == conversation_id):
                 route = deepcopy(saved_route)
-        asyncio.create_task(self._run_failure_turn(chat_id, prompt, mode, target or "", conversation_id, route))
+        managed_work.spawn(self._run_failure_turn(chat_id, prompt, mode, target or "", conversation_id, route))
         logger.warning(
             "[bridge] Woke agent about failed outbound %s (attempt %d/%d, stage=%s, error=%s)",
             mode,
@@ -3681,7 +3684,7 @@ class InkboxGateway:
         )
         # Run in the background so the webhook returns promptly; the turn can
         # take a while (the agent may call/message someone).
-        asyncio.create_task(self._run_external_turn(chat_id, prompt, directive))
+        managed_work.spawn(self._run_external_turn(chat_id, prompt, directive))
         return web.json_response({"ok": True})
 
     def _read_a2a_registry(self) -> Dict[str, Any]:
@@ -3833,7 +3836,7 @@ class InkboxGateway:
         if self._a2a_entry_is_fenced(entry):
             self._a2a_progress_fences[task_id] = registry_key
             return
-        job = asyncio.create_task(self._run_a2a_turn(registry_key, data))
+        job = managed_work.spawn(self._run_a2a_turn(registry_key, data))
         self._a2a_jobs.setdefault(task_id, set()).add(job)
         job.add_done_callback(
             lambda done, value=task_id: self._a2a_jobs.get(value, set()).discard(done)
@@ -4008,7 +4011,7 @@ class InkboxGateway:
         current = self._a2a_ack_tasks.get(key)
         if current is not None and not current[1].done():
             return
-        task = asyncio.create_task(
+        task = managed_work.spawn(
             self._run_a2a_acknowledgement_retry(key, data),
             name=f"inkbox-a2a-ack-{task_id}",
         )
@@ -4152,7 +4155,7 @@ class InkboxGateway:
         stop_event = asyncio.Event()
         self._a2a_progress_owners[task_id] = registry_key
         self._a2a_progress_stop_events[task_id] = stop_event
-        self._a2a_progress_tasks[task_id] = asyncio.create_task(
+        self._a2a_progress_tasks[task_id] = managed_work.spawn(
             self._run_a2a_progress_updates(
                 task_id=task_id,
                 registry_key=registry_key,

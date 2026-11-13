@@ -1309,5 +1309,7 @@ def build_inkbox_mcp_server(
     from . import __version__
 
     server = create_sdk_mcp_server(name="inkbox", version=__version__, tools=tools)
+    if server.get("instance") is not None:
+        server["instance"]._inkbox_client = client
     tool_names = ["mcp__inkbox__" + getattr(item, "name", getattr(item, "_inkbox_tool_name", "")) for item in tools]
     return server, tool_names
