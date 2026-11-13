@@ -13,6 +13,10 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
 class Mock(BaseHTTPRequestHandler):
     background = False
     results = []
+    tool_name = "Bash"
+    tool_input = None
+    captured_results = []
+    captured_tools = []
 
     def log_message(self, *args):
         pass
@@ -24,6 +28,7 @@ class Mock(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"input_tokens":1}')
             return
+        self.captured_tools.append(req.get("tools", []))
         seen = []
         for msg in req.get("messages", []):
             for b in (
@@ -35,6 +40,7 @@ class Mock(BaseHTTPRequestHandler):
                 ):
                     seen.append(b)
         if seen:
+            self.captured_results.append(seen[-1])
             txt = json.dumps(seen[-1].get("content", "")).lower()
             self.results.append(
                 {
@@ -49,8 +55,8 @@ class Mock(BaseHTTPRequestHandler):
             block = {
                 "type": "tool_use",
                 "id": "toolu_wait",
-                "name": "Bash",
-                "input": {
+                "name": self.tool_name,
+                "input": self.tool_input if self.tool_input is not None else {
                     "command": "python3 -c 'import time; time.sleep(3); print(\"WAIT_FINISHED\")'",
                     "description": "Run isolated three-second timing probe",
                     "timeout": 10000,

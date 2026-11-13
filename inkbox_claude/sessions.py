@@ -27,12 +27,14 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
+    from . import managed_work
     from .delivery_policy import sms_tool_failure_kind
     from .hosted_sms_guard import (
         reserve_hosted_sms_attempt,
         settle_hosted_sms_attempt,
     )
 except ImportError:  # pragma: no cover - direct local import/test fallback
+    import managed_work
     from delivery_policy import sms_tool_failure_kind
     from hosted_sms_guard import (
         reserve_hosted_sms_attempt,
@@ -125,6 +127,8 @@ class _Turn:
     reply_meta: Optional[Dict[str, Any]] = None
     completion: Optional["asyncio.Future[str]"] = None
     checkpoint: Optional[Callable[..., None]] = None
+    managed_work: list = field(default_factory=list, repr=False)
+    managed_admitted: bool = False
     context_ids: tuple[str, ...] = ()
     authorize: Optional[Callable[[], Awaitable[None]]] = None
     queued_at: float = 0
@@ -426,7 +430,8 @@ class ContactSession:
         self.always_allowed: set[str] = set()
 
         self._client: Optional[ClaudeSDKClient] = None
-        self._queue: asyncio.Queue[_Turn] = asyncio.Queue()
+        self._mcp_bridge = None
+        self._queue: asyncio.Queue[_Turn] = managed_work.TurnQueue()
         self._worker: Optional[asyncio.Task] = None
         self._resume_task: Optional[asyncio.Task] = None  # /resume pick in flight
         self._turn_active = False     # a Claude turn is mid-flight
@@ -664,6 +669,11 @@ class ContactSession:
                     or compatible_key(meta) != compatible_key(ometa)):
                 self._deferred_turn = other
                 return turn
+            for work in other.managed_work:
+                if work not in turn.managed_work:
+                    work.add(id(turn))
+                    turn.managed_work.append(work)
+            managed_work.finish(other, "completed")
             turn.burst_source_count += other.burst_source_count
             turn.burst_text_chars = (turn.burst_text_chars or len(turn.text)) + (other.burst_text_chars or len(other.text)) + 2
             turn.text += "\n\n" + other.text
@@ -681,10 +691,18 @@ class ContactSession:
             turn = self._deferred_turn or await self._queue.get()
             self._deferred_turn = None
             self._batching_turn = turn
-            turn = await self._batch(turn)
+            try:
+                turn = await self._batch(turn)
+            except BaseException:
+                managed_work.finish(turn, "uncertain")
+                raise
             if self._batching_turn is None or turn.cancelled:
+                managed_work.finish(turn, "cancelled")
                 continue
             self._batching_turn = None
+            outcome = "uncertain"
+            delivery_scope = managed_work.scope(turn.managed_work)
+            delivery_scope.__enter__()
             try:
                 if turn.saved_reply is not None:
                     await self._deliver_reply(turn, turn.saved_reply)
@@ -695,8 +713,10 @@ class ContactSession:
                     await self.notify_activity(turn.mode, turn.reply_meta or {}, "cancelled" if turn.cancelled or self._interrupting else "completed")
                 if turn.completion is not None and not turn.completion.done():
                     turn.completion.set_result(result or "")
+                outcome = "cancelled" if turn.cancelled or self._interrupting else "completed"
             except Exception as exc:
                 if turn.cancelled or self._shutting_down:
+                    outcome = "cancelled" if turn.cancelled else "uncertain"
                     continue
                 from .companion import retryable_read
                 from .imessage import SafeReplyPreflightError
@@ -748,6 +768,10 @@ class ContactSession:
                     logger.exception("[session %s] could not send the error notice", self.chat_id)
                 if getattr(self, "_execution_blocked", False):
                     return
+            finally:
+                if self._deferred_turn is not turn:
+                    managed_work.finish(turn, outcome)
+                delivery_scope.__exit__(None, None, None)
 
     async def _wait_channel_retry(self, turn: _Turn, *, close_host: bool) -> None:
         """Keep one cancellable queue owner while retrying proven pre-effect work."""
@@ -901,6 +925,7 @@ class ContactSession:
         for turn in retained:
             self._queue.put_nowait(turn)
         for turn in dropped:
+            managed_work.finish(turn, "cancelled")
             turn.cancelled = True
             turn.retry_wake.set()
             if turn.completion is not None and not turn.completion.done():
@@ -1106,6 +1131,13 @@ class ContactSession:
         _context: Any,
     ) -> Dict[str, Any]:
         """Observe A2A activity without giving delegated uploads a later turn's owner."""
+        if self._mcp_bridge is not None and str(hook_input.get("tool_name") or "").startswith("mcp__inkbox__"):
+            from inkbox.remote_mcp import RemoteToolError
+            try:
+                self._mcp_bridge.bind(hook_input, _tool_use_id)
+            except RemoteToolError:
+                return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": "The tool call no longer belongs to an active turn."}}
         if (str(hook_input.get("tool_name") or "").removeprefix("mcp__inkbox__") == "inkbox_slack_upload_file"
                 and hook_input.get("agent_id")):
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -1336,6 +1368,8 @@ class ContactSession:
                     pending.future.set_result(None)
                 self.pending = None
             self._current_turn = None
+            if self._mcp_bridge is not None:
+                self._mcp_bridge.calls.clear()
             self._current_hosted_sms_context = None
             if typing_task is not None:
                 typing_task.cancel()
@@ -1346,6 +1380,11 @@ class ContactSession:
 
         if turn.mode == "whatsapp" and turn.reply_meta is not None:
             turn.reply_meta["host_terminal"] = True
+        if self._mcp_bridge is not None and self._mcp_bridge.remote is not None:
+            from .terminal_reply import source as reply_source, blocked as terminal_reply_blocked
+            journal = self._mcp_bridge.root / ("reply-" + hashlib.sha256(self.chat_id.encode()).hexdigest() + ".sqlite")
+            if terminal_reply_blocked(self._mcp_bridge.remote, reply_source(turn.mode, turn.reply_meta), journal):
+                self._current_channel_tool_delivery = True
         if turn.mode == "imessage" and self.cfg.imessage_threaded_replies:
             duplicate = any(owner is turn and text == reply and target == (turn.reply_meta or {}).get("imessage_reply_target")
                             for owner, text, target in self._imessage_tool_outputs)
@@ -1552,6 +1591,11 @@ class ContactSession:
         if getattr(self, "_execution_blocked", False):
             raise PermissionError("Previous native host ownership could not be fenced; inspect the retained receipt before resuming")
         if self._client is not None:
+            if self._mcp_bridge is not None:
+                import time
+                if time.monotonic() - self._mcp_bridge.refreshed_at >= 300:
+                    await self._mcp_bridge.refresh()
+                    await asyncio.wait_for(self._client.reconnect_mcp_server("inkbox"), 40)
             return self._client
         if not CLAUDE_SDK_AVAILABLE:
             raise RuntimeError(
@@ -1579,6 +1623,13 @@ class ContactSession:
         if self.system_prompt_extra:
             prompt_append = f"{prompt_append}\n\n{self.system_prompt_extra}"
 
+        mcp_server = self.mcp_server
+        inkbox_client = getattr(mcp_server.get("instance"), "_inkbox_client", None) if isinstance(mcp_server, dict) else None
+        if inkbox_client is not None:
+            from .mcp_bridge import McpBridge
+            self._mcp_bridge = McpBridge(mcp_server, inkbox_client, self.cfg, self)
+            mcp_server = await self._mcp_bridge.start()
+
         options = ClaudeAgentOptions(
             cwd=self.cfg.project_dir or None,
             model=self.cfg.claude_model or None,
@@ -1591,7 +1642,7 @@ class ContactSession:
             # Read-only tools and our own Inkbox tools run without a text;
             # everything else lands in _can_use_tool and escalates.
             allowed_tools=list(self.cfg.auto_allowed_tools) + list(self.mcp_tool_names),
-            mcp_servers={"inkbox": self.mcp_server},
+            mcp_servers={"inkbox": mcp_server},
             can_use_tool=self._can_use_tool,
             hooks={
                 "PreToolUse": [
@@ -1612,6 +1663,9 @@ class ContactSession:
                 await client.disconnect()
             except Exception:
                 pass
+            if self._mcp_bridge is not None:
+                await self._mcp_bridge.close()
+                self._mcp_bridge = None
             raise
         finally:
             if self._connecting_client is client:
@@ -1766,6 +1820,7 @@ class ContactSession:
             await asyncio.gather(self._worker, return_exceptions=True)
         while not self._queue.empty():
             turn = self._queue.get_nowait()
+            managed_work.finish(turn, "uncertain")
             if turn.completion is not None and not turn.completion.done():
                 turn.completion.cancel()
         if self.pending is not None and not self.pending.future.done():
@@ -1782,6 +1837,9 @@ class ContactSession:
             pending.future.set_result(None)
         self.pending = None
         self._client_generation += 1
+        if self._mcp_bridge is not None:
+            await self._mcp_bridge.close()
+            self._mcp_bridge = None
         from .runtime import process_identity
         current_owner = process_identity(self._client) if self._client is not None else None
         if current_owner:
