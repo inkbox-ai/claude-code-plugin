@@ -266,7 +266,19 @@ class McpBridge:
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = {"tools": await self.catalog()}
+                # The native host rejects root combinators; RemoteMcp validates the full schema.
+                result = {
+                    "tools": [
+                        {
+                            **tool,
+                            "inputSchema": {
+                                key: value for key, value in tool["inputSchema"].items()
+                                if key not in {"allOf", "anyOf", "oneOf"}
+                            },
+                        } if tool["name"] in self.remote_names else tool
+                        for tool in await self.catalog()
+                    ]
+                }
             elif method == "tools/call":
                 result = await self.call(params)
             else:

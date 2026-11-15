@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.19
+
+- Keep remote tools with conditional input schemas visible in the native tool catalog while retaining full argument validation before execution.
+
 ## 0.2.18
 
 - Reuse valid tunnel certificates across reconnects and renew mismatched or expired state with Inkbox SDK 0.7.38 or newer.

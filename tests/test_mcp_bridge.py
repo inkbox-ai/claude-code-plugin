@@ -174,6 +174,7 @@ def test_native_bridge_validates_full_remote_schema(tmp_path, monkeypatch):
                     "properties": {"text": {"type": "string", "minLength": 2}},
                     "required": ["text"],
                     "additionalProperties": False,
+                    "allOf": [{"properties": {"text": {"const": "accepted"}}}],
                 },
             },
         )
@@ -196,7 +197,7 @@ def test_native_bridge_validates_full_remote_schema(tmp_path, monkeypatch):
             await owner.call(
                 {
                     "name": "remote_example",
-                    "arguments": {"text": "x"},
+                    "arguments": {"text": "otherwise valid"},
                     "_meta": {"claudecode/toolUseId": "toolu_invalid"},
                 }
             )

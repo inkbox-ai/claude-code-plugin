@@ -60,6 +60,9 @@ def test_native_http_preserves_call_identity_and_approval(
                     "type": "object",
                     "properties": {"value": {"type": "string"}},
                     "required": ["value"],
+                    "allOf": [{"properties": {"value": {"minLength": 2}}}],
+                    "anyOf": [{"required": ["value"]}],
+                    "oneOf": [{"properties": {"value": {"const": "synthetic"}}}],
                 },
                 "outputSchema": {
                     "type": "object",
@@ -122,6 +125,9 @@ def test_native_http_preserves_call_identity_and_approval(
             assert hooks[0][1] == "toolu_wait"
             assert hooks[0][0]["session_id"] and hooks[0][0]["prompt_id"]
             assert approvals == ["mcp__inkbox__example"]
+            advertised = {tool["name"]: tool for tool in Model.captured_tools[0]}
+            assert "mcp__inkbox__example" in advertised
+            assert "allOf" in descriptors[0]["inputSchema"]
             assert bool(calls) is approve
             if approve:
                 assert calls[0][:2] == ("example", {"value": "synthetic"})
