@@ -302,11 +302,11 @@ def test_contact_create_catalog_accepts_minimal_fields_and_string_lists(tmp_path
                 validator.validate({"preferred_name": "Example", field: [{"value": "invalid shape"}]})
         with pytest.raises(ValidationError):
             validator.validate({"name": "unsupported field"})
-        converted = compatibility_arguments("inkbox_create_contact", arguments, "operation")
+        converted = compatibility_arguments("inkbox_create_contact", arguments)
         assert converted == {
             "contact": {"preferred_name": "Example", "emails": [
                 {"value": "sample@example.com", "label": None, "is_primary": True},
-            ]}, "idempotency_key": "operation",
+            ]},
         }
 
     asyncio.run(run())

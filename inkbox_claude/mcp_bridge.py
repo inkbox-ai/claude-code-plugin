@@ -12,8 +12,8 @@ import sqlite3
 import time
 from pathlib import Path
 
-from aiohttp import web
 import httpx
+from aiohttp import web
 from inkbox.remote_mcp import RemoteMcp, RemoteToolError
 from mcp.types import CallToolRequest, CallToolRequestParams, ListToolsRequest
 
@@ -273,7 +273,7 @@ class McpBridge:
                 hashlib.sha256(session_id.encode()).hexdigest() + ".sqlite"
             )
             diagnostics["stage"] = "conversion"
-            converted = compatibility_arguments(name, arguments, operation_id)
+            converted = compatibility_arguments(name, arguments)
 
             def before_execute():
                 diagnostics["schema"] = "passed"

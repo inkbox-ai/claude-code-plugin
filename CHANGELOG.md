@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.23
+
+- Keep contact and terminal-reply MCP arguments within the advertised schema while retaining durable operation identity and retry receipts.
+
 ## 0.2.22
 
 - Advertise optional contact creation fields and string-only email and phone lists.

@@ -10,7 +10,7 @@ COMPATIBILITY_NAMES = {
 }
 
 
-def compatibility_arguments(name, arguments, operation_id=None):
+def compatibility_arguments(name, arguments):
     if (
         name == "inkbox_lookup_contact"
         and len(
@@ -31,8 +31,6 @@ def compatibility_arguments(name, arguments, operation_id=None):
         raise ValueError("Contact lookup requires exactly one lookup criterion")
     if name == "inkbox_list_contacts":
         return {"limit": 25, **arguments}
-    if name == "inkbox_delete_contact":
-        return {**arguments, "idempotency_key": operation_id}
     if name not in {"inkbox_create_contact", "inkbox_update_contact"}:
         return arguments
     fields = {key: value for key, value in arguments.items() if key != "contact_id"}
@@ -47,4 +45,4 @@ def compatibility_arguments(name, arguments, operation_id=None):
         if name == "inkbox_create_contact"
         else {"contact_id": arguments["contact_id"], "patch": fields}
     )
-    return {**result, "idempotency_key": operation_id}
+    return result

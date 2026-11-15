@@ -167,6 +167,8 @@ async def send(
     ).hexdigest()
     validate()
     journal.reserve(identifier, operation, digest)
+    # Preserve existing receipt fingerprints; execution identity travels separately.
+    payload.pop("idempotency_key")
 
     def submit():
         validate()
