@@ -39,6 +39,32 @@ def failure_category(error):
     return "other"
 
 
+def schema_failure_detail(error):
+    from jsonschema.exceptions import ValidationError
+
+    cause = error.__context__
+    if not isinstance(cause, ValidationError):
+        return "unknown", "unknown", "unknown"
+    fields = {
+        "contact", "patch", "contact_id", "idempotency_key", "given_name", "family_name",
+        "preferred_name", "company_name", "job_title", "notes", "emails", "phones",
+        "value", "value_e164", "label", "is_primary",
+    }
+    field = ".".join(
+        "item" if isinstance(part, int) else part if part in fields else "other"
+        for part in list(cause.absolute_path)[:6]
+    ) or "root"
+    rule = cause.validator if cause.validator in {
+        "type", "required", "additionalProperties", "anyOf", "oneOf", "allOf",
+        "format", "pattern", "enum", "maxLength", "minLength", "maxItems", "minItems",
+    } else "other"
+    actual = {
+        str: "string", dict: "object", list: "array", bool: "boolean",
+        int: "number", float: "number", type(None): "null",
+    }.get(type(cause.instance), "other")
+    return field, rule, actual
+
+
 class McpBridge:
     def __init__(self, local_server, client, cfg, session):
         self.local = local_server["instance"]
@@ -328,8 +354,15 @@ class McpBridge:
             payload = {"jsonrpc": "2.0", "id": identifier, "result": result}
         except Exception as error:  # noqa: BLE001
             category = failure_category(error)
+            message = "Tool request unavailable or no longer authorized"
             if category == "schema":
                 diagnostics["schema"] = "failed"
+                field, rule, actual = schema_failure_detail(error)
+                logger.warning("MCP schema failure field=%s rule=%s actual=%s", field, rule, actual)
+                message = (
+                    f"Tool arguments do not match the schema: field={field}, rule={rule}, actual={actual}. "
+                    "No request was sent. Correct the arguments using the tool schema."
+                )
             logger.warning(
                 "MCP request failed stage=%s category=%s binding=%s schema=%s",
                 diagnostics["stage"], category, diagnostics["binding"], diagnostics["schema"],
@@ -339,7 +372,7 @@ class McpBridge:
                 "id": identifier,
                 "error": {
                     "code": -32000,
-                    "message": "Tool request unavailable or no longer authorized",
+                    "message": message,
                 },
             }
         encoded = json.dumps(payload, separators=(",", ":"))

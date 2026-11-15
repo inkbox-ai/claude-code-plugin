@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.22
+
+- Advertise optional contact creation fields and string-only email and phone lists.
+- Distinguish invalid tool arguments from authorization failures and report bounded schema details without argument values.
+
 ## 0.2.21
 
 - Report bounded MCP failure stages and categories without logging request or response contents.

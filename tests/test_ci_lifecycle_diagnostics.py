@@ -486,3 +486,18 @@ def test_mcp_failure_report_keeps_only_fixed_categories(tmp_path, capsys):
     assert json.loads(output) == {"mcp_failure": {
         "stage": "remote_preflight", "category": "schema", "binding": "matched", "schema": "failed",
     }}
+
+
+def test_mcp_schema_report_excludes_values_and_unknown_field_names(tmp_path, capsys):
+    path = tmp_path / "gateway.log"
+    path.write_text(
+        "WARNING MCP schema failure field=contact.emails.item.value rule=type actual=object\n"
+        f"WARNING MCP schema failure field={SECRET} rule=type actual=object\n"
+        f"WARNING MCP schema failure field=contact rule=type actual={SECRET}\n"
+    )
+    diagnostics.report_mcp_failures(path)
+    output = capsys.readouterr().out
+    assert SECRET not in output
+    assert json.loads(output) == {"mcp_schema_failure": {
+        "field": "contact.emails.item.value", "rule": "type", "actual": "object",
+    }}

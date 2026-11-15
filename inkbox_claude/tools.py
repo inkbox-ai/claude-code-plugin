@@ -935,9 +935,20 @@ def build_inkbox_mcp_server(
         "Save a new contact in the address book. Provide any of given_name, "
         "family_name, preferred_name, company_name, job_title, notes, and "
         "emails / phones as lists of strings (first entry is marked primary).",
-        {"given_name": str, "family_name": str, "preferred_name": str,
-         "company_name": str, "job_title": str, "notes": str,
-         "emails": list, "phones": list},
+        {
+            "type": "object",
+            "properties": {
+                "given_name": {"type": "string"},
+                "family_name": {"type": "string"},
+                "preferred_name": {"type": "string"},
+                "company_name": {"type": "string"},
+                "job_title": {"type": "string"},
+                "notes": {"type": "string"},
+                "emails": {"type": "array", "items": {"type": "string"}},
+                "phones": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+        },
     )
     async def inkbox_create_contact(args: Dict[str, Any]) -> Dict[str, Any]:
         def _run():
