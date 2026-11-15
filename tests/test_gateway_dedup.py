@@ -69,3 +69,25 @@ def test_request_id_rolls_back_after_dispatch_failure(monkeypatch):
         asyncio.run(gw._handle_webhook(_FakeRequest(body)))
 
     assert calls["count"] == 2
+
+
+@pytest.mark.parametrize("fails_first", [False, True])
+def test_event_replay_with_new_request_id(monkeypatch, fails_first):
+    gw = gateway.InkboxGateway(BridgeConfig(require_signature=False, allow_all_users=True))
+    calls = []
+
+    async def receive(envelope):
+        calls.append(envelope["id"])
+        if fails_first and len(calls) == 1:
+            raise RuntimeError("retry")
+        return _FakeResponse(text="ok")
+
+    monkeypatch.setattr(gw, "_on_mail_received", receive)
+    body = json.dumps({"id": "evt-mail", "event_type": "message.received", "data": {"message": {"id": "mail-1"}}}).encode()
+    if fails_first:
+        with pytest.raises(RuntimeError):
+            asyncio.run(gw._handle_webhook(_FakeRequest(body, request_id="failed")))
+    asyncio.run(gw._handle_webhook(_FakeRequest(body, request_id="original")))
+    replay = asyncio.run(gw._handle_webhook(_FakeRequest(body, request_id="replay")))
+    assert json.loads(replay.text)["deduped"] is True
+    assert len(calls) == (2 if fails_first else 1)

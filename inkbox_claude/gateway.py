@@ -2025,7 +2025,9 @@ class InkboxGateway:
                 return web.Response(status=503, text="Companion receiver is temporarily unavailable")
             return web.json_response(result)
 
-        if self._dedup_begin(request_id):
+        event_id = envelope.get("id") if source == "inkbox" else None
+        dedup_id = f"inkbox:event:{event_id}" if isinstance(event_id, str) and event_id else request_id
+        if self._dedup_begin(dedup_id):
             return web.json_response({"ok": True, "deduped": True})
 
         try:
@@ -2118,9 +2120,9 @@ class InkboxGateway:
                 # a fresh session each.
                 response = web.json_response({"ok": True, "ignored": event_type or "unknown"})
         except Exception:
-            self._dedup_rollback(request_id)
+            self._dedup_rollback(dedup_id)
             raise
-        self._dedup_commit(request_id)
+        self._dedup_commit(dedup_id)
         return response
 
     @classmethod
@@ -2501,6 +2503,8 @@ class InkboxGateway:
 
         subject = str(message.get("subject") or "")
         body_text = await asyncio.to_thread(self._fetch_mail_body, message)
+        if body_text.rstrip().endswith("\n\nSent via Inkbox (https://inkbox.ai)"):
+            body_text = body_text.rstrip().removesuffix("\n\nSent via Inkbox (https://inkbox.ai)")
         if message.get("has_attachments"):
             saved = await self._fetch_mail_attachments(message)
             body_text = (body_text + inbound_media_note(saved)).strip()

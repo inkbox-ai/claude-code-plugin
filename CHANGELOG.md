@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.20
+
+- Deduplicate webhook retries by event ID even when each delivery has a new request ID.
+- Ignore the standard Inkbox email footer when handling approval and cancellation replies.
+
 ## 0.2.19
 
 - Keep remote tools with conditional input schemas visible in the native tool catalog while retaining full argument validation before execution.
