@@ -5,17 +5,38 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import secrets
+import sqlite3
 import time
 from pathlib import Path
 
 from aiohttp import web
+import httpx
 from inkbox.remote_mcp import RemoteMcp, RemoteToolError
 from mcp.types import CallToolRequest, CallToolRequestParams, ListToolsRequest
 
 from . import terminal_reply
 from .remote_compat import COMPATIBILITY_NAMES, compatibility_arguments
+
+logger = logging.getLogger(__name__)
+
+
+def failure_category(error):
+    if isinstance(error, RemoteToolError):
+        if str(error) == "Tool arguments do not match the remote schema":
+            return "schema"
+        return "remote_tool"
+    for kind, category in (
+        (sqlite3.Error, "journal"), (httpx.TimeoutException, "timeout"),
+        (httpx.HTTPError, "transport"), (TimeoutError, "timeout"),
+        (OSError, "io"), (KeyError, "missing_field"),
+        (TypeError, "type"), (ValueError, "value"),
+    ):
+        if isinstance(error, kind):
+            return category
+    return "other"
 
 
 class McpBridge:
@@ -177,7 +198,9 @@ class McpBridge:
         self.refreshed_at = time.monotonic()
         return self.tools
 
-    async def call(self, params):
+    async def call(self, params, *, diagnostics=None):
+        diagnostics = diagnostics if diagnostics is not None else {}
+        diagnostics["stage"] = "arguments"
         name, arguments = params.get("name"), params.get("arguments", {})
         if not isinstance(name, str) or not isinstance(arguments, dict):
             raise TypeError("Invalid tool arguments")
@@ -186,6 +209,7 @@ class McpBridge:
             or name in COMPATIBILITY_NAMES
             or name == terminal_reply.NAME
         ):
+            diagnostics["stage"] = "binding"
             metadata = params.get("_meta") or {}
             call_id = (
                 metadata.get("claudecode/toolUseId")
@@ -193,12 +217,17 @@ class McpBridge:
                 else None
             )
             entry = self.calls.get(call_id) if isinstance(call_id, str) else None
+            diagnostics["binding"] = (
+                "missing" if entry is None else
+                "matched" if entry[2] == "mcp__inkbox__" + name else "mismatch"
+            )
             if entry is None or entry[2] != "mcp__inkbox__" + name:
                 raise RemoteToolError(
                     "The tool call is not bound to an active native operation"
                 )
             operation_id, session_id, _, validate = entry
             if name == terminal_reply.NAME:
+                diagnostics["stage"] = "terminal_reply"
                 turn = self.session._current_turn
                 journal = self.root / (
                     "reply-"
@@ -217,13 +246,24 @@ class McpBridge:
             journal = self.root / (
                 hashlib.sha256(session_id.encode()).hexdigest() + ".sqlite"
             )
+            diagnostics["stage"] = "conversion"
+            converted = compatibility_arguments(name, arguments, operation_id)
+
+            def before_execute():
+                diagnostics["schema"] = "passed"
+                diagnostics["stage"] = "turn_validation"
+                validate()
+                diagnostics["stage"] = "remote_request"
+
+            diagnostics["stage"] = "remote_preflight"
             return await self.remote.call(
                 COMPATIBILITY_NAMES.get(name, name),
-                compatibility_arguments(name, arguments, operation_id),
+                converted,
                 call_identity=operation_id,
                 journal_path=journal,
-                before_execute=validate,
+                before_execute=before_execute,
             )
+        diagnostics["stage"] = "local_request"
         from .tools import A2A_TURN_CONTEXT, CURRENT_SESSION
 
         turn = self.session._current_turn
@@ -247,12 +287,14 @@ class McpBridge:
         ):
             return web.Response(status=401)
         identifier = None
+        diagnostics = {"stage": "decode", "binding": "unchecked", "schema": "unchecked"}
         try:
             body = await request.json()
             if not isinstance(body, dict) or body.get("jsonrpc") != "2.0":
                 raise ValueError("Invalid request")
             identifier = body.get("id")
             method, params = body.get("method"), body.get("params", {})
+            diagnostics["stage"] = "dispatch"
             if not isinstance(params, dict):
                 raise TypeError("Invalid parameters")
             if method == "initialize":
@@ -280,11 +322,18 @@ class McpBridge:
                     ]
                 }
             elif method == "tools/call":
-                result = await self.call(params)
+                result = await self.call(params, diagnostics=diagnostics)
             else:
                 raise ValueError("Unsupported method")
             payload = {"jsonrpc": "2.0", "id": identifier, "result": result}
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            category = failure_category(error)
+            if category == "schema":
+                diagnostics["schema"] = "failed"
+            logger.warning(
+                "MCP request failed stage=%s category=%s binding=%s schema=%s",
+                diagnostics["stage"], category, diagnostics["binding"], diagnostics["schema"],
+            )
             payload = {
                 "jsonrpc": "2.0",
                 "id": identifier,

@@ -203,3 +203,74 @@ def test_native_bridge_validates_full_remote_schema(tmp_path, monkeypatch):
             )
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        ("missing", "stage=binding category=remote_tool binding=missing schema=unchecked"),
+        ("mismatch", "stage=binding category=remote_tool binding=mismatch schema=unchecked"),
+        ("conversion", "stage=conversion category=type binding=matched schema=unchecked"),
+        ("schema", "stage=remote_preflight category=schema binding=matched schema=failed"),
+        ("journal", "stage=remote_preflight category=journal binding=matched schema=unchecked"),
+        ("stale", "stage=turn_validation category=remote_tool binding=matched schema=passed"),
+        ("transport", "stage=remote_request category=transport binding=matched schema=passed"),
+    ],
+)
+def test_failure_diagnostics_identify_stage_without_payloads(tmp_path, monkeypatch, caplog, failure, expected):
+    import sqlite3
+    from inkbox.remote_mcp import CallJournal, RemoteMcp
+
+    secret = "synthetic-sensitive-value@example.invalid"
+
+    async def run():
+        owner = bridge(tmp_path, monkeypatch)
+        remote = RemoteMcp(
+            api_key=secret, base_url="https://example.invalid", identity="example",
+            journal_path=tmp_path / "catalog.sqlite",
+        )
+        remote._catalog = ({
+            "name": "inkbox_contact_create",
+            "inputSchema": {
+                "type": "object", "required": ["contact"],
+                "properties": {"contact": {"type": "object", "required": ["name"]}},
+            },
+        },)
+        owner.remote = remote
+        owner.remote_names = {"inkbox_contact_create"}
+        name = "inkbox_create_contact"
+        params = {"name": name, "arguments": {"name": secret}, "_meta": {"claudecode/toolUseId": "call"}}
+        if failure != "missing":
+            owner.bind({"session_id": "session", "prompt_id": "prompt", "tool_name": "mcp__inkbox__" + name}, "call")
+        if failure == "mismatch":
+            params["name"] = "inkbox_contact_create"
+        if failure == "conversion":
+            params["arguments"]["emails"] = None
+        if failure == "schema":
+            params["arguments"] = {"notes": secret}
+        if failure == "journal":
+            def fail_journal(*args):
+                raise sqlite3.OperationalError(secret)
+            monkeypatch.setattr(CallJournal, "begin", fail_journal)
+        if failure == "stale":
+            owner.session._current_turn = object()
+
+        async def request(*args):
+            assert failure == "transport", "failure must occur before network access"
+            raise httpx.ConnectError(secret)
+
+        monkeypatch.setattr(remote, "request", request)
+
+        async def body():
+            return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
+
+        response = await owner.handle(SimpleNamespace(headers={"Authorization": "Bearer " + owner.token}, json=body))
+        import json
+        assert json.loads(response.text)["error"] == {
+            "code": -32000, "message": "Tool request unavailable or no longer authorized",
+        }
+        assert secret not in response.text
+        assert secret not in caplog.text
+        assert expected in caplog.text
+
+    asyncio.run(run())

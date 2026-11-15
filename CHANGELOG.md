@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.21
+
+- Report bounded MCP failure stages and categories without logging request or response contents.
+- Retry incomplete live-test call cleanup and verify calls have ended between tests.
+
 ## 0.2.20
 
 - Deduplicate incoming message and call-completion retries by event ID even when each delivery has a new request ID.
