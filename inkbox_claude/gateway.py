@@ -2025,7 +2025,9 @@ class InkboxGateway:
                 return web.Response(status=503, text="Companion receiver is temporarily unavailable")
             return web.json_response(result)
 
-        event_id = envelope.get("id") if source == "inkbox" else None
+        event_id = envelope.get("id") if source == "inkbox" and envelope.get("event_type") in (
+            "message.received", "text.received", "imessage.received", "call.ended",
+        ) else None
         dedup_id = f"inkbox:event:{event_id}" if isinstance(event_id, str) and event_id else request_id
         if self._dedup_begin(dedup_id):
             return web.json_response({"ok": True, "deduped": True})

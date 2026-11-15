@@ -2,7 +2,7 @@
 
 ## 0.2.20
 
-- Deduplicate webhook retries by event ID even when each delivery has a new request ID.
+- Deduplicate incoming message and call-completion retries by event ID even when each delivery has a new request ID.
 - Ignore the standard Inkbox email footer when handling approval and cancellation replies.
 
 ## 0.2.19
