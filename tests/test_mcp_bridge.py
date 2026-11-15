@@ -219,6 +219,7 @@ def test_native_bridge_validates_full_remote_schema(tmp_path, monkeypatch):
 )
 def test_failure_diagnostics_identify_stage_without_payloads(tmp_path, monkeypatch, caplog, failure, expected):
     import sqlite3
+
     from inkbox.remote_mcp import CallJournal, RemoteMcp
 
     secret = "synthetic-sensitive-value@example.invalid"
@@ -283,15 +284,16 @@ def test_failure_diagnostics_identify_stage_without_payloads(tmp_path, monkeypat
 def test_contact_create_catalog_accepts_minimal_fields_and_string_lists(tmp_path, monkeypatch):
     from jsonschema import Draft202012Validator, ValidationError
     from mcp.types import ListToolsRequest
-    from inkbox_claude.tools import build_inkbox_mcp_server
+
     from inkbox_claude.remote_compat import compatibility_arguments
+    from inkbox_claude.tools import build_inkbox_mcp_server
 
     async def run():
         owner = bridge(tmp_path, monkeypatch)
         local, _ = build_inkbox_mcp_server(owner.client, "example")
         owner.local = local["instance"]
         catalog = await owner.local_request(ListToolsRequest(method="tools/list"))
-        schema = next(row.inputSchema for row in catalog.tools if row.name == "inkbox_create_contact")
+        schema = next(row.model_dump(by_alias=True)["inputSchema"] for row in catalog.tools if row.name == "inkbox_create_contact")
         validator = Draft202012Validator(schema)
         arguments = {"preferred_name": "Example", "emails": ["sample@example.com"]}
         validator.validate(arguments)
@@ -312,6 +314,7 @@ def test_contact_create_catalog_accepts_minimal_fields_and_string_lists(tmp_path
 
 def test_schema_failure_detail_excludes_payloads_and_unknown_property_names():
     from jsonschema import Draft202012Validator, ValidationError
+
     from inkbox_claude.mcp_bridge import schema_failure_detail
 
     secret = "sensitive@example.invalid"
