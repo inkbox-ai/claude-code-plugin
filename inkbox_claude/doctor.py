@@ -12,6 +12,12 @@ except ImportError:  # pragma: no cover - direct local import/test fallback
     from config import VoiceStack, inkbox_client_kwargs, read_config
 
 
+try:
+    from .hosted_diagnostics import hosted_diagnostics
+except ImportError:
+    from hosted_diagnostics import hosted_diagnostics
+
+
 def run_doctor() -> List[Tuple[str, bool, str]]:
     """Run every readiness check.
 
@@ -28,6 +34,10 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
     _maybe_load_env_file()
 
     cfg = read_config()
+    hosted = hosted_diagnostics(cfg.identity, "claude_code", cfg.signing_key)
+    if hosted is not None:
+        return hosted["checks"]
+
     checks: List[Tuple[str, bool, str]] = []
 
     checks.append(("INKBOX_API_KEY", bool(cfg.api_key), "set" if cfg.api_key else "missing"))
