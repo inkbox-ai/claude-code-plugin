@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.25
+
+### Fixed
+- Install the plugin and its CLI when syncing the locked Python environment.
+
 ## 0.2.24
 
 - Make managed diagnostics use a recent runtime health report instead of terminal signing-key or ordinary webhook settings. Keep standalone checks and report unavailable runtime evidence.

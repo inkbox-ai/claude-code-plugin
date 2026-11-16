@@ -407,8 +407,8 @@ wheels = [
 
 [[package]]
 name = "claude-code-plugin"
-version = "0.2.24"
-source = { virtual = "." }
+version = "0.2.25"
+source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'" },

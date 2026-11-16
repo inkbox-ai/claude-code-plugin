@@ -31,6 +31,15 @@ jobs:
       - name: Install test deps
         run: tests/ci/retry_install.sh uv pip install --system pytest httpx aiohttp segno "psutil>=5.9,<8" "audioop-lts>=0.2.1; python_version >= '3.13'" claude-agent-sdk "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@b465550e4563ae3b75443ab44d269d15a6238132#subdirectory=sdk/python"
 
+      - name: Verify locked installation outside the checkout
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/plugin-install
+        run: |
+          uv sync --frozen --no-dev
+          cd "$RUNNER_TEMP"
+          "$UV_PROJECT_ENVIRONMENT/bin/python" -c 'import inkbox_claude.managed_work'
+          "$UV_PROJECT_ENVIRONMENT/bin/inkbox-claude" --help
+
       # tests/contract runs in its own job against the LATEST host, not here.
       # tests/live is collected but self-skips without the live API keys.
       - name: Test
