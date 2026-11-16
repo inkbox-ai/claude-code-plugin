@@ -1,15 +1,15 @@
 """Real Claude reasoning → native in-process MCP → synthetic encrypted SDK API."""
 import asyncio
-import json
 import os
 
 import httpx
 import pytest
 from inkbox import Inkbox
+
 from inkbox_claude.config import BridgeConfig
 from inkbox_claude.sessions import ContactSession
 from inkbox_claude.tools import build_inkbox_mcp_server
-from tests.fixtures.vault_api import VaultAPI, VAULT_KEY, TOTP_SEED, LOGIN_ID
+from tests.fixtures.vault_api import LOGIN_ID, TOTP_SEED, VAULT_KEY, VaultAPI
 
 pytestmark = pytest.mark.skipif(os.getenv("INKBOX_RUN_NATIVE_HOST_TESTS") != "1",
                                 reason="real Claude model contract runs in the authorized real-model E2E lane")
@@ -22,8 +22,9 @@ def test_real_host_retrieves_current_synthetic_two_factor_code(monkeypatch,tmp_p
     monkeypatch.delenv('INKBOX_VAULT_KEY',raising=False)
     monkeypatch.setattr('inkbox._config._CONFIG_PATH',tmp_path/'no-sdk-config')
     monkeypatch.setattr('inkbox._http.httpx.HTTPTransport',lambda **kwargs:httpx.MockTransport(api.respond))
+    monkeypatch.setattr('httpx._client.AsyncHTTPTransport',lambda **kwargs:httpx.MockTransport(api.respond))
     client=Inkbox(api_key='synthetic-agent-key',base_url='https://api.example.com')
-    cfg=BridgeConfig(identity='example-agent',project_dir=str(tmp_path),permission_timeout_s=2)
+    cfg=BridgeConfig(identity='example-agent',api_key='synthetic-agent-key',project_dir=str(tmp_path),permission_timeout_s=2)
     server,names=build_inkbox_mcp_server(client,cfg.identity,cfg)
     outputs=[]
     async def send(_chat,text,_mode,_meta):outputs.append(text)

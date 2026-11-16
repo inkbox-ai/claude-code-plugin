@@ -325,3 +325,42 @@ def test_schema_failure_detail_excludes_payloads_and_unknown_property_names():
             raise RemoteToolError("Tool arguments do not match the remote schema") from None
     except RemoteToolError as error:
         assert schema_failure_detail(error) == ("other", "type", "object")
+
+
+def test_claimed_bridge_discovers_and_executes_local_vault_tools(monkeypatch, tmp_path):
+    import json
+
+    from inkbox import Inkbox
+
+    from inkbox_claude.config import BridgeConfig
+    from inkbox_claude.tools import build_inkbox_mcp_server
+    from tests.fixtures.vault_api import LOGIN_ID, TOTP_SEED, VAULT_KEY, VaultAPI
+
+    api = VaultAPI()
+    monkeypatch.setattr("inkbox._config._CONFIG_PATH", tmp_path / "missing-config")
+    monkeypatch.setattr("inkbox._http.httpx.HTTPTransport", lambda **kw: httpx.MockTransport(api.respond))
+    client = Inkbox(api_key="synthetic-agent-key", base_url="https://api.example.com")
+    monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("INKBOX_CLAUDE_VAULT_KEY", VAULT_KEY)
+    monkeypatch.setattr("httpx._client.AsyncHTTPTransport", lambda **kw: httpx.MockTransport(api.respond))
+    monkeypatch.setattr("inkbox.vault.totp.time.time", lambda: 1111111109)
+    cfg = BridgeConfig(identity="example-agent", api_key="synthetic-agent-key")
+    local, _ = build_inkbox_mcp_server(client, cfg.identity, cfg)
+    bridge = McpBridge(local, client, cfg, SimpleNamespace(_current_turn=None))
+
+    async def run():
+        catalog = await bridge.catalog()
+        assert "inkbox_get_totp_code" in {tool["name"] for tool in catalog}
+        assert bridge.remote is not None
+        listed = await bridge.call({"name": "inkbox_list_vault_secrets", "arguments": {"secret_type": "login"}})
+        assert not listed.get("isError")
+        assert json.loads(listed["content"][0]["text"])[0]["id"] == LOGIN_ID
+        result = await bridge.call({"name": "inkbox_get_totp_code", "arguments": {"secret_id": LOGIN_ID}})
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"])["code"] == "07081804"
+        assert all(value not in json.dumps(result) for value in (VAULT_KEY, TOTP_SEED, "synthetic-password"))
+
+    try:
+        asyncio.run(run())
+    finally:
+        client.close()
