@@ -106,6 +106,10 @@ CHANNEL_RETRY_MAX_DELAY = 30.0
 CHANNEL_DELIVERY_GUARD: ContextVar[Any] = ContextVar("channel_delivery_guard", default=None)
 
 
+class _TerminalReplyUncertain(RuntimeError):
+    """The final reply may already have been sent."""
+
+
 @dataclass
 class _Turn:
     """One unit of work for a session's single Claude client.
@@ -714,6 +718,13 @@ class ContactSession:
                 if turn.completion is not None and not turn.completion.done():
                     turn.completion.set_result(result or "")
                 outcome = "cancelled" if turn.cancelled or self._interrupting else "completed"
+            except _TerminalReplyUncertain as exc:
+                outcome = "uncertain"
+                if turn.completion is not None and not turn.completion.done():
+                    turn.completion.set_exception(exc)
+                await self.receipt(turn.mode, turn.reply_meta or {}, outcome)
+                if turn.checkpoint is None:
+                    await self.notify_activity(turn.mode, turn.reply_meta or {}, "failed")
             except Exception as exc:
                 if turn.cancelled or self._shutting_down:
                     outcome = "cancelled" if turn.cancelled else "uncertain"
@@ -1381,9 +1392,12 @@ class ContactSession:
         if turn.mode == "whatsapp" and turn.reply_meta is not None:
             turn.reply_meta["host_terminal"] = True
         if self._mcp_bridge is not None and self._mcp_bridge.remote is not None:
-            from .terminal_reply import source as reply_source, blocked as terminal_reply_blocked
+            from .terminal_reply import settlement, source as reply_source
             journal = self._mcp_bridge.root / ("reply-" + hashlib.sha256(self.chat_id.encode()).hexdigest() + ".sqlite")
-            if terminal_reply_blocked(self._mcp_bridge.remote, reply_source(turn.mode, turn.reply_meta), journal):
+            reply_state = settlement(self._mcp_bridge.remote, reply_source(turn.mode, turn.reply_meta), journal)
+            if reply_state == "uncertain":
+                raise _TerminalReplyUncertain("Terminal reply delivery could not be confirmed")
+            if reply_state == "accepted":
                 self._current_channel_tool_delivery = True
         if turn.mode == "imessage" and self.cfg.imessage_threaded_replies:
             duplicate = any(owner is turn and text == reply and target == (turn.reply_meta or {}).get("imessage_reply_target")

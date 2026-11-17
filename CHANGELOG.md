@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.27
+
+- Keep inbound delivery unresolved when a final reply cannot be confirmed.
+
 ## 0.2.26
 
 ### Changed

@@ -43,3 +43,42 @@ def test_failed_work_does_not_claim_success_after_error_notice():
         assert await work.done is False
 
     asyncio.run(run())
+
+
+def test_terminal_reply_settlement_preserves_uncertain_delivery(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from inkbox_claude import sessions
+
+    class Result:
+        result = "Automatic fallback"
+        session_id = None
+
+    class Client:
+        async def query(self, _text):
+            pass
+
+        async def receive_response(self):
+            yield Result()
+
+    monkeypatch.setattr(sessions, "ResultMessage", Result)
+
+    async def run(lookup, expected):
+        sent = []
+        session = make_session(sent)
+        session._ensure_client = AsyncMock(return_value=Client())
+        remote = SimpleNamespace(terminal_replies=lambda **_: SimpleNamespace(lookup=lookup))
+        session._mcp_bridge = SimpleNamespace(root=tmp_path, remote=remote, calls={})
+        session.notify_activity = AsyncMock()
+        work = managed_work.DeliveryWork()
+        with managed_work.scope((work,)):
+            await session._queue.put(_Turn(text="synthetic", mode="sms", reply_meta={"message_id": "inbound"}))
+        work.seal()
+        await session._drain()
+        assert await work.done is expected
+        assert sent == []
+
+    asyncio.run(run(Mock(return_value={"state": "accepted"}), True))
+    asyncio.run(run(Mock(return_value={"state": "pending", "submitted": True}), False))
+    asyncio.run(run(Mock(side_effect=OSError("unreadable journal")), False))
