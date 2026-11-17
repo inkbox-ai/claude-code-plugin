@@ -663,6 +663,7 @@ MAIL_EVENTS = ["message.received", "message.bounced", "message.failed"]
 # is subscribed for parity but only logged.
 TEXT_EVENTS = [
     "text.received",
+    "text.transcription_finished",
     "text.sent",
     "text.delivered",
     "text.delivery_failed",
@@ -670,6 +671,7 @@ TEXT_EVENTS = [
 ]
 IMESSAGE_EVENTS = [
     "imessage.received",
+    "imessage.transcription_finished",
     "imessage.sent",
     "imessage.delivered",
     "imessage.delivery_failed",
@@ -787,6 +789,7 @@ class InkboxGateway:
         self._public_host: str = ""
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
+        self._voice_note_closing = False
         self._slack_activity = None
         self._channel_stores = {}
         self._runtime_ready = False
@@ -918,6 +921,7 @@ class InkboxGateway:
             fence_fn=self._record_host_fence,
         )
         self._companion_receiver().recover()
+        self._voice_note_inbox().recover()
         await self._recover_channel_inputs()
         self._runtime_ready = True
         await self._catch_up_a2a_tasks()
@@ -1655,7 +1659,41 @@ class InkboxGateway:
             )
             logger.exception("[bridge] hosted call completion failed call_id=%s", call_id)
 
+    def _voice_note_inbox(self):
+        if getattr(self, "_voice_note_closing", False):
+            raise RuntimeError("Voice-note intake is shutting down")
+        from .voice_notes import VoiceNotes
+        inbox = getattr(self, "_voice_note_state", None)
+        if inbox is None:
+            root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
+            identity_id = str(self._identity.id)
+            inbox = self._voice_note_state = VoiceNotes(
+                root / f"voice-notes-{identity_id}.sqlite3", self._identity,
+                self._inkbox, self._deliver_voice_note,
+            )
+        return inbox
+
+    async def _deliver_voice_note(self, envelope):
+        event_type = envelope.get("event_type")
+        if event_type == "text.received":
+            return await self._on_text_received(envelope)
+        if event_type == "imessage.received":
+            return await self._on_imessage_received(envelope)
+        from .whatsapp import receive
+        return await receive(self, envelope)
+
+    def _voice_note_receipt(self, event_type, envelope):
+        from .voice_notes import FINISHED, RECEIVED, message_for, pending
+        if event_type in FINISHED:
+            self._voice_note_inbox().complete(envelope)
+            return web.json_response({"ok": True})
+        if event_type in RECEIVED and (pending(message_for(envelope)) or getattr(self, "_voice_note_state", None) is not None):
+            if self._voice_note_inbox().defer(envelope):
+                return web.json_response({"ok": True, "pending_transcription": True})
+        return None
+
     async def _cleanup(self) -> None:
+        self._voice_note_closing = True
         self._closing = True
         if self._companion is not None:
             await self._companion.close()
@@ -1687,6 +1725,9 @@ class InkboxGateway:
             task.cancel()
         if jobs:
             await asyncio.gather(*jobs, return_exceptions=True)
+        if getattr(self, "_voice_note_state", None) is not None:
+            await self._voice_note_state.close()
+            self._voice_note_state = None
         if self.sessions is not None:
             await self.sessions.close_all()
         self._runtime_ready = False
@@ -2002,6 +2043,10 @@ class InkboxGateway:
                     return web.Response(status=503, text="Companion delivery receipt is unavailable")
                 return web.json_response({"ok": True, "companion": "delivery_failed"})
 
+        from .voice_notes import FINISHED
+        if source == "inkbox" and envelope.get("event_type") in FINISHED:
+            return self._voice_note_receipt(envelope["event_type"], envelope)
+
         data = envelope.get("data")
         has_companion = envelope.get("companion") is not None
         if source == "inkbox" and has_companion:
@@ -2040,7 +2085,10 @@ class InkboxGateway:
                 # delivery — a forwarded external event can be Inkbox-signed
                 # too. Those don't match a known shape, so they fall through to
                 # the external branch below rather than getting swallowed here.
-                if not event_type:
+                voice_receipt = self._voice_note_receipt(event_type, envelope)
+                if voice_receipt is not None:
+                    response = voice_receipt
+                elif not event_type:
                     # Incoming-call payloads are flat (no envelope); with
                     # auto_accept this is informational, but it can carry
                     # resolved contact context before the WS starts.
@@ -3085,6 +3133,8 @@ class InkboxGateway:
         """
         if not media:
             return text
+        from .voice_notes import transcript_note
+        text += transcript_note(media)
         saved = await download_media(media, prefix=prefix)
         return (text + inbound_media_note(saved)).strip()
 

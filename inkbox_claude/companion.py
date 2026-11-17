@@ -906,6 +906,13 @@ class CompanionReceiver:
                     await self.deliver(key, event)
                     continue
                 scope, message = event["scope"], event["message"]
+                if scope["channel"] in {"phone", "imessage", "whatsapp"}:
+                    from .voice_notes import pending
+                    if pending(message):
+                        message = await self.gateway._voice_note_inbox().resolve_message(
+                            "text" if scope["channel"] == "phone" else scope["channel"], message)
+                        event["message"] = message
+                        self.save(key)
                 if (message["id"] in record.get("snapshot_ids", [])
                         and message["id"] != record.get("initial_source_id")):
                     event["state"] = "completed"
@@ -953,12 +960,14 @@ class CompanionReceiver:
                     from .imessage import source_metadata
                     meta.update(source_metadata(message, event["submission_id"]))
                 raw_text = await self.raw_text(event)
+                from .voice_notes import transcript_note
+                voice_note = transcript_note(message.get("media") or [])
                 if message["id"] not in record.get("history_ids", []):
                     item = json.dumps({
                         "source_message_id": message["id"], "author": event["sender"],
                         **({key: message.get(key) for key in ("reply_to_message_id", "thread_id", "thread_root_message_id")}
                            if scope["channel"] == "whatsapp" else {}),
-                        "text": meta.get("whatsapp_body", raw_text), "sender_access": message.get("sender_access"),
+                        "text": meta.get("whatsapp_body", raw_text + voice_note), "sender_access": message.get("sender_access"),
                         **({"mentions": meta.get("mentions"), "original_text": meta.get("original_text"),
                             "agent_mentioned": meta.get("whatsapp_mentioned")} if scope["channel"] == "whatsapp" else {}),
                         "attachments": message.get("attachments") or message.get("media") or [],
