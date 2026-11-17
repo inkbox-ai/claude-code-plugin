@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.26
+
+### Changed
+- Require Inkbox SDK 0.7.39 for durable messaging and remote tool handling.
+
 ## 0.2.25
 
 ### Fixed
