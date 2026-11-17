@@ -1,6 +1,6 @@
 [project]
 name = "claude-code-plugin"
-version = "0.2.27"
+version = "0.2.28"
 description = "Inkbox bridge for Claude Code — talk to your coding agent over email, Slack, SMS, iMessage, WhatsApp, and voice"
 requires-python = ">=3.11"
 dependencies = [
@@ -8,7 +8,7 @@ dependencies = [
   "psutil>=5.9,<8",
   "audioop-lts>=0.2.1; python_version >= '3.13'",
   "inkbox>=0.7.39,<1.0.0",
-  "claude-agent-sdk>=0.1.0",
+  "claude-agent-sdk==0.2.158",
   "segno>=1.5",  # terminal QR codes for the iMessage connect step
 ]
 
