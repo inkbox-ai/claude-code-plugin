@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.29
+
+- Resolve pending consults when final reply delivery cannot be confirmed.
+
 ## 0.2.28
 
 - Pin Claude Code 2.1.280 through Claude Agent SDK 0.2.158 for Claude Opus 5.5.

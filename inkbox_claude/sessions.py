@@ -722,6 +722,8 @@ class ContactSession:
                 outcome = "uncertain"
                 if turn.completion is not None and not turn.completion.done():
                     turn.completion.set_exception(exc)
+                if turn.future is not None and not turn.future.done():
+                    turn.future.set_exception(exc)
                 await self.receipt(turn.mode, turn.reply_meta or {}, outcome)
                 if turn.checkpoint is None:
                     await self.notify_activity(turn.mode, turn.reply_meta or {}, "failed")

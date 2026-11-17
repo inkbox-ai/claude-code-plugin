@@ -1,6 +1,8 @@
 import asyncio
 from unittest.mock import AsyncMock
 
+import pytest
+
 from inkbox_claude import managed_work
 from inkbox_claude.sessions import _Turn
 from tests.test_sessions import make_session
@@ -78,6 +80,10 @@ def test_terminal_reply_settlement_preserves_uncertain_delivery(tmp_path, monkey
         await session._drain()
         assert await work.done is expected
         assert sent == []
+        if not expected:
+            with pytest.raises(sessions._TerminalReplyUncertain):
+                await asyncio.wait_for(session.run_consult("Voice consult"), timeout=1)
+            assert sent == []
 
     asyncio.run(run(Mock(return_value={"state": "accepted"}), True))
     asyncio.run(run(Mock(return_value={"state": "pending", "submitted": True}), False))
