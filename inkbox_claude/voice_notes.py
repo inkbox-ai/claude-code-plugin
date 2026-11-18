@@ -48,7 +48,7 @@ def transcript_note(media: list[dict[str, Any]]) -> str:
     notes = []
     for index, item in enumerate(media, 1):
         result = item.get("transcription")
-        if not isinstance(result, dict):
+        if not isinstance(result, dict) or result.get("error_code") == "not_audio":
             continue
         if result.get("status") == "completed":
             text = str(result.get("text") or "").strip()
@@ -113,7 +113,7 @@ class VoiceNotes:
             "CREATE TABLE IF NOT EXISTS voice_notes (key TEXT PRIMARY KEY, original TEXT, completion TEXT, result TEXT, deadline REAL, direct INTEGER NOT NULL DEFAULT 0, polled INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT (unixepoch()))"
         )
         self.db.execute(
-            "DELETE FROM voice_notes WHERE created<? AND (done=1 OR original IS NULL)",
+            "DELETE FROM voice_notes WHERE created<? AND (done=1 OR original IS NULL OR (direct=0 AND result IS NOT NULL))",
             (time.time() - 7 * 86400,),
         )
         self.db.commit()

@@ -3,6 +3,7 @@
 import asyncio
 from copy import deepcopy
 import types
+import time
 
 import pytest
 
@@ -294,5 +295,40 @@ def test_payload_cannot_disable_the_standalone_wait(tmp_path, monkeypatch):
             assert state.tasks
         finally:
             await state.close()
+
+    asyncio.run(run())
+
+
+def test_non_audio_metadata_is_not_labelled_as_a_voice_note():
+    media = [{"transcription": {"status": "skipped", "error_code": "not_audio"}}]
+    assert transcript_note(media) == ""
+    media[0]["transcription"]["error_code"] = "unsupported_audio"
+    assert "transcript unavailable" in transcript_note(media)
+
+
+def test_startup_prunes_old_resolved_companion_rows_but_keeps_unresolved_work(tmp_path):
+    async def run():
+        async def deliver(_item):
+            raise AssertionError("Cleanup must not dispatch")
+
+        state = inbox(tmp_path, deliver)
+        old = int(time.time()) - 8 * 86400
+        for key, direct, result, created in [
+            ("old-resolved", 0, "{}", old),
+            ("old-unresolved", 0, None, old),
+            ("old-direct", 1, "{}", old),
+            ("recent-resolved", 0, "{}", int(time.time())),
+        ]:
+            state.db.execute("INSERT INTO voice_notes(key,original,direct,result,created) VALUES(?,?,?,?,?)",
+                             (key, "{}", direct, result, created))
+        state.db.commit()
+        await state.close()
+        reopened = inbox(tmp_path, deliver)
+        try:
+            assert {row[0] for row in reopened.db.execute("SELECT key FROM voice_notes")} == {
+                "old-unresolved", "old-direct", "recent-resolved",
+            }
+        finally:
+            await reopened.close()
 
     asyncio.run(run())
