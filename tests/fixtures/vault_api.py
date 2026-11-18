@@ -1,12 +1,13 @@
 """Synthetic encrypted Vault responses for SDK and host contract tests."""
 
+import json
+
 import httpx
 from inkbox.vault.crypto import (
     encrypt_payload,
     generate_org_encryption_key,
     generate_vault_key_material,
 )
-
 
 LOGIN_ID = "00000000-0000-4000-8000-000000000001"
 TOKEN_ID = "00000000-0000-4000-8000-000000000002"
@@ -44,8 +45,24 @@ class VaultAPI:
 
     def respond(self, request):
         self.requests.append(request)
-        assert request.method == "GET"
+        assert request.url.host == "api.example.com"
         assert request.headers["X-API-Key"] == "synthetic-agent-key"
+        if request.url.path == "/mcp":
+            assert request.method == "POST"
+            body = json.loads(request.content)
+            results = {
+                "server/discover": {"supportedVersions": ["2026-07-28"]},
+                "tools/list": {"tools": []},
+            }
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": body["id"], "result": results[body["method"]],
+            })
+        assert request.method == "GET"
+        if request.url.path == "/api/whoami":
+            return httpx.Response(200, json={
+                "auth_type": "api_key", "auth_subtype": "api_key.agent_scoped.claimed",
+                "organization_id": self.org_id,
+            })
         if request.url.path == "/api/v1/identities/example-agent":
             return httpx.Response(200, json={"id": IDENTITY_ID, "agent_handle": "example-agent",
                 "organization_id": self.org_id, "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00"})

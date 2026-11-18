@@ -389,26 +389,27 @@ wheels = [
 
 [[package]]
 name = "claude-agent-sdk"
-version = "0.2.132"
+version = "0.2.158"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "sniffio" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4d/1d/dbf95d13ff3d7dab474035ba5a58b94bb75d2f9b78eef5b1c578d9da20d3/claude_agent_sdk-0.2.132.tar.gz", hash = "sha256:efc54a6fac96232105a40b6aed870a482dea221151a3b3356c5c514a5844cf7f", size = 312206, upload-time = "2026-08-07T04:14:22.84Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/5c/1d348e677fb199978d2b559fb5822fc58d77927f0988d1eb2acc18d5a0bb/claude_agent_sdk-0.2.158.tar.gz", hash = "sha256:672ddb19df334e9cb80bb264a6ddf00870c8d4e170b3fd0a3cf0ce354f634e7f", size = 354570, upload-time = "2026-09-23T01:39:14.77Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2f/2c/77d9e3d03884b1ed0f34cfc6766960c2aed096de8bace1eef593ab900fbd/claude_agent_sdk-0.2.132-py3-none-macosx_11_0_arm64.whl", hash = "sha256:9162fd2675f366d376529b017fdff6dc522658f88c5f3c49afdd45d77228a4ef", size = 80319863, upload-time = "2026-08-07T04:14:27.073Z" },
-    { url = "https://files.pythonhosted.org/packages/40/e7/6644d29b1fafa25ef4872aebd0cd46577aff4674ad0faf48e1a566332694/claude_agent_sdk-0.2.132-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:1465ca52437921be79dfe1a4e5e1d35a2f850d5dbe5025256729de9befa7a62b", size = 85489278, upload-time = "2026-08-07T04:14:31.344Z" },
-    { url = "https://files.pythonhosted.org/packages/94/67/7f2ac654b919c99f16e68aaeb8bd19f8bac06cedd79c39362b3d5e547ccc/claude_agent_sdk-0.2.132-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:cd13af6ee4240b48fb01831a41248f57f3c83d235f218704f9a14e8c29af8a61", size = 89830986, upload-time = "2026-08-07T04:14:36.192Z" },
-    { url = "https://files.pythonhosted.org/packages/b4/78/7306f398ac3f605211b13c4b02119e91e31c0c566a37ec8e4db243a5b6c7/claude_agent_sdk-0.2.132-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:a1085b8be7fcda441cfb1c86966e008ba72d4d2f6e20da5466bebb15c4765b55", size = 90914461, upload-time = "2026-08-07T04:14:40.815Z" },
-    { url = "https://files.pythonhosted.org/packages/95/d4/7296a1533233a1542dbdb7844efc81f3106eee6f037b0d542cecfd16a3b8/claude_agent_sdk-0.2.132-py3-none-win_amd64.whl", hash = "sha256:4860d059b89d0394acce8a7e767ea1b2da4fa73c07cf5c0ccdd86aa7ad5173ba", size = 90506408, upload-time = "2026-08-07T04:14:45.582Z" },
+    { url = "https://files.pythonhosted.org/packages/89/ad/37559b5a12170699eb6d4c5e1c66f491c4a3d7366f8f300a8dba0fc40aec/claude_agent_sdk-0.2.158-py3-none-macosx_11_0_arm64.whl", hash = "sha256:d124bd374dfbbcbdb4326e922f30d436251ae469df9cae545ef8ff6839d76e47", size = 90406616, upload-time = "2026-09-23T01:39:18.829Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/52/21968fc645ee206bb260f18b26ae8ae035fc5af820a7820b01e308496510/claude_agent_sdk-0.2.158-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:beb963aa66eac715ff005e44ff02065fd5d855a10a47bc802097a31a522e6be3", size = 94751713, upload-time = "2026-09-23T01:39:22.591Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/4b/b42ab1a7ba32cea66184dedf8da158d49d00d6af753bd48998dab6e7a1d6/claude_agent_sdk-0.2.158-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:12f432273c3f0da103ea8dc921c3ce96e802c044e1f3f2535cf98b7d59777aa7", size = 99897552, upload-time = "2026-09-23T01:39:26.933Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/eb/1b34083c59a09a1a380c211eacd1cb185de4adc4bdb1170997e37f53f6ca/claude_agent_sdk-0.2.158-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:1f46ddac2cb51f16b2ca064a0dbeeab7db712f34e72454cc7776713e0f0f663c", size = 100257803, upload-time = "2026-09-23T01:39:31.501Z" },
+    { url = "https://files.pythonhosted.org/packages/15/0d/11ab53934b04176180099a79bb186036e304e1fe1310bdecf21df599f1d3/claude_agent_sdk-0.2.158-py3-none-win_amd64.whl", hash = "sha256:b1e7f6b9d048c2c44e5228d6a0eeb19ae3aafb643c1115c456ea9937e0439aef", size = 102853711, upload-time = "2026-09-23T01:39:36.133Z" },
 ]
 
 [[package]]
 name = "claude-code-plugin"
-version = "0.2.17"
-source = { virtual = "." }
+version = "0.2.29"
+source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'" },
@@ -422,8 +423,8 @@ dependencies = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'", specifier = ">=0.2.1" },
-    { name = "claude-agent-sdk", specifier = ">=0.1.0" },
-    { name = "inkbox", specifier = ">=0.7.29,<1.0.0" },
+    { name = "claude-agent-sdk", specifier = "==0.2.158" },
+    { name = "inkbox", git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=84386f5ea022a9594fb901894f927ee444c2cf91" },
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "segno", specifier = ">=1.5" },
 ]
@@ -698,8 +699,8 @@ wheels = [
 
 [[package]]
 name = "inkbox"
-version = "0.7.29"
-source = { registry = "https://pypi.org/simple" }
+version = "0.7.39"
+source = { git = "https://github.com/inkbox-ai/inkbox.git?subdirectory=sdk%2Fpython&rev=84386f5ea022a9594fb901894f927ee444c2cf91#84386f5ea022a9594fb901894f927ee444c2cf91" }
 dependencies = [
     { name = "argon2-cffi" },
     { name = "certifi" },
@@ -707,10 +708,8 @@ dependencies = [
     { name = "h11" },
     { name = "h2" },
     { name = "httpx" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f8/5a/35a7a0da949d71089b9739490fc2746a05772b7f6c480d842ca520da4284/inkbox-0.7.29.tar.gz", hash = "sha256:1625f782369eb0b2bb70348dea2597f0944b23842368452d1712b9e68c13d4bf", size = 537032, upload-time = "2026-11-07T07:44:08.01Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/d1/d57ce9178ff93a04ee13e9773d9bb0ee2459bf9e2a2efdb573bc9c91771c/inkbox-0.7.29-py3-none-any.whl", hash = "sha256:d1f469186ea98a098e624df55163ad84fdc4f8b0ecabe8500a383486e3c8f079", size = 344308, upload-time = "2026-11-07T07:44:06.463Z" },
+    { name = "jsonschema" },
+    { name = "referencing" },
 ]
 
 [[package]]

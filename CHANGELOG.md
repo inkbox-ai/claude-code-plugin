@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.2.29
+
+- Resolve pending consults when final reply delivery cannot be confirmed.
+
+## 0.2.28
+
+- Pin Claude Code 2.1.280 through Claude Agent SDK 0.2.158 for Claude Opus 5.5.
+
+## 0.2.27
+
+- Keep inbound delivery unresolved when a final reply cannot be confirmed.
+
+## 0.2.26
+
+### Changed
+- Require Inkbox SDK 0.7.39 for durable messaging and remote tool handling.
+
+## 0.2.25
+
+### Fixed
+- Install the plugin and its CLI when syncing the locked Python environment.
+
+## 0.2.24
+
+- Make managed diagnostics use a recent runtime health report instead of terminal signing-key or ordinary webhook settings. Keep standalone checks and report unavailable runtime evidence.
+
+## 0.2.23
+
+- Accept empty MCP continuation input requests through the pinned SDK revision.
+
+- Keep contact and terminal-reply MCP arguments within the advertised schema while retaining durable operation identity and retry receipts.
+
+## 0.2.22
+
+- Advertise optional contact creation fields and string-only email and phone lists.
+- Distinguish invalid tool arguments from authorization failures and report bounded schema details without argument values.
+
+## 0.2.21
+
+- Report bounded MCP failure stages and categories without logging request or response contents.
+- Retry incomplete live-test call cleanup and verify calls have ended between tests.
+
+## 0.2.20
+
+- Deduplicate incoming message and call-completion retries by event ID even when each delivery has a new request ID.
+- Ignore the standard Inkbox email footer when handling approval and cancellation replies.
+
+## 0.2.19
+
+- Keep remote tools with conditional input schemas visible in the native tool catalog while retaining full argument validation before execution.
+
+## 0.2.18
+
+- Reuse valid tunnel certificates across reconnects and renew mismatched or expired state with Inkbox SDK 0.7.38 or newer.
+- Bound tunnel startup and reconcile cancelled attempts before reconnecting, including late listener cleanup.
+
 ## 0.2.17 (unreleased)
 
 - Support existing inbound-admitted WhatsApp groups, conversation-isolated context, native mentions and readable mention names in groups and direct chats.

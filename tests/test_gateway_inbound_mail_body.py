@@ -183,3 +183,19 @@ def test_absent_body_falls_back_to_the_fetch_then_the_snippet():
     assert identity.calls == ["mail-in-1"]
     body, _, _ = gw.sessions.by_id[next(iter(gw.sessions.by_id))].inbound[0]
     assert body == SNIPPET
+
+
+@pytest.mark.parametrize("decision", ["1", "2", "3", "/stop"])
+def test_email_footer_does_not_obscure_control_replies(decision):
+    gw = _gw()
+    body = decision + "\n\nSent via Inkbox (https://inkbox.ai)\n"
+    asyncio.run(gw._on_mail_received(_envelope(body=body, body_state="complete")))
+    text, mode, _ = next(iter(gw.sessions.by_id.values())).inbound[0]
+    assert (text, mode) == (decision, "email")
+
+
+def test_footer_text_inside_message_is_preserved():
+    gw = _gw()
+    body = "Explain Sent via Inkbox (https://inkbox.ai) please."
+    asyncio.run(gw._on_mail_received(_envelope(body=body, body_state="complete")))
+    assert next(iter(gw.sessions.by_id.values())).inbound[0][0] == body

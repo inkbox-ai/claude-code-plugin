@@ -470,3 +470,34 @@ def test_a2a_tool_presence_is_boolean_only_and_search_is_named(tmp_path):
     assert rows[0]['a2a_tools'] == {name: name == 'inkbox_a2a_call' for name in diagnostics.A2A_TOOLS}
     assert rows[1]['tool'] == 'ToolSearch'
     assert SECRET not in path.read_text()
+
+
+def test_mcp_failure_report_keeps_only_fixed_categories(tmp_path, capsys):
+    path = tmp_path / "gateway.log"
+    path.write_text(
+        f"WARNING private payload {SECRET}\n"
+        "WARNING MCP request failed stage=remote_preflight category=schema binding=matched schema=failed\n"
+        f"WARNING MCP request failed stage={SECRET} category=schema binding=matched schema=failed\n"
+        f"WARNING MCP request failed stage=binding category=remote_tool binding=missing schema=unchecked {SECRET}\n"
+    )
+    diagnostics.report_mcp_failures(path)
+    output = capsys.readouterr().out
+    assert SECRET not in output
+    assert json.loads(output) == {"mcp_failure": {
+        "stage": "remote_preflight", "category": "schema", "binding": "matched", "schema": "failed",
+    }}
+
+
+def test_mcp_schema_report_excludes_values_and_unknown_field_names(tmp_path, capsys):
+    path = tmp_path / "gateway.log"
+    path.write_text(
+        "WARNING MCP schema failure field=contact.emails.item.value rule=type actual=object\n"
+        f"WARNING MCP schema failure field={SECRET} rule=type actual=object\n"
+        f"WARNING MCP schema failure field=contact rule=type actual={SECRET}\n"
+    )
+    diagnostics.report_mcp_failures(path)
+    output = capsys.readouterr().out
+    assert SECRET not in output
+    assert json.loads(output) == {"mcp_schema_failure": {
+        "field": "contact.emails.item.value", "rule": "type", "actual": "object",
+    }}

@@ -351,10 +351,41 @@ def report(path):
     print(json.dumps({"phase_counts": dict(sorted(counts.items()))}, sort_keys=True))
 
 
+def report_mcp_failures(path):
+    pattern = re.compile(
+        r"MCP request failed stage=(decode|dispatch|arguments|binding|conversion|"
+        r"remote_preflight|turn_validation|remote_request|terminal_reply|local_request) "
+        r"category=(schema|remote_tool|journal|timeout|transport|io|missing_field|type|value|other) "
+        r"binding=(unchecked|missing|matched|mismatch) schema=(unchecked|passed|failed)$"
+    )
+    field = r"(?:root|unknown|other|item|contact|patch|contact_id|idempotency_key|given_name|family_name|preferred_name|company_name|job_title|notes|emails|phones|value|value_e164|label|is_primary)"
+    schema_pattern = re.compile(
+        rf"MCP schema failure field=({field}(?:\.{field}){{0,5}}) "
+        r"rule=(unknown|other|type|required|additionalProperties|anyOf|oneOf|allOf|format|pattern|enum|maxLength|minLength|maxItems|minItems) "
+        r"actual=(unknown|other|string|object|array|boolean|number|null)$"
+    )
+    try:
+        with Path(path).open() as stream:
+            for line in stream:
+                detail = schema_pattern.search(line.rstrip("\n"))
+                if detail:
+                    print(json.dumps({"mcp_schema_failure": dict(zip(
+                        ("field", "rule", "actual"), detail.groups(),
+                    ))}, sort_keys=True))
+                match = pattern.search(line.rstrip("\n"))
+                if match:
+                    print(json.dumps({"mcp_failure": dict(zip(
+                        ("stage", "category", "binding", "schema"), match.groups(),
+                    ))}, sort_keys=True))
+    except OSError:
+        print("MCP failure diagnostics unavailable.")
+
+
 if __name__ == "__main__":
     path = os.environ.get("INKBOX_CI_TRACE_FILE", "/tmp/inkbox-ci-lifecycle.jsonl")
     if sys.argv[1:] == ["report"]:
         report(path)
+        report_mcp_failures(os.environ.get("GATEWAY_LOG", "/tmp/gateway.log"))
     else:
         from inkbox_claude.daemon import run_foreground
         raise SystemExit(run_gateway(path, run_foreground))
