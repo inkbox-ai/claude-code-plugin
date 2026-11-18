@@ -21,7 +21,7 @@ EVENTS = [
     "whatsapp.delivery_failed",
     "whatsapp.delivery_unconfirmed",
     "whatsapp.reaction_received",
-    "whatsapp.transcription_finished",
+
 ]
 
 logger = logging.getLogger(__name__)

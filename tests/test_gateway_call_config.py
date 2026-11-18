@@ -190,12 +190,14 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
     )
 
     assert [created["event_types"] for created in subscriptions.created] == [
+        gateway.TRANSCRIPTION_EVENTS,
         gateway.A2A_EVENTS,
         gateway.CALL_EVENTS,
         gateway.IMESSAGE_EVENTS,
         WHATSAPP_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.example/webhook",
         "https://agent.example/webhook",
         "https://agent.example/webhook",
         "https://agent.example/webhook",
@@ -217,6 +219,7 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
 
     assert subscriptions.deleted == []
     assert [created["event_types"] for created in subscriptions.created] == [
+        gateway.TRANSCRIPTION_EVENTS,
         gateway.CALL_EVENTS,
         gateway.IMESSAGE_EVENTS,
         WHATSAPP_EVENTS,
@@ -230,7 +233,7 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert [created["event_types"] for created in subscriptions.created] == [gateway.CALL_EVENTS, WHATSAPP_EVENTS]
+    assert [created["event_types"] for created in subscriptions.created] == [gateway.TRANSCRIPTION_EVENTS, gateway.CALL_EVENTS, WHATSAPP_EVENTS]
 
 
 def test_old_api_rejecting_whatsapp_keeps_other_subscriptions():
@@ -241,7 +244,7 @@ def test_old_api_rejecting_whatsapp_keeps_other_subscriptions():
             return super().create(**kwargs)
     subscriptions = OlderAPI()
     _patched_gateway(_Identity(phone=None, imessage_enabled=True), subscriptions=subscriptions)
-    assert [item["event_types"] for item in subscriptions.created] == [gateway.A2A_EVENTS, gateway.CALL_EVENTS, gateway.IMESSAGE_EVENTS]
+    assert [item["event_types"] for item in subscriptions.created] == [gateway.TRANSCRIPTION_EVENTS, gateway.A2A_EVENTS, gateway.CALL_EVENTS, gateway.IMESSAGE_EVENTS]
 
 
 def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
@@ -272,7 +275,7 @@ def test_whatsapp_adopts_identity_scoped_receiver_without_rewriting_other_channe
             self.scoped_reads += 1
             foreign = types.SimpleNamespace(id="foreign", url="https://other.example/webhook",
                 event_types=WHATSAPP_EVENTS)
-            return [] if race and self.scoped_reads == 1 else [foreign, active]
+            return [] if race and self.scoped_reads == 2 else [foreign, active]
         def create(self, **kwargs):
             if kwargs["event_types"] == WHATSAPP_EVENTS:
                 self.attempts += 1

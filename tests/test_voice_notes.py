@@ -51,9 +51,8 @@ def envelope(
 def completion(original, status="completed"):
     result = deepcopy(original)
     result["id"] = "separate-completion-event"
-    result["event_type"] = result["event_type"].replace(
-        "received", "transcription_finished"
-    )
+    result["data"].update(channel=original["event_type"].split(".")[0], message_id=message_for(original)["id"])
+    result["event_type"] = "message.transcription_finished"
     for item in message_for(result)["media"]:
         item["transcription"] = {
             "status": status,
@@ -86,6 +85,10 @@ def test_pending_receipt_is_immediate_and_matching_completion_wakes_once(
         assert state.defer(original)  # No await: the HTTP handler can ACK now.
         assert state.defer(deepcopy(original))
         assert delivered == []
+        mismatched = completion(original)
+        mismatched["data"]["message_id"] = "different-source"
+        state.complete(mismatched)
+        assert state.db.execute("SELECT COUNT(*) FROM voice_notes WHERE completion IS NOT NULL").fetchone()[0] == 0
         state.complete(completion(original))
         await next(iter(state.tasks.values()))
         assert len(delivered) == 1
@@ -231,9 +234,8 @@ def test_terminal_and_legacy_messages_do_not_wait_and_silence_is_not_failure(tmp
 def test_subscription_catalogs_register_completion_events():
     from inkbox_claude.whatsapp import EVENTS
 
-    assert "text.transcription_finished" in gateway.TEXT_EVENTS
-    assert "imessage.transcription_finished" in gateway.IMESSAGE_EVENTS
-    assert "whatsapp.transcription_finished" in EVENTS
+    assert gateway.TRANSCRIPTION_EVENTS == ["message.transcription_finished"]
+    assert not set(gateway.TRANSCRIPTION_EVENTS).intersection(gateway.TEXT_EVENTS + gateway.IMESSAGE_EVENTS + list(EVENTS))
 
 
 @pytest.mark.parametrize("channel", ["text", "imessage", "whatsapp"])

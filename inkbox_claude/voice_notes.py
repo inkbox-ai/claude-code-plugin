@@ -18,20 +18,20 @@ RECEIVED = {
     "imessage.received": "imessage",
     "whatsapp.received": "whatsapp",
 }
-FINISHED = {
-    f"{channel}.transcription_finished": channel for channel in RECEIVED.values()
-}
+FINISHED = "message.transcription_finished"
 WAIT_SECONDS = 60.0
 POLL_SECONDS = 10.0
 
 
 def message_for(envelope: dict[str, Any]) -> dict[str, Any]:
     """Extract a channel's original message without changing its content."""
-    return (envelope.get("data") or {}).get(
-        "text_message"
-        if str(envelope.get("event_type", "")).startswith("text.")
-        else "message"
-    ) or {}
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        return {}
+    event_type = envelope.get("event_type")
+    channel = data.get("channel") if event_type == FINISHED else str(event_type).split(".", 1)[0]
+    message = data.get("text_message" if channel == "text" else "message")
+    return message if isinstance(message, dict) else {}
 
 
 def pending(message: dict[str, Any]) -> bool:
@@ -139,9 +139,15 @@ class VoiceNotes:
 
     def complete(self, envelope: dict[str, Any]) -> None:
         """A callback updates a receipt; it never creates an agent turn."""
-        channel = FINISHED.get(str(envelope.get("event_type")))
+        data = envelope.get("data")
+        if envelope.get("event_type") != FINISHED or not isinstance(data, dict):
+            return
+        channel = data.get("channel")
         message = message_for(envelope)
-        if not channel or message.get("direction") == "outbound" or pending(message):
+        if (channel not in RECEIVED.values() or not isinstance(data.get("message_id"), str)
+                or data["message_id"] != message.get("id")):
+            return
+        if message.get("direction") == "outbound" or pending(message):
             return
         key = self.key(channel, message)
         if not key:

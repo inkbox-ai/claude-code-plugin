@@ -21,6 +21,7 @@ The bridge's runtime core:
 from __future__ import annotations
 
 from . import managed_work
+from .voice_notes import FINISHED
 
 import asyncio
 import hashlib
@@ -657,13 +658,19 @@ SMS_CONTROL_WORDS = {"stop", "start", "help", "unstop", "unsubscribe", "cancel",
 # outbound delivery-failure loop. The success transitions (sent/delivered)
 # stay unsubscribed — they would pay signature cost on every outbound email
 # for no behaviour; the failure counter falls back to inbound-reset + TTL.
+TRANSCRIPTION_EVENTS = [FINISHED]
+
+
+def _subscription_family(event_type: str) -> str:
+    return event_type if event_type in TRANSCRIPTION_EVENTS else event_type.split(".", 1)[0]
+
+
 MAIL_EVENTS = ["message.received", "message.bounced", "message.failed"]
 # Text/iMessage: inbound plus the outbound delivery lifecycle. ``*.delivered``
 # clears the failed-send budget; ``*.delivery_failed`` feeds the loop. ``sent``
 # is subscribed for parity but only logged.
 TEXT_EVENTS = [
     "text.received",
-    "text.transcription_finished",
     "text.sent",
     "text.delivered",
     "text.delivery_failed",
@@ -671,7 +678,6 @@ TEXT_EVENTS = [
 ]
 IMESSAGE_EVENTS = [
     "imessage.received",
-    "imessage.transcription_finished",
     "imessage.sent",
     "imessage.delivered",
     "imessage.delivery_failed",
@@ -1005,12 +1011,12 @@ class InkboxGateway:
             subscription_url: str = webhook_url,
         ) -> None:
             desired_families = {
-                event_type.split(".", 1)[0] for event_type in event_types
+                _subscription_family(event_type) for event_type in event_types
             }
             # The legacy identity view omits WhatsApp and mixed receivers.
             # Limit the wider view to this channel; existing channels retain
             # their reconciliation behavior.
-            identity_scope = desired_families == {"whatsapp"}
+            identity_scope = desired_families == {"whatsapp"} or event_types == TRANSCRIPTION_EVENTS
             list_kw = {**owner_kw, **({"scope": "identity"} if identity_scope else {})}
             existing = self._inkbox.webhooks.subscriptions.list(**list_kw)
             for sub in existing:
@@ -1022,7 +1028,7 @@ class InkboxGateway:
                     return  # already wired
             for sub in existing:
                 existing_families = {
-                    event_type.split(".", 1)[0] for event_type in sub.event_types
+                    _subscription_family(event_type) for event_type in sub.event_types
                 }
                 if (
                     sub.url.split("?", 1)[0].endswith(DEFAULT_WEBHOOK_PATH)
@@ -1050,6 +1056,12 @@ class InkboxGateway:
                         return
                 raise
 
+        try:
+            _reconcile({"agent_identity_id": identity.id}, TRANSCRIPTION_EVENTS)
+        except ValueError as exc:
+            if not str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet."):
+                raise
+            logger.warning("Transcription callbacks are unavailable on this API version")
         if identity.mailbox is not None:
             _reconcile({"mailbox_id": identity.mailbox.id}, MAIL_EVENTS)
             logger.info("[bridge] mailbox %s → %s", identity.mailbox.email_address, webhook_url)
@@ -1683,8 +1695,8 @@ class InkboxGateway:
         return await receive(self, envelope)
 
     def _voice_note_receipt(self, event_type, envelope):
-        from .voice_notes import FINISHED, RECEIVED, message_for, pending
-        if event_type in FINISHED:
+        from .voice_notes import RECEIVED, message_for, pending
+        if event_type == FINISHED:
             self._voice_note_inbox().complete(envelope)
             return web.json_response({"ok": True})
         if event_type in RECEIVED and (pending(message_for(envelope)) or getattr(self, "_voice_note_state", None) is not None):
@@ -2043,8 +2055,7 @@ class InkboxGateway:
                     return web.Response(status=503, text="Companion delivery receipt is unavailable")
                 return web.json_response({"ok": True, "companion": "delivery_failed"})
 
-        from .voice_notes import FINISHED
-        if source == "inkbox" and envelope.get("event_type") in FINISHED:
+        if source == "inkbox" and envelope.get("event_type") == FINISHED:
             return self._voice_note_receipt(envelope["event_type"], envelope)
 
         data = envelope.get("data")
