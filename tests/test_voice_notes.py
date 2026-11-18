@@ -233,3 +233,66 @@ def test_subscription_catalogs_register_completion_events():
     assert "text.transcription_finished" in gateway.TEXT_EVENTS
     assert "imessage.transcription_finished" in gateway.IMESSAGE_EVENTS
     assert "whatsapp.transcription_finished" in EVENTS
+
+
+@pytest.mark.parametrize("channel", ["text", "imessage", "whatsapp"])
+def test_configured_hosted_runtime_does_not_wait_again(tmp_path, monkeypatch, channel):
+    monkeypatch.setenv("INKBOX_HOSTED_MODE", "1")
+
+    async def run():
+        async def deliver(item):
+            raise AssertionError("The normal consumer owns this turn")
+
+        state = inbox(tmp_path, deliver)
+        original = envelope(channel)
+        item = message_for(original)
+        try:
+            assert not state.defer(original)
+            assert await asyncio.wait_for(state.resolve_message(channel, item), 0.1) is item
+            assert not state.tasks
+            assert "transcript unavailable" in transcript_note(item["media"])
+            state.complete(completion(original))
+            state.recover()
+            assert not state.tasks
+        finally:
+            await state.close()
+
+    asyncio.run(run())
+
+
+def test_payload_cannot_claim_hosted_transcription_ownership(tmp_path, monkeypatch):
+    monkeypatch.delenv("INKBOX_HOSTED_MODE", raising=False)
+
+    async def run():
+        async def deliver(item):
+            raise AssertionError("Pending original should still wait")
+
+        state = inbox(tmp_path, deliver)
+        original = envelope()
+        original["hosted_delivery"] = {"version": 1}
+        try:
+            assert state.defer(original)
+            assert state.tasks
+        finally:
+            await state.close()
+
+    asyncio.run(run())
+
+
+def test_payload_cannot_disable_the_standalone_wait(tmp_path, monkeypatch):
+    monkeypatch.delenv("INKBOX_HOSTED_MODE", raising=False)
+
+    async def run():
+        async def deliver(item):
+            raise AssertionError("The pending message must wait")
+
+        state = inbox(tmp_path, deliver)
+        original = envelope()
+        original["hosted_delivery"] = {"starts_agent": True}
+        try:
+            assert state.defer(original)
+            assert state.tasks
+        finally:
+            await state.close()
+
+    asyncio.run(run())

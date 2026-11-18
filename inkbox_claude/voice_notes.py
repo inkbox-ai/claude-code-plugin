@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 import json
 import logging
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -129,6 +130,8 @@ class VoiceNotes:
 
     def recover(self) -> None:
         """Resume acknowledged originals, including already-resolved receipts."""
+        if os.getenv("INKBOX_HOSTED_MODE") == "1":
+            return
         for (key,) in self.db.execute(
             "SELECT key FROM voice_notes WHERE original IS NOT NULL AND direct=1 AND done=0"
         ).fetchall():
@@ -159,6 +162,8 @@ class VoiceNotes:
 
     def defer(self, envelope: dict[str, Any]) -> bool:
         """Commit pending ordinary input before returning the webhook receipt."""
+        if os.getenv("INKBOX_HOSTED_MODE") == "1":
+            return False
         channel = RECEIVED.get(str(envelope.get("event_type")))
         message = message_for(envelope)
         key = self.key(channel or "", message)
@@ -208,6 +213,8 @@ class VoiceNotes:
         self, channel: str, message: dict[str, Any]
     ) -> dict[str, Any]:
         """Wait inside an already-durable conversation consumer, not its ingress."""
+        if os.getenv("INKBOX_HOSTED_MODE") == "1":
+            return message
         key = self.key(channel, message)
         if not key or not pending(message):
             return message
