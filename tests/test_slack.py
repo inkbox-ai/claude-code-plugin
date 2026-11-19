@@ -575,8 +575,7 @@ def test_existing_message_subscription_extends_selection_for_native_stop(gw):
     client = connected_client()
     url = "https://agent.example/webhook"
     client.webhooks.subscriptions.list.return_value = [NS(
-        id="ours", url=url, status="active", event_types=[event for event in SLACK_SUBSCRIPTION_EVENTS
-                                                if event != "slack.session_stopped"],
+        id="ours", url=url, status="active", event_types=list(SLACK_INCOMING_EVENTS),
     )]
     reconcile_subscription(client, IDENTITY, url)
     client.webhooks.subscriptions.update.assert_called_once_with(
