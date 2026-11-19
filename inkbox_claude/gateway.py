@@ -21,6 +21,7 @@ The bridge's runtime core:
 from __future__ import annotations
 
 from . import managed_work
+from .voice_notes import FINISHED
 
 import asyncio
 import hashlib
@@ -657,6 +658,13 @@ SMS_CONTROL_WORDS = {"stop", "start", "help", "unstop", "unsubscribe", "cancel",
 # outbound delivery-failure loop. The success transitions (sent/delivered)
 # stay unsubscribed — they would pay signature cost on every outbound email
 # for no behaviour; the failure counter falls back to inbound-reset + TTL.
+TRANSCRIPTION_EVENTS = [FINISHED]
+
+
+def _subscription_family(event_type: str) -> str:
+    return event_type if event_type in TRANSCRIPTION_EVENTS else event_type.split(".", 1)[0]
+
+
 MAIL_EVENTS = ["message.received", "message.bounced", "message.failed"]
 # Text/iMessage: inbound plus the outbound delivery lifecycle. ``*.delivered``
 # clears the failed-send budget; ``*.delivery_failed`` feeds the loop. ``sent``
@@ -686,6 +694,23 @@ A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 A2A_STOPPED_STATES = A2A_TERMINAL_STATES | {"input_required", "auth_required"}
 _A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 _A2A_RETRY_INTERVAL_SECONDS = 5.0
+
+
+def _transcription_subscription_unsupported(exc: Exception) -> bool:
+    if isinstance(exc, ValueError):
+        return str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet.")
+    errors = getattr(exc, "detail", None)
+    if getattr(exc, "status_code", None) != 422 or not isinstance(errors, list) or not errors:
+        return False
+    # The API reports one enum error per channel when none recognize the event.
+    return all(
+        isinstance(error, dict)
+        and error.get("type") == "enum"
+        and isinstance(error.get("loc"), list)
+        and error["loc"][:3] == ["body", "event_types", 0]
+        and error.get("input") == FINISHED
+        for error in errors
+    )
 
 
 def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
@@ -787,6 +812,7 @@ class InkboxGateway:
         self._public_host: str = ""
         self._runner: Any = None
         self.sessions: Optional[SessionManager] = None
+        self._voice_note_closing = False
         self._slack_activity = None
         self._channel_stores = {}
         self._runtime_ready = False
@@ -879,6 +905,9 @@ class InkboxGateway:
             self._self_addresses.add(identity_info["email"].lower())
 
         # Local webhook server first, so the tunnel has something to hit.
+        # Load receipt ownership before a replay with refreshed attachment
+        # metadata can reach the ordinary channel handler.
+        self._voice_note_inbox()
         await self._start_http_server()
 
         if self.cfg.public_url:
@@ -918,6 +947,7 @@ class InkboxGateway:
             fence_fn=self._record_host_fence,
         )
         self._companion_receiver().recover()
+        self._voice_note_inbox().recover()
         await self._recover_channel_inputs()
         self._runtime_ready = True
         await self._catch_up_a2a_tasks()
@@ -1001,14 +1031,43 @@ class InkboxGateway:
             subscription_url: str = webhook_url,
         ) -> None:
             desired_families = {
-                event_type.split(".", 1)[0] for event_type in event_types
+                _subscription_family(event_type) for event_type in event_types
             }
             # The legacy identity view omits WhatsApp and mixed receivers.
             # Limit the wider view to this channel; existing channels retain
             # their reconciliation behavior.
-            identity_scope = desired_families == {"whatsapp"}
+            identity_scope = desired_families == {"whatsapp"} or event_types == TRANSCRIPTION_EVENTS
             list_kw = {**owner_kw, **({"scope": "identity"} if identity_scope else {})}
             existing = self._inkbox.webhooks.subscriptions.list(**list_kw)
+            if desired_families == {"whatsapp"}:
+                # Disjoint subscriptions may share a URL. Create only the difference;
+                # replacing a shared row could discard another registrant's events.
+                wanted = list(event_types)
+                while True:
+                    covering = [
+                        row for row in existing
+                        if row.url == subscription_url and any(event in wanted for event in row.event_types)
+                    ]
+                    covered = {event for row in covering for event in row.event_types}
+                    missing = [event for event in wanted if event not in covered]
+                    if not missing:
+                        return
+                    try:
+                        self._inkbox.webhooks.subscriptions.create(
+                            url=subscription_url, event_types=missing, **owner_kw
+                        )
+                        return
+                    except Exception as exc:
+                        if getattr(exc, "status_code", None) != 409:
+                            raise
+                        existing = self._inkbox.webhooks.subscriptions.list(**list_kw)
+                        if not any(
+                            row.url == subscription_url and event in missing
+                            for row in existing for event in row.event_types
+                        ):
+                            raise
+                        wanted = missing
+
             for sub in existing:
                 if (
                     sub.url == subscription_url
@@ -1018,7 +1077,7 @@ class InkboxGateway:
                     return  # already wired
             for sub in existing:
                 existing_families = {
-                    event_type.split(".", 1)[0] for event_type in sub.event_types
+                    _subscription_family(event_type) for event_type in sub.event_types
                 }
                 if (
                     sub.url.split("?", 1)[0].endswith(DEFAULT_WEBHOOK_PATH)
@@ -1046,6 +1105,12 @@ class InkboxGateway:
                         return
                 raise
 
+        try:
+            _reconcile({"agent_identity_id": identity.id}, TRANSCRIPTION_EVENTS)
+        except Exception as exc:
+            if not _transcription_subscription_unsupported(exc):
+                raise
+            logger.warning("Transcription callbacks are unavailable on this API version")
         if identity.mailbox is not None:
             _reconcile({"mailbox_id": identity.mailbox.id}, MAIL_EVENTS)
             logger.info("[bridge] mailbox %s → %s", identity.mailbox.email_address, webhook_url)
@@ -1655,7 +1720,40 @@ class InkboxGateway:
             )
             logger.exception("[bridge] hosted call completion failed call_id=%s", call_id)
 
+    def _voice_note_inbox(self):
+        if getattr(self, "_voice_note_closing", False):
+            raise RuntimeError("Voice-note intake is shutting down")
+        from .voice_notes import VoiceNotes, inbox_path
+        inbox = getattr(self, "_voice_note_state", None)
+        if inbox is None:
+            inbox = self._voice_note_state = VoiceNotes(
+                inbox_path(str(self._identity.id)), self._identity,
+                self._inkbox, self._deliver_voice_note,
+                ready=lambda: self.sessions is not None and self._identity is not None,
+            )
+        return inbox
+
+    async def _deliver_voice_note(self, envelope):
+        event_type = envelope.get("event_type")
+        if event_type == "text.received":
+            return await self._on_text_received(envelope)
+        if event_type == "imessage.received":
+            return await self._on_imessage_received(envelope)
+        from .whatsapp import receive
+        return await receive(self, envelope)
+
+    def _voice_note_receipt(self, event_type, envelope):
+        from .voice_notes import RECEIVED, message_for, pending
+        if event_type == FINISHED:
+            self._voice_note_inbox().complete(envelope)
+            return web.json_response({"ok": True})
+        if event_type in RECEIVED and (pending(message_for(envelope)) or getattr(self, "_voice_note_state", None) is not None):
+            if self._voice_note_inbox().defer(envelope):
+                return web.json_response({"ok": True, "pending_transcription": True})
+        return None
+
     async def _cleanup(self) -> None:
+        self._voice_note_closing = True
         self._closing = True
         if self._companion is not None:
             await self._companion.close()
@@ -1687,6 +1785,9 @@ class InkboxGateway:
             task.cancel()
         if jobs:
             await asyncio.gather(*jobs, return_exceptions=True)
+        if getattr(self, "_voice_note_state", None) is not None:
+            await self._voice_note_state.close()
+            self._voice_note_state = None
         if self.sessions is not None:
             await self.sessions.close_all()
         self._runtime_ready = False
@@ -1965,10 +2066,11 @@ class InkboxGateway:
         # Trusted source label. ``None`` means no registered provider claimed
         # the request — an unknown/unverifiable third party.
         source = provider.name if provider is not None else None
-        if str(envelope.get("event_type") or "").startswith("whatsapp."):
+        event_type = str(envelope.get("event_type") or "")
+        if event_type == FINISHED or event_type.startswith("whatsapp."):
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
-                return web.Response(status=401, text="WhatsApp events require a valid signature")
+                return web.Response(status=401, text="This event requires a valid Inkbox signature")
         if str(envelope.get("event_type") or "").startswith("slack."):
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
@@ -2001,6 +2103,9 @@ class InkboxGateway:
                 except RuntimeError:
                     return web.Response(status=503, text="Companion delivery receipt is unavailable")
                 return web.json_response({"ok": True, "companion": "delivery_failed"})
+
+        if source == "inkbox" and envelope.get("event_type") == FINISHED:
+            return self._voice_note_receipt(envelope["event_type"], envelope)
 
         data = envelope.get("data")
         has_companion = envelope.get("companion") is not None
@@ -2040,7 +2145,10 @@ class InkboxGateway:
                 # delivery — a forwarded external event can be Inkbox-signed
                 # too. Those don't match a known shape, so they fall through to
                 # the external branch below rather than getting swallowed here.
-                if not event_type:
+                voice_receipt = self._voice_note_receipt(event_type, envelope)
+                if voice_receipt is not None:
+                    response = voice_receipt
+                elif not event_type:
                     # Incoming-call payloads are flat (no envelope); with
                     # auto_accept this is informational, but it can carry
                     # resolved contact context before the WS starts.
@@ -3085,6 +3193,8 @@ class InkboxGateway:
         """
         if not media:
             return text
+        from .voice_notes import transcript_note
+        text += transcript_note(media)
         saved = await download_media(media, prefix=prefix)
         return (text + inbound_media_note(saved)).strip()
 

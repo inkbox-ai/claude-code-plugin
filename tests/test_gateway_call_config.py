@@ -190,12 +190,14 @@ def test_a2a_and_imessage_use_channel_coherent_subscriptions():
     )
 
     assert [created["event_types"] for created in subscriptions.created] == [
+        gateway.TRANSCRIPTION_EVENTS,
         gateway.A2A_EVENTS,
         gateway.CALL_EVENTS,
         gateway.IMESSAGE_EVENTS,
         WHATSAPP_EVENTS,
     ]
     assert [created["url"] for created in subscriptions.created] == [
+        "https://agent.example/webhook",
         "https://agent.example/webhook",
         "https://agent.example/webhook",
         "https://agent.example/webhook",
@@ -217,6 +219,7 @@ def test_imessage_reconcile_preserves_existing_a2a_channel_subscription():
 
     assert subscriptions.deleted == []
     assert [created["event_types"] for created in subscriptions.created] == [
+        gateway.TRANSCRIPTION_EVENTS,
         gateway.CALL_EVENTS,
         gateway.IMESSAGE_EVENTS,
         WHATSAPP_EVENTS,
@@ -230,7 +233,38 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
         subscriptions=subscriptions,
     )
 
-    assert [created["event_types"] for created in subscriptions.created] == [gateway.CALL_EVENTS, WHATSAPP_EVENTS]
+    assert [created["event_types"] for created in subscriptions.created] == [gateway.TRANSCRIPTION_EVENTS, gateway.CALL_EVENTS, WHATSAPP_EVENTS]
+
+
+def test_unsupported_transcription_event_does_not_block_existing_channels():
+    from inkbox.exceptions import InkboxAPIError
+
+    class OlderAPI(_FakeSubscriptions):
+        def create(self, **kwargs):
+            if kwargs["event_types"] == gateway.TRANSCRIPTION_EVENTS:
+                raise InkboxAPIError(422, [{
+                    "type": "enum", "loc": ["body", "event_types", 0, family],
+                    "input": "message.transcription_finished",
+                } for family in ("MailWebhookEventType", "IMessageWebhookEventType")])
+            super().create(**kwargs)
+
+    subscriptions = OlderAPI()
+    _patched_gateway(_Identity(phone=_phone(), imessage_enabled=True), subscriptions=subscriptions)
+    assert [row["event_types"] for row in subscriptions.created] == [
+        gateway.TEXT_EVENTS, gateway.A2A_EVENTS, gateway.CALL_EVENTS,
+        gateway.IMESSAGE_EVENTS, WHATSAPP_EVENTS,
+    ]
+
+
+def test_transcription_subscription_does_not_hide_unrelated_validation_failure():
+    from inkbox.exceptions import InkboxAPIError
+
+    class InvalidURL(_FakeSubscriptions):
+        def create(self, **kwargs):
+            raise InkboxAPIError(422, [{"type": "url_scheme", "loc": ["body", "url"]}])
+
+    with pytest.raises(InkboxAPIError):
+        _patched_gateway(_Identity(), subscriptions=InvalidURL())
 
 
 def test_old_api_rejecting_whatsapp_keeps_other_subscriptions():
@@ -241,7 +275,7 @@ def test_old_api_rejecting_whatsapp_keeps_other_subscriptions():
             return super().create(**kwargs)
     subscriptions = OlderAPI()
     _patched_gateway(_Identity(phone=None, imessage_enabled=True), subscriptions=subscriptions)
-    assert [item["event_types"] for item in subscriptions.created] == [gateway.A2A_EVENTS, gateway.CALL_EVENTS, gateway.IMESSAGE_EVENTS]
+    assert [item["event_types"] for item in subscriptions.created] == [gateway.TRANSCRIPTION_EVENTS, gateway.A2A_EVENTS, gateway.CALL_EVENTS, gateway.IMESSAGE_EVENTS]
 
 
 def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
@@ -261,7 +295,7 @@ def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
 def test_whatsapp_adopts_identity_scoped_receiver_without_rewriting_other_channels(race, mixed):
     from inkbox.exceptions import InkboxAPIError
     active = types.SimpleNamespace(id="wa-active", url="https://agent.example/webhook",
-        event_types=[*WHATSAPP_EVENTS, *(["a2a.task.created"] if mixed else [])])
+        event_types=[*WHATSAPP_EVENTS, "whatsapp.future", *(["a2a.task.created"] if mixed else [])])
     class Subscriptions(_FakeSubscriptions):
         scoped_reads = 0
         attempts = 0
@@ -272,7 +306,7 @@ def test_whatsapp_adopts_identity_scoped_receiver_without_rewriting_other_channe
             self.scoped_reads += 1
             foreign = types.SimpleNamespace(id="foreign", url="https://other.example/webhook",
                 event_types=WHATSAPP_EVENTS)
-            return [] if race and self.scoped_reads == 1 else [foreign, active]
+            return [] if race and self.scoped_reads == 2 else [foreign, active]
         def create(self, **kwargs):
             if kwargs["event_types"] == WHATSAPP_EVENTS:
                 self.attempts += 1
@@ -280,25 +314,21 @@ def test_whatsapp_adopts_identity_scoped_receiver_without_rewriting_other_channe
             return super().create(**kwargs)
     subscriptions = Subscriptions()
     _patched_gateway(_Identity(), subscriptions=subscriptions)
+    _patched_gateway(_Identity(), subscriptions=subscriptions)
     assert subscriptions.attempts == int(race)
     assert subscriptions.deleted == []
     assert all(item["event_types"] != WHATSAPP_EVENTS for item in subscriptions.created)
 
 
 def test_whatsapp_incomplete_shared_receiver_is_not_deleted_or_truncated():
-    from inkbox.exceptions import InkboxAPIError
     shared = types.SimpleNamespace(id="shared", url="https://agent.example/webhook",
         event_types=["whatsapp.received", "a2a.task.created"])
     class Subscriptions(_FakeSubscriptions):
         def list(self, **owner):
             return [shared] if owner.get("scope") == "identity" else []
-        def create(self, **kwargs):
-            if kwargs["event_types"] == WHATSAPP_EVENTS:
-                raise InkboxAPIError(409, "Events already subscribed")
-            return super().create(**kwargs)
     subscriptions = Subscriptions()
-    with pytest.raises(InkboxAPIError):
-        _patched_gateway(_Identity(), subscriptions=subscriptions)
+    _patched_gateway(_Identity(), subscriptions=subscriptions)
+    assert subscriptions.created[-1]["event_types"] == [e for e in WHATSAPP_EVENTS if e != "whatsapp.received"]
     assert subscriptions.deleted == []
 
 

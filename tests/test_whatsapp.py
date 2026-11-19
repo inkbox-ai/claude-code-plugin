@@ -198,8 +198,9 @@ def test_ordinary_reply_uses_stable_key_and_never_replays_after_send_checkpoint(
     assert client.whatsapp._http.post.call_count == 3
 
 
+@pytest.mark.parametrize("event_type", ["whatsapp.delivery_unconfirmed", "message.transcription_finished"])
 def test_statuses_require_signature_even_when_generic_verification_disabled_and_never_wake(
-    setup, monkeypatch
+    setup, monkeypatch, event_type
 ):
     gw, session, _ = setup
     gw.cfg.external_events_enabled = True
@@ -208,7 +209,7 @@ def test_statuses_require_signature_even_when_generic_verification_disabled_and_
     gw._on_external_event = AsyncMock()
     payload = {
         **event(),
-        "event_type": "whatsapp.delivery_unconfirmed",
+        "event_type": event_type,
         "data": {"message": MESSAGE_WIRE},
     }
 
@@ -223,6 +224,9 @@ def test_statuses_require_signature_even_when_generic_verification_disabled_and_
             return json.dumps(payload).encode()
 
     assert asyncio.run(gw._handle_webhook(Request())).status == 401
+    if event_type == "message.transcription_finished":
+        session.handle_inbound.assert_not_called()
+        return
     provider.verify.return_value = True
     assert asyncio.run(gw._handle_webhook(Request())).status == 200
     session.handle_inbound.assert_not_called()

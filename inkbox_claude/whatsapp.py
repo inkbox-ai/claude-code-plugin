@@ -21,6 +21,7 @@ EVENTS = [
     "whatsapp.delivery_failed",
     "whatsapp.delivery_unconfirmed",
     "whatsapp.reaction_received",
+
 ]
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,7 @@ async def render_reply_context(gateway, item):
 
 async def with_media(gateway, message, text):
     """Refresh owned attachments and preserve native inputs for both receive paths."""
+    from .voice_notes import transcript_note
     media = message.get("media") or []
     if not media:
         return text, []
@@ -228,6 +230,7 @@ async def with_media(gateway, message, text):
         if field(fresh, "status") == "ready" and field(fresh, "url"):
             refreshed.append(
                 {
+                    "transcription": item.get("transcription"),
                     "url": field(fresh, "url"),
                     "content_type": field(fresh, "content_type"),
                     "size": field(fresh, "size"),
