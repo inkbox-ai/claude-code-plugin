@@ -2018,10 +2018,11 @@ class InkboxGateway:
         # Trusted source label. ``None`` means no registered provider claimed
         # the request — an unknown/unverifiable third party.
         source = provider.name if provider is not None else None
-        if str(envelope.get("event_type") or "").startswith("whatsapp."):
+        event_type = str(envelope.get("event_type") or "")
+        if event_type == FINISHED or event_type.startswith("whatsapp."):
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
-                return web.Response(status=401, text="WhatsApp events require a valid signature")
+                return web.Response(status=401, text="This event requires a valid Inkbox signature")
         if str(envelope.get("event_type") or "").startswith("slack."):
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
