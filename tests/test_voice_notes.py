@@ -662,3 +662,56 @@ def test_unsupported_completion_error_is_recognized_at_any_event_position():
     assert transcription_unsupported(error)
     error.detail[0]["input"] = "slack.dm_received"
     assert not transcription_unsupported(error)
+
+
+def test_slack_connection_read_failure_retries_without_polling_again(tmp_path, monkeypatch):
+    from inkbox_claude.voice_notes import VoiceNoteNotAdmitted
+    import inkbox_claude.voice_notes as voice_notes
+
+    monkeypatch.setattr(voice_notes, "RETRY_SECONDS", 0.01)
+
+    async def run():
+        attempts, reads = [], []
+
+        def get(path, **kwargs):
+            reads.append(path)
+            return {"messages": [{"id": SLACK_MESSAGE, "connection_id": SLACK_CONNECTION,
+                                  "conversation_id": "D_TEST", "files": slack_files("completed")}]}
+
+        async def deliver(item):
+            attempts.append(item)
+            if len(attempts) < 3:
+                raise VoiceNoteNotAdmitted("connection read failed")
+
+        state = inbox(tmp_path, deliver, wait=0,
+                      client=types.SimpleNamespace(_api_http=types.SimpleNamespace(get=get)))
+        state.defer(slack_envelope())
+        await next(iter(state.tasks.values()))
+        assert len(attempts) == 3 and len(reads) == 1
+        assert attempts[-1]["data"]["event"]["files"][0]["transcription"]["status"] == "completed"
+        assert state.db.execute("SELECT done FROM voice_notes").fetchone() == (1,)
+        await state.close()
+
+    asyncio.run(run())
+
+
+def test_gateway_marks_transient_slack_connection_reads_as_not_admitted():
+    from inkbox_claude.config import BridgeConfig
+    from inkbox_claude.slack import inbound_message
+    from inkbox_claude.voice_notes import VoiceNoteNotAdmitted
+
+    async def run():
+        bridge = object.__new__(gateway.InkboxGateway)
+        bridge.cfg = BridgeConfig(slack_enabled=True)
+        bridge._identity = types.SimpleNamespace(id=SLACK_IDENTITY)
+        bridge._sender_allowed = lambda *_args: True
+        bridge._inkbox = types.SimpleNamespace(slack=types.SimpleNamespace(
+            list_connections=Mock(side_effect=OSError("connection read unavailable"))))
+        bridge._channel_store = Mock()
+        received = slack_envelope("completed")
+        assert inbound_message(received, SLACK_IDENTITY) is not None
+        with pytest.raises(VoiceNoteNotAdmitted):
+            await bridge._on_slack_received(received)
+        bridge._channel_store.assert_not_called()
+
+    asyncio.run(run())

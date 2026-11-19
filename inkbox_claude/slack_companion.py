@@ -159,18 +159,28 @@ def _voice_media(event: dict) -> list[dict]:
             for item in files if isinstance(item, dict)]
 
 
+def _names_source(data: dict, source_id: str) -> bool:
+    try:
+        return _uuid(data.get("message_id")) == source_id
+    except ValueError:
+        return False
+
+
 def normalize_envelope(client: Any, identity_handle: str, envelope: dict) -> dict:
     """Normalize verified Slack input to the durable conversation receipt shape."""
     from .slack import inbound_message
 
     require_sdk_support()
     prepared = prepare_envelope(client, identity_handle, envelope)
-    # Voice-note results are labeled after the receipt waits for them.
-    incoming = inbound_message(prepared, prepared["data"]["identity_id"], transcripts=False)
+    source = prepared["_claude_slack_source"]
+    # A completion names the retained message, so the receipt waits only when
+    # the envelope names the same message as the archived source.
+    media = _voice_media(prepared["data"]["event"]) if _names_source(prepared["data"], source["id"]) else []
+    # A waiting receipt labels its voice-note results once they are known.
+    incoming = inbound_message(prepared, prepared["data"]["identity_id"], transcripts=not media)
     if incoming is None:
         raise ValueError("Invalid Slack Companion message")
     _, body, route = incoming
-    source = prepared["_claude_slack_source"]
     route.update(sender=source["author"], thread_ts=source["thread_ts"], slack_bot_user_id=source["bot_user_id"],
                  recipient_team_id=source["author"].partition(":")[0])
     scope = prepared["companion"]
@@ -179,6 +189,6 @@ def normalize_envelope(client: Any, identity_handle: str, envelope: dict) -> dic
         "id": source["id"], "conversation_id": scope["conversation_id"],
         "direction": "inbound", "text": body, "slack_author": source["author"],
         "sender_access": prepared["data"].get("sender_access"), "slack_route": route,
-        **({"media": media} if (media := _voice_media(prepared["data"]["event"])) else {}),
+        **({"media": media} if media else {}),
     }}
     return result
