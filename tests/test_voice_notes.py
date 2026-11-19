@@ -3,6 +3,7 @@
 import asyncio
 from copy import deepcopy
 import types
+from unittest.mock import AsyncMock, Mock
 import time
 
 import pytest
@@ -333,4 +334,68 @@ def test_startup_prunes_old_resolved_companion_rows_but_keeps_unresolved_work(tm
         finally:
             await reopened.close()
 
+    asyncio.run(run())
+
+
+def test_ambiguous_handler_failure_is_not_replayed_after_restart(tmp_path):
+    async def run():
+        admitted = []
+
+        async def deliver(item):
+            admitted.append(item)
+            raise OSError("connection lost after handoff")
+
+        state = inbox(tmp_path, deliver)
+        original = envelope()
+        state.complete(completion(original))
+        state.defer(original)
+        await next(iter(state.tasks.values()))
+        await state.close()
+        recovered = inbox(tmp_path, deliver)
+        recovered.recover()
+        assert recovered.defer(original) and not recovered.tasks
+        assert len(admitted) == 1
+        await recovered.close()
+    asyncio.run(run())
+
+
+def test_gateway_retries_saved_message_after_sessions_start(tmp_path, monkeypatch):
+    async def run():
+        bridge = object.__new__(gateway.InkboxGateway)
+        bridge._identity = types.SimpleNamespace(id="agent-1")
+        bridge._inkbox = None
+        bridge.sessions = None
+        monkeypatch.setenv("INKBOX_CLAUDE_HOME", str(tmp_path))
+        state = bridge._voice_note_inbox()
+        original = envelope("text")
+        message_for(original)["sender_phone_number"] = "+15555550123"
+        state.complete(completion(original))
+        state.defer(original)
+        await asyncio.sleep(0)
+        result, retry_at = state.db.execute("SELECT result,retry_at FROM voice_notes").fetchone()
+        assert result and retry_at > time.time()
+        await state.close()
+        bridge._voice_note_state = None
+        native = AsyncMock()
+        bridge.sessions = Mock(get=Mock(return_value=native))
+        bridge._recent_request_ids = {}
+        bridge._inflight_request_ids = {}
+        bridge.cfg = types.SimpleNamespace(contact_memories_enabled=False)
+        bridge._sender_allowed = lambda _: True
+        bridge._with_media = AsyncMock(return_value="caption and transcript")
+        bridge._lookup_text_conversation_summary = AsyncMock(return_value=None)
+        bridge._resolve_contact_full = AsyncMock(return_value=None)
+        bridge._chat_key = Mock(return_value="sms:conversation-1")
+        bridge._clear_outbound_failures = Mock()
+        recovered = bridge._voice_note_inbox()
+        recovered.db.execute("UPDATE voice_notes SET retry_at=0")
+        recovered.db.commit()
+        recovered.recover()
+        await next(iter(recovered.tasks.values()))
+        native.handle_inbound.assert_awaited_once()
+        body, mode, meta = native.handle_inbound.await_args.args
+        assert mode == "sms" and meta["conversation_id"] == "conversation-1"
+        assert bridge._with_media.await_args.args[1] == message_for(completion(original))["media"]
+        assert recovered.db.execute("SELECT done FROM voice_notes").fetchone() == (1,)
+        await recovered.close()
     asyncio.run(run())

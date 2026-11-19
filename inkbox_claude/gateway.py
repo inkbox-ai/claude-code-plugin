@@ -1711,6 +1711,7 @@ class InkboxGateway:
             inbox = self._voice_note_state = VoiceNotes(
                 root / f"voice-notes-{identity_id}.sqlite3", self._identity,
                 self._inkbox, self._deliver_voice_note,
+                ready=lambda: self.sessions is not None and self._identity is not None,
             )
         return inbox
 

@@ -105,6 +105,7 @@ class VoiceNotes:
         deliver: Callable[[dict[str, Any]], Awaitable[Any]],
         *,
         wait_seconds: float = WAIT_SECONDS,
+        ready: Callable[[], bool] = lambda: True,
     ):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(path)
@@ -112,11 +113,17 @@ class VoiceNotes:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS voice_notes (key TEXT PRIMARY KEY, original TEXT, completion TEXT, result TEXT, deadline REAL, direct INTEGER NOT NULL DEFAULT 0, polled INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT (unixepoch()))"
         )
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(voice_notes)")}
+        if "retry_at" not in columns:
+            self.db.execute("ALTER TABLE voice_notes ADD COLUMN retry_at REAL")
+            # Older resolved receipts had no marker around the external call.
+            self.db.execute("UPDATE voice_notes SET done=2 WHERE direct=1 AND result IS NOT NULL AND done=0")
         self.db.execute(
             "DELETE FROM voice_notes WHERE created<? AND (done=1 OR original IS NULL OR (direct=0 AND result IS NOT NULL))",
             (time.time() - 7 * 86400,),
         )
         self.db.commit()
+        self.ready = ready
         self.identity, self.client, self.deliver = identity, client, deliver
         self.wait_seconds = wait_seconds
         self.events: dict[str, asyncio.Event] = {}
@@ -202,18 +209,32 @@ class VoiceNotes:
         task.add_done_callback(lambda completed: self.tasks.pop(key, None))
 
     async def _deliver(self, key: str) -> None:
-        while not self.closing:
-            try:
-                envelope = await self._resolve(key)
-                await self.deliver(envelope)
-                self.db.execute("UPDATE voice_notes SET done=1 WHERE key=?", (key,))
-                self.db.commit()
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning("Voice-note delivery is waiting for the message handler")
-                await asyncio.sleep(5)
+        envelope = await self._resolve(key)
+        retry_at, = self.db.execute("SELECT retry_at FROM voice_notes WHERE key=?", (key,)).fetchone()
+        if retry_at and retry_at > time.time():
+            await asyncio.sleep(retry_at - time.time())
+        while not self.ready():
+            self.db.execute("UPDATE voice_notes SET retry_at=? WHERE key=?", (time.time() + 5, key))
+            self.db.commit()
+            await asyncio.sleep(5)
+
+        # An interrupted handler may already own the input. Only pending rows
+        # are recoverable; keep ambiguous receipts for inspection.
+        claimed = self.db.execute("UPDATE voice_notes SET done=2 WHERE key=? AND done=0", (key,))
+        self.db.commit()
+        if not claimed.rowcount:
+            return
+        try:
+            response = await self.deliver(envelope)
+        except Exception:
+            logger.exception("Voice-note admission is unconfirmed; not replaying")
+            return
+        status = getattr(response, "status", 200)
+        if 200 <= status < 300 or status in (400, 401, 403, 404, 422):
+            self.db.execute("UPDATE voice_notes SET done=1 WHERE key=?", (key,))
+            self.db.commit()
+        else:
+            logger.warning("Voice-note admission is unconfirmed (status %s); not replaying", status)
 
     async def resolve_message(
         self, channel: str, message: dict[str, Any]
