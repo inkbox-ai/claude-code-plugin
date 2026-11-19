@@ -11,6 +11,7 @@ import pytest
 from inkbox_claude.voice_notes import (
     VoiceNotes,
     merge_results,
+    unconfirmed_ids,
     message_for,
     pending,
     transcript_note,
@@ -351,6 +352,7 @@ def test_ambiguous_handler_failure_is_not_replayed_after_restart(tmp_path):
         state.defer(original)
         await next(iter(state.tasks.values()))
         await state.close()
+        assert unconfirmed_ids(tmp_path / "voice.sqlite3") == ["imessage:message-1"]
         recovered = inbox(tmp_path, deliver)
         recovered.recover()
         refreshed = deepcopy(original)

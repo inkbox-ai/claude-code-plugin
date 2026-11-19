@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 from copy import deepcopy
 import json
 import logging
@@ -92,6 +93,21 @@ def merge_results(original: dict[str, Any], current: dict[str, Any]) -> dict[str
         if isinstance(source, dict) and isinstance(source.get("transcription"), dict):
             item["transcription"] = deepcopy(source["transcription"])
     return result
+
+
+def inbox_path(identity_id: str) -> Path:
+    root = Path(os.getenv("INKBOX_CLAUDE_HOME") or (Path.home() / ".inkbox-claude"))
+    return root / f"voice-notes-{identity_id}.sqlite3"
+
+
+def unconfirmed_ids(path: Path) -> list[str]:
+    """Inspect ordinary handoffs without opening a receiver or replaying work."""
+    if not path.exists():
+        return []
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        return [row[0] for row in db.execute(
+            "SELECT key FROM voice_notes WHERE direct=1 AND done=2 ORDER BY key"
+        )]
 
 
 class VoiceNotes:
