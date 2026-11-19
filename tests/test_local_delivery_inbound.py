@@ -378,8 +378,16 @@ def test_prompt_body_capped_at_64_kib_on_char_boundary():
 
 
 def test_agent_handler_binary_body_is_not_inlined():
-    prompt = inbound.inbound_prompt("s", "e", "", base64.b64encode(b"\x00\x01").decode(), "base64")
-    assert "binary content" in prompt and "AAE=" not in prompt
+    prompt = inbound.inbound_prompt("s", "e", "", base64.b64encode(b"\x00\x01\xff").decode(), "base64")
+    assert prompt.endswith("Body:\n(binary body, 3 bytes, not shown)")
+
+
+def test_agent_handler_base64_utf8_body_is_shown():
+    gw = _run(_gateway(), _data(body=base64.b64encode("café ✓".encode()).decode(), encoding="base64"))
+    [(_, prompt)] = gw.sessions.turns
+    assert prompt.endswith("Body:\ncafé ✓")
+    big = base64.b64encode(b"x" * 70000).decode()
+    assert inbound.inbound_prompt("s", "e", "", big, "base64").endswith("x" * 65536 + "\n(truncated)")
 
 
 def _run(gw, data, *, inkbox=None, setup=None):
@@ -428,7 +436,7 @@ def test_script_output_is_drained_and_bounded():
     [(_, prompt)] = gw.sessions.turns
     assert prompt.count("o") >= inbound.MAX_STDOUT_BYTES and "o" * (inbound.MAX_STDOUT_BYTES + 1) not in prompt
     code, out, err = asyncio.run(inbound.run_script(command, big_body.encode()))
-    assert code == 0 and len(out) == inbound.MAX_STDOUT_BYTES
+    assert code == 0 and out == "o" * inbound.MAX_STDOUT_BYTES + "\n(truncated)"
     assert len(err) == inbound.STDERR_TAIL_BYTES and err.endswith("END\n")
 
 
@@ -446,14 +454,14 @@ def test_failed_report_is_retried_without_rerunning_script(isolated_home, instan
     inkbox = types.SimpleNamespace(inbound=_Inbound([ConnectionError("offline"), TimeoutError()]))
     gw = _run(_gateway(), _data({"type": "script", "command": "echo run >> runs; exit 1"}), inkbox=inkbox)
     assert (isolated_home / "runs").read_text().count("run") == 1
-    assert len(inkbox.inbound.reports) == 3 and instant_waits == [20, 40]
+    assert len(inkbox.inbound.reports) == 3 and instant_waits == [30, 60]
 
 
 def test_pending_report_resumes_after_restart_without_rerunning_script(isolated_home):
     delivery = _data()["delivery_id"]
     gw = _gateway()
     gw._inbound.receive(_data({"type": "script", "command": "echo run >> runs; exit 1"}))
-    gw._inbound.queue.update(delivery, stage="report", due=time.time(), error="exit code 1")
+    gw._inbound.queue.update(delivery, stage="report", due=time.time() + 3600, error="exit code 1")
     gw._inbound.queue.close()
     restarted = _gateway()
 
@@ -517,11 +525,31 @@ def test_script_timeout_counts_as_failure(monkeypatch, instant_waits):
     assert gw._inkbox.inbound.reports[0][3:5] == ("failed", "timed out after 0.2s")
 
 
-def test_report_without_sdk_support_is_retried(monkeypatch, instant_waits):
+def test_report_keeps_retrying_past_a_day_with_capped_backoff(monkeypatch, instant_waits):
     monkeypatch.setattr(inbound, "SCRIPT_RETRY_DELAYS", ())
-    monkeypatch.setattr(inbound, "REPORT_WINDOW_SECONDS", 50.0)
-    _run(_gateway(), _data({"type": "script", "command": "exit 1"}), inkbox=types.SimpleNamespace())
-    assert instant_waits == [20, 40]
+    inkbox = types.SimpleNamespace(inbound=_Inbound([ConnectionError("offline")] * 32))
+    _run(_gateway(), _data({"type": "script", "command": "exit 1"}), inkbox=inkbox)
+    assert len(inkbox.inbound.reports) == 33
+    assert max(instant_waits) == 3600 and sum(instant_waits) > 86400
+
+
+def test_interrupted_last_script_run_is_not_repeated(isolated_home):
+    delivery = _data()["delivery_id"]
+    gw = _gateway()
+    gw._inbound.receive(_data({"type": "script", "command": "echo run >> runs"}))
+    # Five runs counted; the fifth was cut off by a restart.
+    gw._inbound.queue.update(delivery, attempts=5, error="boom")
+    gw._inbound.queue.close()
+    restarted = _gateway()
+
+    async def scenario():
+        restarted._inbound.start()
+        await _settled(restarted)
+        await restarted._inbound.close()
+
+    asyncio.run(scenario())
+    assert not (isolated_home / "runs").exists()
+    assert [r[4] for r in restarted._inkbox.inbound.reports] == ["boom"]
 
 
 

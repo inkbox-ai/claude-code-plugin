@@ -231,17 +231,19 @@ are ignored; a replay (new `delivery_id`) runs again.
 
 - `agent` handler: one turn in the `inbound:<source name>` session. The message
   marks the content as untrusted, then carries the source's instructions and the
-  request body (binary bodies are noted, not inlined; bodies over 64 KiB are
-  truncated). The agent's text reply is not sent anywhere; it acts through tools.
+  request body (base64 bodies that decode to UTF-8 are shown as text, other
+  binary bodies are noted, not inlined; bodies over 64 KiB are truncated). The agent's text reply is not sent anywhere; it acts through tools.
 - `script` handler: runs `/bin/sh -c "<command>"` in the home directory with
   `{"source", "event_id", "headers", "body", "body_encoding"}` as JSON on stdin and
   a 120 second timeout. Exit 0 with no output finishes the event; otherwise the
-  first 64 KiB of output is passed to the agent as the body. It runs up to 5
-  times: a failure or timeout is retried after 10 s, 30 s, 2 min and 10 min.
+  first 64 KiB of output is passed to the agent as the body, marked `(truncated)`
+  when cut. It runs up to 5 times: a failure or timeout is retried after 10 s,
+  30 s, 2 min and 10 min. A run cut off by a restart counts toward the 5.
 
 When the script's last run fails or the agent turn fails, the bridge reports the
 event as failed to Inkbox with the end of stderr (up to 4 KiB is kept). The report
-is retried with backoff for up to 24 hours without running the script again. An
+is retried with backoff (at most an hour apart) while the bridge runs and again on
+every start, without running the script again, until it is recorded or rejected. An
 agent turn interrupted by a restart is reported rather than repeated.
 
 ## External webhooks

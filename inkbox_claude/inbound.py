@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextvars
 import json
 import logging
@@ -22,8 +24,7 @@ MAX_PROMPT_BODY_BYTES = 64 * 1024
 MAX_STDOUT_BYTES = 64 * 1024
 STDERR_TAIL_BYTES = 4 * 1024
 REPORT_ERROR_CHARS = 2000
-REPORT_WINDOW_SECONDS = 24 * 3600.0
-REPORT_MAX_DELAY_SECONDS = 1800.0
+REPORT_MAX_DELAY_SECONDS = 3600.0
 DONE_RETENTION_SECONDS = 7 * 24 * 3600.0
 
 
@@ -33,6 +34,28 @@ def cap_body(body: str) -> str:
         return body
     # "ignore" drops only a character split by the cut.
     return raw[:MAX_PROMPT_BODY_BYTES].decode("utf-8", "ignore") + "\n(truncated)"
+
+
+def decode_body(body: str, encoding: str) -> str:
+    """The body as text; base64 bodies are shown when they decode to UTF-8."""
+    if encoding != "base64":
+        return body
+    try:
+        raw = base64.b64decode(body, validate=True)
+    except binascii.Error:
+        return "(binary body, not shown)"
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"(binary body, {len(raw)} bytes, not shown)"
+
+
+def fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _source(data: dict[str, Any]) -> dict[str, Any]:
@@ -63,11 +86,7 @@ def inbound_prompt(name: str, event_id: str, instructions: str, body: str, encod
     ]
     if instructions:
         parts += ["", "Instructions for this source:", instructions]
-    parts += ["", "Body:"]
-    if encoding == "base64":
-        parts.append(f"(binary content, {len(body)} base64 characters, not shown)")
-    else:
-        parts.append(cap_body(body))
+    parts += ["", "Body:", cap_body(decode_body(body, encoding))]
     return "\n".join(parts)
 
 
@@ -89,9 +108,10 @@ async def _feed(proc: Any, stdin: bytes) -> None:
 
 
 async def _read_head(stream: Any, limit: int) -> bytes:
+    # Keeps one byte past the limit so truncation can be marked.
     kept = bytearray()
     while chunk := await stream.read(65536):
-        kept += chunk[: max(0, limit - len(kept))]
+        kept += chunk[: max(0, limit + 1 - len(kept))]
     return bytes(kept)
 
 
@@ -123,7 +143,10 @@ async def run_script(command: str, stdin: bytes, timeout: float = SCRIPT_TIMEOUT
     except asyncio.CancelledError:
         _kill(proc)
         raise
-    return proc.returncode, out.decode("utf-8", "ignore"), err.decode("utf-8", "replace")
+    stdout = out[:MAX_STDOUT_BYTES].decode("utf-8", "ignore")
+    if len(out) > MAX_STDOUT_BYTES:
+        stdout += "\n(truncated)"
+    return proc.returncode, stdout, err.decode("utf-8", "replace")
 
 
 class InboundQueue:
@@ -139,6 +162,7 @@ class InboundQueue:
             " stage TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL,"
             " body TEXT, error TEXT, since REAL NOT NULL)"
         )
+        fsync_dir(path.parent)
         self.db.execute("DELETE FROM jobs WHERE stage = 'done' AND since < ?",
                         (time.time() - DONE_RETENTION_SECONDS,))
 
@@ -207,6 +231,8 @@ class InboundRunner:
 
     def start(self) -> None:
         self.started = True
+        # Pending failure reports are retried right away on every start.
+        self.queue.db.execute("UPDATE jobs SET due = ? WHERE stage = 'report'", (time.time(),))
         for delivery_id in self.queue.pending():
             self._start(delivery_id)
 
@@ -277,7 +303,9 @@ class InboundRunner:
             "body_encoding": request.get("body_encoding") or "utf8",
         }, ensure_ascii=False).encode()
         command = str(_handler(data).get("command") or "")
-        attempts, error = job["attempts"], job["error"] or "missing command"
+        attempts = job["attempts"]
+        # With no runs left, the last run was cut off by a restart; it is not run again.
+        error = job["error"] or ("script run was interrupted by a restart" if command else "missing command")
         while command and attempts <= len(SCRIPT_RETRY_DELAYS):
             await self._wait(job["due"])
             attempts += 1
@@ -324,10 +352,7 @@ class InboundRunner:
                     logger.info("[inbound] result for %s not recorded: %s", data.get("event_id"), exc)
                     break
                 attempts += 1
-                job["due"] = time.time() + min(REPORT_MAX_DELAY_SECONDS, 10.0 * 2 ** attempts)
-                if job["due"] - job["since"] > REPORT_WINDOW_SECONDS:
-                    logger.error("[inbound] giving up reporting the result for %s: %s", data.get("event_id"), exc)
-                    break
+                job["due"] = time.time() + min(REPORT_MAX_DELAY_SECONDS, 30.0 * 2 ** (attempts - 1))
                 logger.warning("[inbound] reporting the result for %s failed: %s", data.get("event_id"), exc)
                 self.queue.update(delivery_id, attempts=attempts, due=job["due"])
         self.queue.update(delivery_id, stage="done")
