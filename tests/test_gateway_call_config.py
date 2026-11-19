@@ -264,7 +264,7 @@ def test_old_api_without_reactions_still_registers_direct_whatsapp_callbacks():
 def test_whatsapp_adopts_identity_scoped_receiver_without_rewriting_other_channels(race, mixed):
     from inkbox.exceptions import InkboxAPIError
     active = types.SimpleNamespace(id="wa-active", url="https://agent.example/webhook",
-        event_types=[*WHATSAPP_EVENTS, *(["a2a.task.created"] if mixed else [])])
+        event_types=[*WHATSAPP_EVENTS, "whatsapp.future", *(["a2a.task.created"] if mixed else [])])
     class Subscriptions(_FakeSubscriptions):
         scoped_reads = 0
         attempts = 0
@@ -283,25 +283,21 @@ def test_whatsapp_adopts_identity_scoped_receiver_without_rewriting_other_channe
             return super().create(**kwargs)
     subscriptions = Subscriptions()
     _patched_gateway(_Identity(), subscriptions=subscriptions)
+    _patched_gateway(_Identity(), subscriptions=subscriptions)
     assert subscriptions.attempts == int(race)
     assert subscriptions.deleted == []
     assert all(item["event_types"] != WHATSAPP_EVENTS for item in subscriptions.created)
 
 
 def test_whatsapp_incomplete_shared_receiver_is_not_deleted_or_truncated():
-    from inkbox.exceptions import InkboxAPIError
     shared = types.SimpleNamespace(id="shared", url="https://agent.example/webhook",
         event_types=["whatsapp.received", "a2a.task.created"])
     class Subscriptions(_FakeSubscriptions):
         def list(self, **owner):
             return [shared] if owner.get("scope") == "identity" else []
-        def create(self, **kwargs):
-            if kwargs["event_types"] == WHATSAPP_EVENTS:
-                raise InkboxAPIError(409, "Events already subscribed")
-            return super().create(**kwargs)
     subscriptions = Subscriptions()
-    with pytest.raises(InkboxAPIError):
-        _patched_gateway(_Identity(), subscriptions=subscriptions)
+    _patched_gateway(_Identity(), subscriptions=subscriptions)
+    assert subscriptions.created[-1]["event_types"] == [e for e in WHATSAPP_EVENTS if e != "whatsapp.received"]
     assert subscriptions.deleted == []
 
 

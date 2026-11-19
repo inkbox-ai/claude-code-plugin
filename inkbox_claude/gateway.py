@@ -1019,6 +1019,35 @@ class InkboxGateway:
             identity_scope = desired_families == {"whatsapp"} or event_types == TRANSCRIPTION_EVENTS
             list_kw = {**owner_kw, **({"scope": "identity"} if identity_scope else {})}
             existing = self._inkbox.webhooks.subscriptions.list(**list_kw)
+            if desired_families == {"whatsapp"}:
+                # Disjoint subscriptions may share a URL. Create only the difference;
+                # replacing a shared row could discard another registrant's events.
+                wanted = list(event_types)
+                while True:
+                    covering = [
+                        row for row in existing
+                        if row.url == subscription_url and any(event in wanted for event in row.event_types)
+                    ]
+                    covered = {event for row in covering for event in row.event_types}
+                    missing = [event for event in wanted if event not in covered]
+                    if not missing:
+                        return
+                    try:
+                        self._inkbox.webhooks.subscriptions.create(
+                            url=subscription_url, event_types=missing, **owner_kw
+                        )
+                        return
+                    except Exception as exc:
+                        if getattr(exc, "status_code", None) != 409:
+                            raise
+                        existing = self._inkbox.webhooks.subscriptions.list(**list_kw)
+                        if not any(
+                            row.url == subscription_url and event in missing
+                            for row in existing for event in row.event_types
+                        ):
+                            raise
+                        wanted = missing
+
             for sub in existing:
                 if (
                     sub.url == subscription_url
