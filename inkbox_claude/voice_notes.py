@@ -12,12 +12,18 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 RECEIVED = {
     "text.received": "text",
     "imessage.received": "imessage",
     "whatsapp.received": "whatsapp",
+    "slack.dm_received": "slack",
+    "slack.group_dm_received": "slack",
+    "slack.channel_message_received": "slack",
+    "slack.mention_received": "slack",
+    "slack.thread_reply_received": "slack",
 }
 FINISHED = "message.transcription_finished"
 WAIT_SECONDS = 60.0
@@ -31,8 +37,62 @@ def message_for(envelope: dict[str, Any]) -> dict[str, Any]:
         return {}
     event_type = envelope.get("event_type")
     channel = data.get("channel") if event_type == FINISHED else str(event_type).split(".", 1)[0]
+    if channel == "slack":
+        # Slack keys results by the retained message and lists them on event.files.
+        event = data.get("event")
+        files = event.get("files") if isinstance(event, dict) else None
+        return {
+            "id": data.get("message_id"),
+            "conversation_id": data.get("conversation_id"),
+            "connection_id": data.get("connection_id"),
+            "media": files if isinstance(files, list) else [],
+        }
     message = data.get("text_message" if channel == "text" else "message")
     return message if isinstance(message, dict) else {}
+
+
+def envelope_for(channel: str, message: dict[str, Any]) -> dict[str, Any]:
+    """Build the received-event shape whose message_for view is ``message``."""
+    if channel == "slack":
+        return {"event_type": "slack.received", "data": {
+            "message_id": message.get("id"),
+            "conversation_id": message.get("conversation_id"),
+            "connection_id": message.get("connection_id"),
+            "event": {"files": message.get("media") or []},
+        }}
+    return {
+        "event_type": f"{channel}.received",
+        "data": {"text_message" if channel == "text" else "message": message},
+    }
+
+
+def store_message(channel: str, envelope: dict[str, Any], message: dict[str, Any]) -> None:
+    """Write resolved attachment results back into the original envelope."""
+    data = envelope["data"]
+    if channel == "slack":
+        data["event"]["files"] = message.get("media") or []
+    else:
+        data["text_message" if channel == "text" else "message"] = message
+
+
+def transcription_unsupported(exc: Exception) -> bool:
+    """Recognize a server that does not offer the completion event yet."""
+    if isinstance(exc, ValueError):
+        return str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet.")
+    errors = getattr(exc, "detail", None)
+    if getattr(exc, "status_code", None) != 422 or not isinstance(errors, list) or not errors:
+        return False
+    # The API reports one enum error per channel when none recognize the event.
+    return all(
+        isinstance(error, dict)
+        and error.get("type") == "enum"
+        and isinstance(error.get("loc"), list)
+        and len(error["loc"]) >= 3
+        and error["loc"][:2] == ["body", "event_types"]
+        and type(error["loc"][2]) is int
+        and error.get("input") == FINISHED
+        for error in errors
+    )
 
 
 def pending(message: dict[str, Any]) -> bool:
@@ -261,10 +321,7 @@ class VoiceNotes:
         key = self.key(channel, message)
         if not key or not pending(message):
             return message
-        envelope = {
-            "event_type": f"{channel}.received",
-            "data": {"text_message" if channel == "text" else "message": message},
-        }
+        envelope = envelope_for(channel, message)
         self._remember(key, envelope, direct=False)
         return message_for(await self._resolve(key))
 
@@ -274,8 +331,10 @@ class VoiceNotes:
         ).fetchone()
         envelope = json.loads(original)
         message = message_for(envelope)
+        channel = key.split(":", 1)[0]
         if result:
             message.update(json.loads(result))
+            store_message(channel, envelope, message)
             return envelope
         event = self.events.setdefault(key, asyncio.Event())
         while pending(message):
@@ -300,7 +359,7 @@ class VoiceNotes:
                     try:
                         current = await asyncio.wait_for(
                             asyncio.to_thread(
-                                self._poll, key.split(":", 1)[0], message
+                                self._poll, channel, message
                             ),
                             POLL_SECONDS,
                         )
@@ -322,13 +381,29 @@ class VoiceNotes:
         )
         self.db.commit()
         self.events.pop(key, None)
-        field = "text_message" if key.startswith("text:") else "message"
-        envelope["data"][field] = message
+        store_message(channel, envelope, message)
         return envelope
 
     def _poll(self, channel: str, message: dict[str, Any]) -> dict[str, Any]:
         """Read raw additive metadata using the existing authenticated SDK transport."""
         message_id = str(message["id"])
+        if channel == "slack":
+            connection_id = quote(str(message["connection_id"]), safe="")
+            page = self.client._api_http.get(
+                f"/slack/connections/{connection_id}/archive/messages",
+                params={"message_id": message_id}, timeout=POLL_SECONDS,
+            )
+            found = [
+                item for item in page.get("messages") or []
+                if isinstance(item, dict) and str(item.get("id")) == message_id
+            ]
+            if len(found) != 1:
+                return {}
+            return {
+                "id": message_id,
+                "conversation_id": found[0].get("conversation_id"),
+                "media": found[0].get("files") or [],
+            }
         if channel == "text":
             phone_id = str(self.identity.phone_number.id)
             return self.client._phone_http.get(

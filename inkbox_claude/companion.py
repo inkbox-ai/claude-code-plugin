@@ -906,11 +906,21 @@ class CompanionReceiver:
                     await self.deliver(key, event)
                     continue
                 scope, message = event["scope"], event["message"]
-                if scope["channel"] in {"phone", "imessage", "whatsapp"}:
+                if scope["channel"] in {"phone", "imessage", "whatsapp", "slack"}:
                     from .voice_notes import pending
                     if pending(message):
-                        message = await self.gateway._voice_note_inbox().resolve_message(
-                            "text" if scope["channel"] == "phone" else scope["channel"], message)
+                        inbox = self.gateway._voice_note_inbox()
+                        if scope["channel"] == "slack":
+                            # Slack results correlate by the retained message in its native conversation.
+                            route = message["slack_route"]
+                            resolved = await inbox.resolve_message("slack", {
+                                "id": message["id"], "conversation_id": route["conversation_id"],
+                                "connection_id": route["connection_id"], "media": message["media"],
+                            })
+                            message = {**message, "media": resolved["media"]}
+                        else:
+                            message = await inbox.resolve_message(
+                                "text" if scope["channel"] == "phone" else scope["channel"], message)
                         event["message"] = message
                         self.save(key)
                 if (message["id"] in record.get("snapshot_ids", [])
