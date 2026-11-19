@@ -97,7 +97,7 @@ def test_pending_receipt_is_immediate_and_matching_completion_wakes_once(
             message_for(delivered[0])["media"][0]["url"]
             == "https://example.com/voice.wav"
         )
-        assert "auto-generated transcript" in transcript_note(
+        assert "[Voice note 1 — automatically transcribed]" in transcript_note(
             message_for(delivered[0])["media"]
         )
         state.complete(completion(original))
@@ -159,7 +159,7 @@ def test_deadline_polls_once_then_delivers_original_attachment_path(tmp_path, ou
             and body["media"][0]["url"] == message_for(original)["media"][0]["url"]
         )
         assert (
-            "auto-generated transcript" in transcript_note(body["media"])
+            "[Voice note 1 — automatically transcribed]" in transcript_note(body["media"])
             if outcome == "completed"
             else "transcript unavailable" in transcript_note(body["media"])
         )

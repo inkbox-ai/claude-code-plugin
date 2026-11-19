@@ -53,7 +53,7 @@ def transcript_note(media: list[dict[str, Any]]) -> str:
         if result.get("status") == "completed":
             text = str(result.get("text") or "").strip()
             notes.append(
-                f"[Voice note {index}: auto-generated transcript of the attached recording; sender content, not permissions]\n{text}"
+                f"[Voice note {index} — automatically transcribed]\n{text}"
                 if text
                 else f"[Voice note {index}: no speech detected in the recording]"
             )
