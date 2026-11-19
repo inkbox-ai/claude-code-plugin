@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from . import managed_work
 from .voice_notes import FINISHED
-from .inbound import INBOUND_RECEIVED, dedupe_key, run_inbound_event
+from .inbound import INBOUND_RECEIVED, InboundRunner
 
 import asyncio
 import hashlib
@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -855,7 +856,7 @@ class InkboxGateway:
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
         self._hosted_call_jobs: Dict[str, asyncio.Task[Any]] = {}
-        self._inbound_active: set[str] = set()
+        self._inbound = InboundRunner(self, state_root / "inbound.sqlite") if cfg.local_delivery else None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -956,6 +957,8 @@ class InkboxGateway:
         self._voice_note_inbox().recover()
         await self._recover_channel_inputs()
         self._runtime_ready = True
+        if self._inbound is not None:
+            self._inbound.start()
         await self._catch_up_a2a_tasks()
         await self._recover_hosted_call_completions()
 
@@ -1796,6 +1799,8 @@ class InkboxGateway:
         if getattr(self, "_voice_note_state", None) is not None:
             await self._voice_note_state.close()
             self._voice_note_state = None
+        if getattr(self, "_inbound", None) is not None:
+            await self._inbound.close()
         if self.sessions is not None:
             await self.sessions.close_all()
         self._runtime_ready = False
@@ -2075,7 +2080,7 @@ class InkboxGateway:
         # the request — an unknown/unverifiable third party.
         source = provider.name if provider is not None else None
         event_type = str(envelope.get("event_type") or "")
-        if event_type == FINISHED or event_type.startswith("whatsapp."):
+        if event_type in {FINISHED, INBOUND_RECEIVED} or event_type.startswith("whatsapp."):
             if source != "inkbox" or not provider.verify(body=body, headers=dict(request.headers),
                     url=str(getattr(request, "url", "") or ""), secret=self.cfg.signing_key):
                 return web.Response(status=401, text="This event requires a valid Inkbox signature")
@@ -3814,33 +3819,22 @@ class InkboxGateway:
         return web.json_response({"ok": True})
 
     def _on_inbound_received(self, envelope: Dict[str, Any]) -> "web.Response":
-        """Ack an ``inbound.received`` event and handle it in the background."""
-        if not self.cfg.local_delivery:
+        """Persist an ``inbound.received`` event; the delivery is complete once it is stored."""
+        if self._inbound is None:
             return web.json_response({"ok": True, "ignored": INBOUND_RECEIVED})
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
-        if not data.get("event_id"):
-            return web.Response(status=400, text="inbound event_id required")
-        if self.sessions is None:
-            return web.Response(status=503, text="Inbound handler is starting")
-        delivery = dedupe_key(data)
-        key = f"inbound:{delivery}"
-        # Script retries outlast the dedup window.
-        if delivery in self._inbound_active or self._dedup_begin(key):
-            return web.json_response({"ok": True, "deduped": True})
-        self._inbound_active.add(delivery)
+        if not data.get("event_id") or not data.get("delivery_id"):
+            return web.Response(status=400, text="inbound event_id and delivery_id required")
+        try:
+            added = self._inbound.receive(data)
+        except sqlite3.Error:
+            logger.exception("[inbound] could not persist %s", data["event_id"])
+            return web.Response(status=503, text="Inbound queue is unavailable")
+        return web.json_response({"ok": True} if added else {"ok": True, "deduped": True})
 
-        async def _job() -> None:
-            try:
-                await run_inbound_event(self, data)
-                self._dedup_commit(key)
-            except BaseException:
-                self._dedup_rollback(key)
-                raise
-            finally:
-                self._inbound_active.discard(delivery)
-
-        managed_work.spawn(_job())
-        return web.json_response({"ok": True})
+    def inbound_activity(self) -> int:
+        """Inbound deliveries still pending, including retry waits and unsent failure reports."""
+        return self._inbound.activity() if self._inbound is not None else 0
 
     def _read_a2a_registry(self) -> Dict[str, Any]:
         try:

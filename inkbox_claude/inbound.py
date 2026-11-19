@@ -1,12 +1,15 @@
-"""Handle ``inbound.received`` events in local delivery mode."""
+"""Handle ``inbound.received`` events in local delivery mode from a durable local queue."""
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import signal
+import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,12 +19,12 @@ INBOUND_RECEIVED = "inbound.received"
 SCRIPT_TIMEOUT_SECONDS = 120.0
 SCRIPT_RETRY_DELAYS = (10.0, 30.0, 120.0, 600.0)
 MAX_PROMPT_BODY_BYTES = 64 * 1024
-ERROR_TAIL_CHARS = 500
-
-
-def dedupe_key(data: dict[str, Any]) -> str:
-    # delivery_id is stable across retries and new on each replay.
-    return str(data.get("delivery_id") or data.get("event_id") or "")
+MAX_STDOUT_BYTES = 64 * 1024
+STDERR_TAIL_BYTES = 4 * 1024
+REPORT_ERROR_CHARS = 2000
+REPORT_WINDOW_SECONDS = 24 * 3600.0
+REPORT_MAX_DELAY_SECONDS = 1800.0
+DONE_RETENTION_SECONDS = 7 * 24 * 3600.0
 
 
 def cap_body(body: str) -> str:
@@ -32,10 +35,21 @@ def cap_body(body: str) -> str:
     return raw[:MAX_PROMPT_BODY_BYTES].decode("utf-8", "ignore") + "\n(truncated)"
 
 
+def _source(data: dict[str, Any]) -> dict[str, Any]:
+    return data.get("source") if isinstance(data.get("source"), dict) else {}
+
+
 def _source_name(data: dict[str, Any]) -> str:
-    source = data.get("source") if isinstance(data.get("source"), dict) else {}
-    name = str(source.get("name") or "").replace("\r", "").replace("\n", " ").strip()
+    name = str(_source(data).get("name") or "").replace("\r", "").replace("\n", " ").strip()
     return name[:80] or "unknown"
+
+
+def _request(data: dict[str, Any]) -> dict[str, Any]:
+    return data.get("request") if isinstance(data.get("request"), dict) else {}
+
+
+def _handler(data: dict[str, Any]) -> dict[str, Any]:
+    return data.get("handler") if isinstance(data.get("handler"), dict) else {}
 
 
 def inbound_prompt(name: str, event_id: str, instructions: str, body: str, encoding: str) -> str:
@@ -65,8 +79,31 @@ def _kill(proc: Any) -> None:
         pass
 
 
+async def _feed(proc: Any, stdin: bytes) -> None:
+    try:
+        proc.stdin.write(stdin)
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+async def _read_head(stream: Any, limit: int) -> bytes:
+    kept = bytearray()
+    while chunk := await stream.read(65536):
+        kept += chunk[: max(0, limit - len(kept))]
+    return bytes(kept)
+
+
+async def _read_tail(stream: Any, limit: int) -> bytes:
+    kept = b""
+    while chunk := await stream.read(65536):
+        kept = (kept + chunk)[-limit:]
+    return kept
+
+
 async def run_script(command: str, stdin: bytes, timeout: float = SCRIPT_TIMEOUT_SECONDS) -> tuple[int | None, str, str]:
-    """Run ``command`` with ``/bin/sh -c``; return (exit code or None on timeout, stdout, stderr)."""
+    """Run ``command`` with ``/bin/sh -c``; return (exit code or None on timeout, stdout head, stderr tail)."""
     proc = await asyncio.create_subprocess_exec(
         "/bin/sh", "-c", command,
         cwd=str(Path.home()),
@@ -75,8 +112,10 @@ async def run_script(command: str, stdin: bytes, timeout: float = SCRIPT_TIMEOUT
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+    io = asyncio.gather(_feed(proc, stdin), _read_head(proc.stdout, MAX_STDOUT_BYTES),
+                        _read_tail(proc.stderr, STDERR_TAIL_BYTES), proc.wait())
     try:
-        out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
+        _, out, err, _ = await asyncio.wait_for(io, timeout)
     except TimeoutError:
         _kill(proc)
         await proc.wait()
@@ -84,65 +123,211 @@ async def run_script(command: str, stdin: bytes, timeout: float = SCRIPT_TIMEOUT
     except asyncio.CancelledError:
         _kill(proc)
         raise
-    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+    return proc.returncode, out.decode("utf-8", "ignore"), err.decode("utf-8", "replace")
 
 
-async def _report_failure(gateway: Any, data: dict[str, Any], error: str) -> None:
-    inbound = getattr(gateway._inkbox, "inbound", None)
-    report = getattr(inbound, "report_inbound_event_result", None)
-    if report is None:
-        logger.warning("[inbound] SDK cannot report event results; upgrade inkbox")
-        return
-    source = data.get("source") if isinstance(data.get("source"), dict) else {}
-    try:
-        await asyncio.to_thread(
-            report, gateway.cfg.identity, str(source.get("id") or ""), str(data["event_id"]),
-            status="failed", error=error,
+class InboundQueue:
+    """Events persisted on receipt; each row walks script -> agent -> report -> done."""
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS jobs (delivery_id TEXT PRIMARY KEY, data TEXT NOT NULL,"
+            " stage TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL,"
+            " body TEXT, error TEXT, since REAL NOT NULL)"
         )
-    except Exception:
-        logger.exception("[inbound] failed to report result for %s", data["event_id"])
+        self.db.execute("DELETE FROM jobs WHERE stage = 'done' AND since < ?",
+                        (time.time() - DONE_RETENTION_SECONDS,))
+
+    def add(self, data: dict[str, Any]) -> bool:
+        """Persist a new delivery; False when this delivery id was already received."""
+        script = _handler(data).get("type") == "script"
+        body = None if script else str(_request(data).get("body") or "")
+        now = time.time()
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO jobs (delivery_id, data, stage, due, body, since) VALUES (?, ?, ?, ?, ?, ?)",
+            (str(data["delivery_id"]), json.dumps(data, ensure_ascii=False),
+             "script" if script else "agent", now, body, now),
+        )
+        return cursor.rowcount == 1
+
+    def pending(self) -> list[str]:
+        return [row[0] for row in self.db.execute("SELECT delivery_id FROM jobs WHERE stage != 'done'")]
+
+    def get(self, delivery_id: str) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT data, stage, attempts, due, body, error, since FROM jobs WHERE delivery_id = ?", (delivery_id,),
+        ).fetchone()
+        data, stage, attempts, due, body, error, since = row
+        return {"data": json.loads(data), "stage": stage, "attempts": attempts, "due": due,
+                "body": body, "error": error, "since": since}
+
+    def update(self, delivery_id: str, **values: Any) -> None:
+        if values.get("stage") in {"report", "done"}:
+            values.setdefault("since", time.time())
+        if values.get("stage") in {"agent", "report", "done"}:
+            values.setdefault("attempts", 0)
+        if values.get("stage") == "done":
+            # The event content is no longer needed; the row only dedupes.
+            values.update(data="{}", body=None)
+        columns = ", ".join(f"{name} = ?" for name in values)
+        self.db.execute(f"UPDATE jobs SET {columns} WHERE delivery_id = ?", (*values.values(), delivery_id))
+
+    def close(self) -> None:
+        self.db.close()
 
 
-async def _agent_turn(gateway: Any, name: str, event_id: str, instructions: str, body: str, encoding: str) -> None:
-    prompt = inbound_prompt(name, event_id, instructions, body, encoding)
-    reply = await gateway.sessions.get(f"inbound:{name}").run_consult(prompt)
-    logger.info("[inbound] agent turn done: %s reply=%r", event_id, (reply or "")[:300])
+def _report_done(exc: Exception) -> bool:
+    """Whether a failed report needs no retry: superseded by a newer delivery, or rejected outright."""
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status not in {408, 429}
 
 
-async def run_inbound_event(gateway: Any, data: dict[str, Any]) -> None:
-    """Run the source's handler for one event."""
-    event_id = str(data["event_id"])
-    name = _source_name(data)
-    source = data.get("source") if isinstance(data.get("source"), dict) else {}
-    instructions = str(source.get("instructions") or "")
-    handler = data.get("handler") if isinstance(data.get("handler"), dict) else {}
-    request = data.get("request") if isinstance(data.get("request"), dict) else {}
-    body = str(request.get("body") or "")
-    encoding = str(request.get("body_encoding") or "utf8")
+class InboundRunner:
+    """Run queued events; one task per pending delivery, resumed after restart."""
 
-    if handler.get("type") != "script":
-        await _agent_turn(gateway, name, event_id, instructions, body, encoding)
-        return
+    def __init__(self, gateway: Any, path: Path):
+        self.gateway = gateway
+        self.queue = InboundQueue(path)
+        self.tasks: dict[str, asyncio.Task[None]] = {}
+        self.started = False
 
-    stdin = json.dumps({
-        "source": name,
-        "event_id": event_id,
-        "headers": request.get("headers") if isinstance(request.get("headers"), dict) else {},
-        "body": body,
-        "body_encoding": encoding,
-    }).encode()
-    command = str(handler.get("command") or "")
-    error = "missing command"
-    for attempt, delay in enumerate((0.0, *SCRIPT_RETRY_DELAYS)):
-        if delay:
-            await asyncio.sleep(delay)
-        if not command:
-            break
-        code, out, err = await run_script(command, stdin)
-        if code == 0:
-            if out.strip():
-                await _agent_turn(gateway, name, event_id, instructions, out, "utf8")
+    def activity(self) -> int:
+        """Pending deliveries, including those waiting out a retry delay."""
+        return len(self.queue.pending())
+
+    def receive(self, data: dict[str, Any]) -> bool:
+        added = self.queue.add(data)
+        if added and self.started:
+            self._start(str(data["delivery_id"]))
+        return added
+
+    def start(self) -> None:
+        self.started = True
+        for delivery_id in self.queue.pending():
+            self._start(delivery_id)
+
+    def _start(self, delivery_id: str) -> None:
+        if delivery_id in self.tasks:
             return
-        error = (err.strip() or f"exit code {code}")[-ERROR_TAIL_CHARS:]
-        logger.warning("[inbound] script for %s failed (attempt %d): %s", event_id, attempt + 1, error)
-    await _report_failure(gateway, data, error)
+        # A fresh context keeps the work out of the managed delivery that received it.
+        task = asyncio.get_running_loop().create_task(self._run(delivery_id), context=contextvars.Context())
+        self.tasks[delivery_id] = task
+        task.add_done_callback(lambda _: self.tasks.pop(delivery_id, None))
+
+    async def close(self) -> None:
+        tasks = list(self.tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.queue.close()
+
+    async def _wait(self, due: float) -> None:
+        delay = due - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def _run(self, delivery_id: str) -> None:
+        try:
+            await self._advance(delivery_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[inbound] delivery %s stopped unexpectedly", delivery_id)
+
+    async def _advance(self, delivery_id: str) -> None:
+        job = self.queue.get(delivery_id)
+        data = job["data"]
+        if job["stage"] == "script":
+            await self._script(delivery_id, job)
+            job = self.queue.get(delivery_id)
+        if job["stage"] == "agent":
+            if job["attempts"]:
+                # A turn that was running when the bridge stopped is not repeated.
+                self.queue.update(delivery_id, stage="report", due=time.time(),
+                                  error="agent turn was interrupted by a restart")
+            else:
+                self.queue.update(delivery_id, attempts=1)
+                try:
+                    script = _handler(data).get("type") == "script"
+                    encoding = "utf8" if script else str(_request(data).get("body_encoding") or "utf8")
+                    await self._agent_turn(data, job["body"] or "", encoding)
+                    self.queue.update(delivery_id, stage="done")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("[inbound] agent turn for %s failed: %s", data.get("event_id"), exc)
+                    self.queue.update(delivery_id, stage="report", due=time.time(),
+                                      error=f"agent turn failed: {type(exc).__name__}")
+            job = self.queue.get(delivery_id)
+        if job["stage"] == "report":
+            await self._report(delivery_id, job)
+
+    async def _script(self, delivery_id: str, job: dict[str, Any]) -> None:
+        data = job["data"]
+        request = _request(data)
+        stdin = json.dumps({
+            "source": _source_name(data),
+            "event_id": data.get("event_id"),
+            "headers": request.get("headers") if isinstance(request.get("headers"), dict) else {},
+            "body": request.get("body") or "",
+            "body_encoding": request.get("body_encoding") or "utf8",
+        }, ensure_ascii=False).encode()
+        command = str(_handler(data).get("command") or "")
+        attempts, error = job["attempts"], job["error"] or "missing command"
+        while command and attempts <= len(SCRIPT_RETRY_DELAYS):
+            await self._wait(job["due"])
+            attempts += 1
+            self.queue.update(delivery_id, attempts=attempts)
+            code, out, err = await run_script(command, stdin)
+            if code == 0:
+                if out.strip():
+                    self.queue.update(delivery_id, stage="agent", body=out)
+                else:
+                    self.queue.update(delivery_id, stage="done")
+                return
+            error = err.strip() or f"exit code {code}"
+            logger.warning("[inbound] script for %s failed (run %d): %s", data.get("event_id"), attempts, error[-300:])
+            if attempts <= len(SCRIPT_RETRY_DELAYS):
+                job["due"] = time.time() + SCRIPT_RETRY_DELAYS[attempts - 1]
+                self.queue.update(delivery_id, due=job["due"], error=error)
+        self.queue.update(delivery_id, stage="report", due=time.time(), error=error)
+
+    async def _agent_turn(self, data: dict[str, Any], body: str, encoding: str) -> None:
+        event_id = str(data.get("event_id") or "")
+        prompt = inbound_prompt(_source_name(data), event_id, str(_source(data).get("instructions") or ""),
+                                body, encoding)
+        reply = await self.gateway.sessions.get(f"inbound:{_source_name(data)}").run_consult(prompt)
+        logger.info("[inbound] agent turn done: %s reply=%r", event_id, (reply or "")[:300])
+
+    async def _report(self, delivery_id: str, job: dict[str, Any]) -> None:
+        data, attempts = job["data"], job["attempts"]
+        report = getattr(getattr(self.gateway._inkbox, "inbound", None), "report_inbound_event_result", None)
+        while True:
+            await self._wait(job["due"])
+            try:
+                if report is None:
+                    raise RuntimeError("SDK cannot report inbound event results; upgrade inkbox")
+                await asyncio.to_thread(
+                    report, self.gateway.cfg.identity, str(_source(data).get("id") or ""), str(data["event_id"]),
+                    status="failed", error=(job["error"] or "failed")[-REPORT_ERROR_CHARS:],
+                    delivery_id=delivery_id,
+                )
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if _report_done(exc):
+                    logger.info("[inbound] result for %s not recorded: %s", data.get("event_id"), exc)
+                    break
+                attempts += 1
+                job["due"] = time.time() + min(REPORT_MAX_DELAY_SECONDS, 10.0 * 2 ** attempts)
+                if job["due"] - job["since"] > REPORT_WINDOW_SECONDS:
+                    logger.error("[inbound] giving up reporting the result for %s: %s", data.get("event_id"), exc)
+                    break
+                logger.warning("[inbound] reporting the result for %s failed: %s", data.get("event_id"), exc)
+                self.queue.update(delivery_id, attempts=attempts, due=job["due"])
+        self.queue.update(delivery_id, stage="done")

@@ -223,21 +223,26 @@ Inbound answering is configured once per identity (`hosted_agent` for Inkbox Voi
 ## Inbound sources
 
 With `INKBOX_DELIVERY_MODE=local`, the bridge handles `inbound.received` events
-for the identity's inbound sources. Each event is acknowledged right away and
-handled in the background. Retries of the same delivery are ignored; a replay
-(new delivery ID) runs again.
+for the identity's inbound sources. These events always require a valid Inkbox
+signature. Each event is saved to a local queue (`inbound.sqlite` in the bridge
+state directory) and acknowledged; queued events, including ones waiting for a
+retry, resume after a restart. Repeated deliveries with the same `delivery_id`
+are ignored; a replay (new `delivery_id`) runs again.
 
 - `agent` handler: one turn in the `inbound:<source name>` session. The message
   marks the content as untrusted, then carries the source's instructions and the
   request body (binary bodies are noted, not inlined; bodies over 64 KiB are
-  truncated). The agent's text reply is
-  not sent anywhere; it acts through tools.
+  truncated). The agent's text reply is not sent anywhere; it acts through tools.
 - `script` handler: runs `/bin/sh -c "<command>"` in the home directory with
   `{"source", "event_id", "headers", "body", "body_encoding"}` as JSON on stdin and
-  a 120 second timeout. Exit 0 with no output finishes the event; output is passed
-  to the agent as the body. It runs up to 5 times: a failure or timeout is retried
-  after 10 s, 30 s, 2 min and 10 min, then reported to Inkbox as failed with the
-  end of stderr.
+  a 120 second timeout. Exit 0 with no output finishes the event; otherwise the
+  first 64 KiB of output is passed to the agent as the body. It runs up to 5
+  times: a failure or timeout is retried after 10 s, 30 s, 2 min and 10 min.
+
+When the script's last run fails or the agent turn fails, the bridge reports the
+event as failed to Inkbox with the end of stderr (up to 4 KiB is kept). The report
+is retried with backoff for up to 24 hours without running the script again. An
+agent turn interrupted by a restart is reported rather than repeated.
 
 ## External webhooks
 
