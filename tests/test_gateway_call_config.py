@@ -236,6 +236,37 @@ def test_a2a_only_subscription_is_skipped_on_older_api():
     assert [created["event_types"] for created in subscriptions.created] == [gateway.TRANSCRIPTION_EVENTS, gateway.CALL_EVENTS, WHATSAPP_EVENTS]
 
 
+def test_unsupported_transcription_event_does_not_block_existing_channels():
+    from inkbox.exceptions import InkboxAPIError
+
+    class OlderAPI(_FakeSubscriptions):
+        def create(self, **kwargs):
+            if kwargs["event_types"] == gateway.TRANSCRIPTION_EVENTS:
+                raise InkboxAPIError(422, [{
+                    "type": "enum", "loc": ["body", "event_types", 0, family],
+                    "input": "message.transcription_finished",
+                } for family in ("MailWebhookEventType", "IMessageWebhookEventType")])
+            super().create(**kwargs)
+
+    subscriptions = OlderAPI()
+    _patched_gateway(_Identity(phone=_phone(), imessage_enabled=True), subscriptions=subscriptions)
+    assert [row["event_types"] for row in subscriptions.created] == [
+        gateway.TEXT_EVENTS, gateway.A2A_EVENTS, gateway.CALL_EVENTS,
+        gateway.IMESSAGE_EVENTS, WHATSAPP_EVENTS,
+    ]
+
+
+def test_transcription_subscription_does_not_hide_unrelated_validation_failure():
+    from inkbox.exceptions import InkboxAPIError
+
+    class InvalidURL(_FakeSubscriptions):
+        def create(self, **kwargs):
+            raise InkboxAPIError(422, [{"type": "url_scheme", "loc": ["body", "url"]}])
+
+    with pytest.raises(InkboxAPIError):
+        _patched_gateway(_Identity(), subscriptions=InvalidURL())
+
+
 def test_old_api_rejecting_whatsapp_keeps_other_subscriptions():
     class OlderAPI(_FakeSubscriptions):
         def create(self, **kwargs):
