@@ -26,12 +26,11 @@ RECEIVED = {
 FINISHED = SLACK_TRANSCRIPTION_EVENT
 WAIT_SECONDS = 60.0
 RETRY_SECONDS = 5.0
-RETRY_MAX_SECONDS = 300.0
+POLL_SECONDS = 10.0
 
 
 class VoiceNoteNotAdmitted(Exception):
     """The handler stopped before admission, so the resolved input may be replayed."""
-POLL_SECONDS = 10.0
 
 
 def message_for(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -287,7 +286,6 @@ class VoiceNotes:
 
     async def _deliver(self, key: str) -> None:
         envelope = await self._resolve(key)
-        delay = RETRY_SECONDS
         while True:
             retry_at, = self.db.execute("SELECT retry_at FROM voice_notes WHERE key=?", (key,)).fetchone()
             if retry_at and retry_at > time.time():
@@ -308,9 +306,8 @@ class VoiceNotes:
             except VoiceNoteNotAdmitted:
                 # Nothing reached a session; retry the stored result without polling again.
                 logger.warning("Voice-note admission could not start yet; retrying", exc_info=True)
-                self.db.execute("UPDATE voice_notes SET done=0, retry_at=? WHERE key=?", (time.time() + delay, key))
+                self.db.execute("UPDATE voice_notes SET done=0, retry_at=? WHERE key=?", (time.time() + RETRY_SECONDS, key))
                 self.db.commit()
-                delay = min(delay * 2, RETRY_MAX_SECONDS)
                 continue
             except Exception:
                 logger.exception("Voice-note admission is unconfirmed; not replaying")

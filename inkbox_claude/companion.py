@@ -68,7 +68,7 @@ def retryable_read(exc: Exception) -> bool:
         status = exc.response.status_code
     return (
         isinstance(exc, (httpx.TransportError, TimeoutError, ConnectionError))
-        or status == 429
+        or status in (408, 429)
         or (isinstance(status, int) and 500 <= status < 600)
     )
 
