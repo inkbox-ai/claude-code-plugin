@@ -353,7 +353,9 @@ def test_ambiguous_handler_failure_is_not_replayed_after_restart(tmp_path):
         await state.close()
         recovered = inbox(tmp_path, deliver)
         recovered.recover()
-        assert recovered.defer(original) and not recovered.tasks
+        refreshed = deepcopy(original)
+        message_for(refreshed)["media"] = []
+        assert recovered.defer(refreshed) and not recovered.tasks
         assert len(admitted) == 1
         await recovered.close()
     asyncio.run(run())

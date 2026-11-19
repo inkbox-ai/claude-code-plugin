@@ -888,6 +888,9 @@ class InkboxGateway:
             self._self_addresses.add(identity_info["email"].lower())
 
         # Local webhook server first, so the tunnel has something to hit.
+        # Load receipt ownership before a replay with refreshed attachment
+        # metadata can reach the ordinary channel handler.
+        self._voice_note_inbox()
         await self._start_http_server()
 
         if self.cfg.public_url:
