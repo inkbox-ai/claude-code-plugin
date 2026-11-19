@@ -23,7 +23,10 @@ SLACK_ATTENTION_EVENTS = tuple(
     event for event in SLACK_INCOMING_EVENTS if event != "slack.channel_message_received"
 )
 SLACK_STOP_EVENT = "slack.session_stopped"
-SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
+# Slack delivers a voice-note completion only to receivers that also select its
+# original message event, so the completion shares the Slack receiver.
+SLACK_TRANSCRIPTION_EVENT = "message.transcription_finished"
+SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT, SLACK_TRANSCRIPTION_EVENT)
 SLACK_MAX_TEXT_LENGTH = 12000
 SLACK_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
@@ -69,9 +72,22 @@ def slack_resource(client: Any) -> Any:
 
 
 def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
+    from .voice_notes import transcription_unsupported
+
+    try:
+        _reconcile_subscription(client, identity_id, url, SLACK_SUBSCRIPTION_EVENTS)
+    except Exception as exc:
+        if not transcription_unsupported(exc):
+            raise
+        # Keep Slack available on servers without completion notifications.
+        _reconcile_subscription(client, identity_id, url, tuple(
+            event for event in SLACK_SUBSCRIPTION_EVENTS if event != SLACK_TRANSCRIPTION_EVENT))
+
+
+def _reconcile_subscription(client: Any, identity_id: Any, url: str, wanted: tuple[str, ...]) -> None:
     slack_resource(client)
     subscriptions = client.webhooks.subscriptions
-    events = list(SLACK_SUBSCRIPTION_EVENTS)
+    events = list(wanted)
     covered = set()
     message_subscriptions = []
     for sub in subscriptions.list(agent_identity_id=identity_id, scope="identity", url=url):
@@ -97,7 +113,9 @@ def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
     )
 
 
-def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] | None:
+def inbound_message(
+    envelope: dict, identity_id: str, *, transcripts: bool = True,
+) -> tuple[str, str, dict] | None:
     data = envelope.get("data")
     if not isinstance(data, dict) or data.get("identity_id") != identity_id:
         return None
@@ -136,6 +154,9 @@ def inbound_message(envelope: dict, identity_id: str) -> tuple[str, str, dict] |
         return None
     body = raw
     files = event.get("files")
+    if transcripts and isinstance(files, list):
+        from .voice_notes import transcript_note
+        body += transcript_note([file for file in files if isinstance(file, dict)])
     if isinstance(files, list) and files:
         body += "\nAttachment references (not downloaded): " + json.dumps([
             {key: file[key] for key in ("id", "name", "mimetype", "size") if key in file}

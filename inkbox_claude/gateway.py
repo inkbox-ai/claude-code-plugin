@@ -21,7 +21,7 @@ The bridge's runtime core:
 from __future__ import annotations
 
 from . import managed_work
-from .voice_notes import FINISHED
+from .voice_notes import FINISHED, transcription_unsupported as _transcription_subscription_unsupported
 from .inbound import INBOUND_RECEIVED, InboundFull, InboundRunner
 
 import asyncio
@@ -697,23 +697,6 @@ A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 A2A_STOPPED_STATES = A2A_TERMINAL_STATES | {"input_required", "auth_required"}
 _A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 _A2A_RETRY_INTERVAL_SECONDS = 5.0
-
-
-def _transcription_subscription_unsupported(exc: Exception) -> bool:
-    if isinstance(exc, ValueError):
-        return str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet.")
-    errors = getattr(exc, "detail", None)
-    if getattr(exc, "status_code", None) != 422 or not isinstance(errors, list) or not errors:
-        return False
-    # The API reports one enum error per channel when none recognize the event.
-    return all(
-        isinstance(error, dict)
-        and error.get("type") == "enum"
-        and isinstance(error.get("loc"), list)
-        and error["loc"][:3] == ["body", "event_types", 0]
-        and error.get("input") == FINISHED
-        for error in errors
-    )
 
 
 def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
@@ -1750,6 +1733,8 @@ class InkboxGateway:
             return await self._on_text_received(envelope)
         if event_type == "imessage.received":
             return await self._on_imessage_received(envelope)
+        if str(event_type).startswith("slack."):
+            return await self._on_slack_received(envelope)
         from .whatsapp import receive
         return await receive(self, envelope)
 

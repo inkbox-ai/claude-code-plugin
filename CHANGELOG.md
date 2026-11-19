@@ -7,6 +7,7 @@
 - `InkboxGateway.inbound_activity()` returns the number of inbound events still to handle, including running scripts and script retry waits; pending failure reports are not counted.
 - `InkboxGateway.inbound_full()` tells a host that acknowledges deliveries itself to refuse a new `inbound.received` delivery first; such a host sets `inbound_bounded = False` so a delivery it already acknowledged is always queued.
 - Require Inkbox SDK 0.7.41.
+- Wait for incoming Slack voice-note transcripts the same way as other channels, including the completion notification, a single message read, and the transcript label.
 
 ## 0.2.30 (unreleased)
 

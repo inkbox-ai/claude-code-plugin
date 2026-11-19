@@ -148,13 +148,25 @@ def prepare_envelope(client: Any, identity_handle: str, envelope: dict) -> dict:
     return result
 
 
+def _voice_media(event: dict) -> list[dict]:
+    """Keep only the file fields that voice-note waiting and labeling read."""
+    files = event.get("files")
+    if not isinstance(files, list) or not any(
+        isinstance(item, dict) and isinstance(item.get("transcription"), dict) for item in files
+    ):
+        return []
+    return [{key: item[key] for key in ("id", "name", "mimetype", "transcription") if key in item}
+            for item in files if isinstance(item, dict)]
+
+
 def normalize_envelope(client: Any, identity_handle: str, envelope: dict) -> dict:
     """Normalize verified Slack input to the durable conversation receipt shape."""
     from .slack import inbound_message
 
     require_sdk_support()
     prepared = prepare_envelope(client, identity_handle, envelope)
-    incoming = inbound_message(prepared, prepared["data"]["identity_id"])
+    # Voice-note results are labeled after the receipt waits for them.
+    incoming = inbound_message(prepared, prepared["data"]["identity_id"], transcripts=False)
     if incoming is None:
         raise ValueError("Invalid Slack Companion message")
     _, body, route = incoming
@@ -167,5 +179,6 @@ def normalize_envelope(client: Any, identity_handle: str, envelope: dict) -> dic
         "id": source["id"], "conversation_id": scope["conversation_id"],
         "direction": "inbound", "text": body, "slack_author": source["author"],
         "sender_access": prepared["data"].get("sender_access"), "slack_route": route,
+        **({"media": media} if (media := _voice_media(prepared["data"]["event"])) else {}),
     }}
     return result
