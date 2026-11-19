@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 INBOUND_RECEIVED = "inbound.received"
 SCRIPT_TIMEOUT_SECONDS = 120.0
+TURN_TIMEOUT_SECONDS = 1800
 SCRIPT_RETRY_DELAYS = (10.0, 30.0, 120.0, 600.0)
 MAX_PROMPT_BODY_BYTES = 64 * 1024
 MAX_STDOUT_BYTES = 64 * 1024
@@ -328,7 +329,11 @@ class InboundRunner:
         event_id = str(data.get("event_id") or "")
         prompt = inbound_prompt(_source_name(data), event_id, str(_source(data).get("instructions") or ""),
                                 body, encoding)
-        reply = await self.gateway.sessions.get(f"inbound:{_source_name(data)}").run_consult(prompt)
+        turn = self.gateway.sessions.get(f"inbound:{_source_name(data)}").run_consult(prompt)
+        try:
+            reply = await asyncio.wait_for(turn, TURN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise TimeoutError(f"agent turn did not finish within {TURN_TIMEOUT_SECONDS // 60} minutes") from None
         logger.info("[inbound] agent turn done: %s reply=%r", event_id, (reply or "")[:300])
 
     async def _report(self, delivery_id: str, job: dict[str, Any]) -> None:

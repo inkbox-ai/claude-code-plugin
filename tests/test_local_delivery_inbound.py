@@ -499,6 +499,15 @@ def test_agent_handler_failure_is_reported():
     assert report[3:] == ("failed", "agent turn failed: RuntimeError", _data()["delivery_id"])
 
 
+def test_stuck_agent_turn_is_reported_after_the_bound(monkeypatch):
+    monkeypatch.setattr(inbound, "TURN_TIMEOUT_SECONDS", 0.05)
+    gw = _gateway()
+    gw.sessions.block = asyncio.Event()
+    _run(gw, _data())
+    [report] = gw._inkbox.inbound.reports
+    assert report[3:] == ("failed", "agent turn failed: TimeoutError", _data()["delivery_id"])
+
+
 def test_interrupted_agent_turn_is_reported_not_repeated():
     async def first():
         gw = _gateway()
