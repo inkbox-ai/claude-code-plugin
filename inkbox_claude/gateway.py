@@ -3833,7 +3833,7 @@ class InkboxGateway:
         return web.json_response({"ok": True} if added else {"ok": True, "deduped": True})
 
     def inbound_activity(self) -> int:
-        """Inbound deliveries still pending, including retry waits and unsent failure reports."""
+        """Inbound deliveries still to handle, including script retry waits; pending failure reports are not counted."""
         return self._inbound.activity() if self._inbound is not None else 0
 
     def _read_a2a_registry(self) -> Dict[str, Any]:

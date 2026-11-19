@@ -196,8 +196,8 @@ class InboundRunner:
         self.started = False
 
     def activity(self) -> int:
-        """Pending deliveries, including those waiting out a retry delay."""
-        return len(self.queue.pending())
+        """Deliveries still to handle, including script retry waits; pending failure reports are not counted."""
+        return self.queue.db.execute("SELECT count(*) FROM jobs WHERE stage IN ('script', 'agent')").fetchone()[0]
 
     def receive(self, data: dict[str, Any]) -> bool:
         added = self.queue.add(data)

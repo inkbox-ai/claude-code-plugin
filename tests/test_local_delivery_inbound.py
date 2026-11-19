@@ -136,7 +136,7 @@ def _signed(body: bytes, secret=SECRET):
 
 async def _settled(gw):
     async with asyncio.timeout(10):
-        while gw.inbound_activity():
+        while gw._inbound.queue.pending():
             await asyncio.sleep(0.01)
 
 
@@ -467,6 +467,15 @@ def test_pending_report_resumes_after_restart_without_rerunning_script(isolated_
     assert restarted._inkbox.inbound.reports == [("agent", "inbsrc_1", "inbev_1", "failed", "exit code 1", delivery)]
 
 
+def test_pending_report_is_not_activity(isolated_home):
+    gw = _gateway()
+    gw._inbound.receive(_data({"type": "script", "command": "exit 1"}))
+    assert gw.inbound_activity() == 1
+    gw._inbound.queue.update(_data()["delivery_id"], stage="report", due=time.time(), error="exit code 1")
+    assert gw.inbound_activity() == 0 and gw._inbound.queue.pending()
+    gw._inbound.queue.close()
+
+
 def test_stale_delivery_report_counts_as_done(instant_waits, monkeypatch):
     monkeypatch.setattr(inbound, "SCRIPT_RETRY_DELAYS", ())
     inkbox = types.SimpleNamespace(inbound=_Inbound([StaleDelivery()]))
@@ -514,3 +523,10 @@ def test_report_without_sdk_support_is_retried(monkeypatch, instant_waits):
     _run(_gateway(), _data({"type": "script", "command": "exit 1"}), inkbox=types.SimpleNamespace())
     assert instant_waits == [20, 40]
 
+
+
+@pytest.mark.parametrize(("status", "done"), [(409, True), (400, True), (404, True), (408, False),
+                                               (429, False), (500, False), (503, False), (None, False)])
+def test_report_response_handling(status, done):
+    exc = ConnectionError("offline") if status is None else type("ApiError", (Exception,), {"status_code": status})()
+    assert inbound._report_done(exc) is done
