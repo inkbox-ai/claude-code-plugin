@@ -573,21 +573,67 @@ def test_slack_label_matches_other_channels_and_follows_typed_text():
     assert "Voice note" not in plain
 
 
-def test_slack_companion_receipt_waits_with_the_native_conversation(tmp_path):
+def test_slack_completion_before_original_is_cached_without_waking(tmp_path):
     async def run():
+        delivered = []
+
         async def deliver(item):
-            raise AssertionError("The Companion consumer owns this turn")
+            delivered.append(item)
 
         state = inbox(tmp_path, deliver)
-        view = {"id": SLACK_MESSAGE, "conversation_id": "D_TEST", "connection_id": SLACK_CONNECTION,
-                "media": [{key: item[key] for key in ("id", "name", "mimetype", "transcription") if key in item}
-                          for item in slack_files("pending")]}
-        waiting = asyncio.create_task(state.resolve_message("slack", view))
-        await asyncio.sleep(0)
-        state.complete(slack_completion(slack_envelope()))
-        resolved = await asyncio.wait_for(waiting, 1)
-        assert resolved["media"][0]["transcription"]["status"] == "completed"
-        assert resolved["media"][1] == view["media"][1]
+        original = slack_envelope()
+        state.complete(slack_completion(original))
+        assert not state.tasks and not delivered
+        assert state.defer(original)
+        await next(iter(state.tasks.values()))
+        assert len(delivered) == 1 and not pending(message_for(delivered[0]))
+        assert delivered[0]["data"]["event"]["files"][0]["transcription"]["text"] == "Move the review to Thursday."
+        await state.close()
+
+    asyncio.run(run())
+
+
+def test_slack_shutdown_retains_original_and_does_not_restart_sixty_second_deadline(tmp_path):
+    async def run():
+        delivered = []
+
+        async def deliver(item):
+            delivered.append(item)
+
+        first = inbox(tmp_path, deliver)
+        first.defer(slack_envelope())
+        deadline = first.db.execute("SELECT deadline FROM voice_notes").fetchone()[0]
+        await first.close()
+        second = inbox(tmp_path, deliver)
+        assert second.db.execute("SELECT deadline FROM voice_notes").fetchone()[0] == deadline
+        second.complete(slack_completion(slack_envelope()))
+        second.recover()
+        await next(iter(second.tasks.values()))
+        assert len(delivered) == 1
+        assert delivered[0]["event_type"] == "slack.dm_received"
+        assert delivered[0]["data"]["event"]["files"][0]["transcription"]["status"] == "completed"
+        await second.close()
+
+    asyncio.run(run())
+
+
+def test_slack_results_from_another_connection_are_not_merged(tmp_path):
+    async def run():
+        async def deliver(item):
+            raise AssertionError("The mismatched completion must not resolve the message")
+
+        original = message_for(slack_envelope())
+        foreign = message_for(slack_completion(slack_envelope()))
+        foreign["connection_id"] = "00000000-0000-4000-8000-00000000000b"
+        assert merge_results(original, foreign) == original
+        state = inbox(tmp_path, deliver)
+        mismatched = slack_completion(slack_envelope())
+        mismatched["data"]["connection_id"] = foreign["connection_id"]
+        state.complete(mismatched)
+        assert state.defer(slack_envelope())
+        waiting = next(iter(state.tasks.values()))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
         await state.close()
 
     asyncio.run(run())
