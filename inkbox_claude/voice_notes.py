@@ -14,16 +14,14 @@ import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
+from .slack import SLACK_INCOMING_EVENTS
+
 logger = logging.getLogger(__name__)
 RECEIVED = {
     "text.received": "text",
     "imessage.received": "imessage",
     "whatsapp.received": "whatsapp",
-    "slack.dm_received": "slack",
-    "slack.group_dm_received": "slack",
-    "slack.channel_message_received": "slack",
-    "slack.mention_received": "slack",
-    "slack.thread_reply_received": "slack",
+    **{event_type: "slack" for event_type in SLACK_INCOMING_EVENTS},
 }
 FINISHED = "message.transcription_finished"
 WAIT_SECONDS = 60.0
@@ -54,7 +52,7 @@ def message_for(envelope: dict[str, Any]) -> dict[str, Any]:
 def envelope_for(channel: str, message: dict[str, Any]) -> dict[str, Any]:
     """Build the received-event shape whose message_for view is ``message``."""
     if channel == "slack":
-        return {"event_type": "slack.received", "data": {
+        return {"event_type": SLACK_INCOMING_EVENTS[0], "data": {
             "message_id": message.get("id"),
             "conversation_id": message.get("conversation_id"),
             "connection_id": message.get("connection_id"),
@@ -130,12 +128,9 @@ def merge_results(original: dict[str, Any], current: dict[str, Any]) -> dict[str
     result = deepcopy(original)
     if str(current.get("id") or "") != str(original.get("id") or ""):
         return result
-    if (
-        current.get("conversation_id")
-        and original.get("conversation_id")
-        and current["conversation_id"] != original["conversation_id"]
-    ):
-        return result
+    for field in ("conversation_id", "connection_id"):
+        if current.get(field) and original.get(field) and str(current[field]) != str(original[field]):
+            return result
     refreshed = current.get("media") or []
     by_id = {
         str(item["id"]): item
@@ -402,6 +397,7 @@ class VoiceNotes:
             return {
                 "id": message_id,
                 "conversation_id": found[0].get("conversation_id"),
+                "connection_id": found[0].get("connection_id"),
                 "media": found[0].get("files") or [],
             }
         if channel == "text":
