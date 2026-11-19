@@ -695,7 +695,14 @@ def test_slack_connection_read_failure_retries_without_polling_again(tmp_path, m
     asyncio.run(run())
 
 
-def test_gateway_marks_transient_slack_connection_reads_as_not_admitted():
+class _StatusError(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize("failure", [ConnectionError("connection reset"), _StatusError(408), _StatusError(503)])
+def test_gateway_marks_transient_slack_connection_reads_as_not_admitted(failure):
     from inkbox_claude.config import BridgeConfig
     from inkbox_claude.slack import inbound_message
     from inkbox_claude.voice_notes import VoiceNoteNotAdmitted
@@ -706,12 +713,36 @@ def test_gateway_marks_transient_slack_connection_reads_as_not_admitted():
         bridge._identity = types.SimpleNamespace(id=SLACK_IDENTITY)
         bridge._sender_allowed = lambda *_args: True
         bridge._inkbox = types.SimpleNamespace(slack=types.SimpleNamespace(
-            list_connections=Mock(side_effect=OSError("connection read unavailable"))))
+            list_connections=Mock(side_effect=failure)))
         bridge._channel_store = Mock()
         received = slack_envelope("completed")
         assert inbound_message(received, SLACK_IDENTITY) is not None
-        with pytest.raises(VoiceNoteNotAdmitted):
+        with pytest.raises(VoiceNoteNotAdmitted) as raised:
             await bridge._on_slack_received(received)
+        assert raised.value.__cause__ is failure
+        bridge._channel_store.assert_not_called()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", [_StatusError(403), TypeError("unexpected payload")])
+def test_gateway_reraises_nontransient_slack_connection_reads_unchanged(failure):
+    from inkbox_claude.config import BridgeConfig
+    from inkbox_claude.slack import inbound_message
+
+    async def run():
+        bridge = object.__new__(gateway.InkboxGateway)
+        bridge.cfg = BridgeConfig(slack_enabled=True)
+        bridge._identity = types.SimpleNamespace(id=SLACK_IDENTITY)
+        bridge._sender_allowed = lambda *_args: True
+        bridge._inkbox = types.SimpleNamespace(slack=types.SimpleNamespace(
+            list_connections=Mock(side_effect=failure)))
+        bridge._channel_store = Mock()
+        received = slack_envelope("completed")
+        assert inbound_message(received, SLACK_IDENTITY) is not None
+        with pytest.raises(type(failure)) as raised:
+            await bridge._on_slack_received(received)
+        assert raised.value is failure
         bridge._channel_store.assert_not_called()
 
     asyncio.run(run())

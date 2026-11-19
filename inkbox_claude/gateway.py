@@ -1905,7 +1905,10 @@ class InkboxGateway:
         except (PermissionError, ValueError):
             return web.json_response({"ok": True, "ignored": "slack-connection-unavailable"})
         except Exception as exc:
-            # A failed read precedes admission, so the input can be delivered again.
+            from .companion import retryable_read
+            if not retryable_read(exc):
+                raise
+            # A transient read failure precedes admission, so the input can be delivered again.
             from .voice_notes import VoiceNoteNotAdmitted
             raise VoiceNoteNotAdmitted("Slack connection could not be read") from exc
         session = self.sessions.sessions.get(chat_id)
