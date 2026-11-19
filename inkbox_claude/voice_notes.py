@@ -14,7 +14,7 @@ import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
-from .slack import SLACK_INCOMING_EVENTS
+from .slack import SLACK_INCOMING_EVENTS, SLACK_TRANSCRIPTION_EVENT
 
 logger = logging.getLogger(__name__)
 RECEIVED = {
@@ -23,8 +23,14 @@ RECEIVED = {
     "whatsapp.received": "whatsapp",
     **{event_type: "slack" for event_type in SLACK_INCOMING_EVENTS},
 }
-FINISHED = "message.transcription_finished"
+FINISHED = SLACK_TRANSCRIPTION_EVENT
 WAIT_SECONDS = 60.0
+RETRY_SECONDS = 5.0
+RETRY_MAX_SECONDS = 300.0
+
+
+class VoiceNoteNotAdmitted(Exception):
+    """The handler stopped before admission, so the resolved input may be replayed."""
 POLL_SECONDS = 10.0
 
 
@@ -281,25 +287,35 @@ class VoiceNotes:
 
     async def _deliver(self, key: str) -> None:
         envelope = await self._resolve(key)
-        retry_at, = self.db.execute("SELECT retry_at FROM voice_notes WHERE key=?", (key,)).fetchone()
-        if retry_at and retry_at > time.time():
-            await asyncio.sleep(retry_at - time.time())
-        while not self.ready():
-            self.db.execute("UPDATE voice_notes SET retry_at=? WHERE key=?", (time.time() + 5, key))
-            self.db.commit()
-            await asyncio.sleep(5)
+        delay = RETRY_SECONDS
+        while True:
+            retry_at, = self.db.execute("SELECT retry_at FROM voice_notes WHERE key=?", (key,)).fetchone()
+            if retry_at and retry_at > time.time():
+                await asyncio.sleep(retry_at - time.time())
+            while not self.ready():
+                self.db.execute("UPDATE voice_notes SET retry_at=? WHERE key=?", (time.time() + 5, key))
+                self.db.commit()
+                await asyncio.sleep(5)
 
-        # An interrupted handler may already own the input. Only pending rows
-        # are recoverable; keep ambiguous receipts for inspection.
-        claimed = self.db.execute("UPDATE voice_notes SET done=2 WHERE key=? AND done=0", (key,))
-        self.db.commit()
-        if not claimed.rowcount:
-            return
-        try:
-            response = await self.deliver(envelope)
-        except Exception:
-            logger.exception("Voice-note admission is unconfirmed; not replaying")
-            return
+            # An interrupted handler may already own the input. Only pending rows
+            # are recoverable; keep ambiguous receipts for inspection.
+            claimed = self.db.execute("UPDATE voice_notes SET done=2 WHERE key=? AND done=0", (key,))
+            self.db.commit()
+            if not claimed.rowcount:
+                return
+            try:
+                response = await self.deliver(envelope)
+            except VoiceNoteNotAdmitted:
+                # Nothing reached a session; retry the stored result without polling again.
+                logger.warning("Voice-note admission could not start yet; retrying", exc_info=True)
+                self.db.execute("UPDATE voice_notes SET done=0, retry_at=? WHERE key=?", (time.time() + delay, key))
+                self.db.commit()
+                delay = min(delay * 2, RETRY_MAX_SECONDS)
+                continue
+            except Exception:
+                logger.exception("Voice-note admission is unconfirmed; not replaying")
+                return
+            break
         status = getattr(response, "status", 200)
         if 200 <= status < 300 or status in (400, 401, 403, 404, 422):
             self.db.execute("UPDATE voice_notes SET done=1 WHERE key=?", (key,))

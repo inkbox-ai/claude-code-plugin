@@ -1904,6 +1904,10 @@ class InkboxGateway:
             meta["slack_bot_user_id"] = await asyncio.to_thread(validate_connection, self._inkbox.slack, str(self._identity.id), meta)
         except (PermissionError, ValueError):
             return web.json_response({"ok": True, "ignored": "slack-connection-unavailable"})
+        except Exception as exc:
+            # A failed read precedes admission, so the input can be delivered again.
+            from .voice_notes import VoiceNoteNotAdmitted
+            raise VoiceNoteNotAdmitted("Slack connection could not be read") from exc
         session = self.sessions.sessions.get(chat_id)
         if stop:
             candidates = list(self.sessions.sessions.items())
