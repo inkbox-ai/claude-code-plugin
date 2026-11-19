@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.31 (unreleased)
+
+- Add `INKBOX_DELIVERY_MODE=local`: open no tunnel, register no webhook URL, listen on 127.0.0.1 only, and accept event bodies up to 2 MiB. Signature verification is unchanged.
+- Handle `inbound.received` events in local delivery mode, deduplicated by delivery ID (falling back to event ID) so retries run once and replays run again. `agent` sources run one turn in the `inbound:<source>` session with the body marked as untrusted content and capped at 64 KiB; `script` sources run the command with the event on stdin and pass non-empty output to the agent. Scripts run up to 5 times (retries after 10 s, 30 s, 2 min, and 10 min, 120 s timeout each) before the failure is reported.
+- Require Inkbox SDK 0.7.41.
+
 ## 0.2.30 (unreleased)
 
 - Wait up to 60 seconds for incoming voice-note transcripts, then read the message once before continuing with its original attachments.

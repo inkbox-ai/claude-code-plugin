@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from . import managed_work
 from .voice_notes import FINISHED
+from .inbound import INBOUND_RECEIVED, dedupe_key, run_inbound_event
 
 import asyncio
 import hashlib
@@ -648,6 +649,7 @@ EXTERNAL_EVENT_UNVERIFIED_DIRECTIVE = (
 )
 
 WEBHOOK_DEDUP_TTL_SECONDS = 300
+LOCAL_DELIVERY_MAX_BYTES = 2 * 1024 * 1024
 CONTACT_CACHE_TTL_SECONDS = 300
 SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
 IMESSAGE_MAX_LENGTH = 18995  # Inkbox iMessage text cap
@@ -853,6 +855,7 @@ class InkboxGateway:
         self._hosted_call_registry_path = state_root / "hosted_call_completions.json"
         self._hosted_call_registry_owner = uuid.uuid4().hex
         self._hosted_call_jobs: Dict[str, asyncio.Task[Any]] = {}
+        self._inbound_active: set[str] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -910,13 +913,16 @@ class InkboxGateway:
         self._voice_note_inbox()
         await self._start_http_server()
 
-        if self.cfg.public_url:
+        if self.cfg.local_delivery:
+            logger.info("[bridge] local delivery: no tunnel, events arrive on 127.0.0.1:%d", self.cfg.port)
+        elif self.cfg.public_url:
             self._public_url = self.cfg.public_url.rstrip("/")
             self._public_host = self._public_url.split("://", 1)[-1]
         else:
             await self._open_tunnel()
 
-        await asyncio.to_thread(self._patch_identity_objects)
+        if not self.cfg.local_delivery:
+            await asyncio.to_thread(self._patch_identity_objects)
         if self.cfg.imessage_threaded_replies:
             from .config import imessage_threading_capability
             supported, detail = imessage_threading_capability(self._identity)
@@ -964,16 +970,18 @@ class InkboxGateway:
             await self._cleanup()
 
     async def _start_http_server(self) -> None:
-        app = web.Application()
+        local = self.cfg.local_delivery
+        app = web.Application(client_max_size=LOCAL_DELIVERY_MAX_BYTES) if local else web.Application()
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/ready", self._handle_ready)
         app.router.add_post(DEFAULT_WEBHOOK_PATH, self._handle_webhook)
         app.router.add_get(INKBOX_WS_PATH, self._handle_call_ws)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, self.cfg.host, self.cfg.port)
+        host = "127.0.0.1" if local else self.cfg.host
+        site = web.TCPSite(self._runner, host, self.cfg.port)
         await site.start()
-        logger.info("[bridge] webhook server on %s:%d", self.cfg.host, self.cfg.port)
+        logger.info("[bridge] webhook server on %s:%d", host, self.cfg.port)
 
     async def _open_tunnel(self) -> None:
         if not INKBOX_TUNNEL_AVAILABLE:
@@ -2106,6 +2114,8 @@ class InkboxGateway:
 
         if source == "inkbox" and envelope.get("event_type") == FINISHED:
             return self._voice_note_receipt(envelope["event_type"], envelope)
+        if source == "inkbox" and envelope.get("event_type") == INBOUND_RECEIVED:
+            return self._on_inbound_received(envelope)
 
         data = envelope.get("data")
         has_companion = envelope.get("companion") is not None
@@ -3803,6 +3813,35 @@ class InkboxGateway:
         managed_work.spawn(self._run_external_turn(chat_id, prompt, directive))
         return web.json_response({"ok": True})
 
+    def _on_inbound_received(self, envelope: Dict[str, Any]) -> "web.Response":
+        """Ack an ``inbound.received`` event and handle it in the background."""
+        if not self.cfg.local_delivery:
+            return web.json_response({"ok": True, "ignored": INBOUND_RECEIVED})
+        data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+        if not data.get("event_id"):
+            return web.Response(status=400, text="inbound event_id required")
+        if self.sessions is None:
+            return web.Response(status=503, text="Inbound handler is starting")
+        delivery = dedupe_key(data)
+        key = f"inbound:{delivery}"
+        # Script retries outlast the dedup window.
+        if delivery in self._inbound_active or self._dedup_begin(key):
+            return web.json_response({"ok": True, "deduped": True})
+        self._inbound_active.add(delivery)
+
+        async def _job() -> None:
+            try:
+                await run_inbound_event(self, data)
+                self._dedup_commit(key)
+            except BaseException:
+                self._dedup_rollback(key)
+                raise
+            finally:
+                self._inbound_active.discard(delivery)
+
+        managed_work.spawn(_job())
+        return web.json_response({"ok": True})
+
     def _read_a2a_registry(self) -> Dict[str, Any]:
         try:
             loaded = json.loads(self._a2a_registry_path.read_text())
@@ -5192,7 +5231,9 @@ class InkboxGateway:
             lines.append(f"Inkbox: NOT reachable — {exc}")
 
         # Inbound path: the tunnel + reconciled webhook subscriptions.
-        if self._public_url:
+        if self.cfg.local_delivery:
+            lines.append("Inbound: local delivery")
+        elif self._public_url:
             lines.append(f"Inbound: connected ({self._public_host or self._public_url})")
         else:
             lines.append("Inbound: not connected")

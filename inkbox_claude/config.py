@@ -105,6 +105,8 @@ class BridgeConfig:
     companion_response_mode: str = "safe"
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
+    # Events arrive on the loopback listener: no tunnel, no public URL.
+    local_delivery: bool = False
     # Claude Code side
     project_dir: str = ""
     claude_model: str = ""
@@ -214,6 +216,7 @@ def read_config(extra: Dict[str, Any] | None = None) -> BridgeConfig:
         companion_response_mode=_mode_env("INKBOX_COMPANION_RESPONSE_MODE", "safe", {"safe", "relaxed"}),
         host=str(os.getenv("INKBOX_BRIDGE_HOST") or DEFAULT_HOST).strip(),
         port=int(os.getenv("INKBOX_BRIDGE_PORT") or DEFAULT_PORT),
+        local_delivery=_mode_env("INKBOX_DELIVERY_MODE", "tunnel", {"tunnel", "local"}) == "local",
         project_dir=str(os.getenv("CLAUDE_PROJECT_DIR") or extra.get("project_dir") or os.getcwd()).strip(),
         claude_model=str(os.getenv("CLAUDE_MODEL") or extra.get("claude_model") or "").strip(),
         permission_timeout_s=float(os.getenv("INKBOX_PERMISSION_TIMEOUT_S") or 600.0),
