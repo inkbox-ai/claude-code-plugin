@@ -25,6 +25,9 @@ MAX_PROMPT_BODY_BYTES = 64 * 1024
 MAX_STDOUT_BYTES = 64 * 1024
 STDERR_TAIL_BYTES = 4 * 1024
 REPORT_ERROR_CHARS = 2000
+MAX_PENDING_EVENTS = 100
+MAX_PENDING_BYTES = 64 * 1024 * 1024
+MAX_CONCURRENT_SCRIPTS = 4
 REPORT_MAX_DELAY_SECONDS = 3600.0
 DONE_RETENTION_SECONDS = 7 * 24 * 3600.0
 
@@ -66,6 +69,10 @@ def _source(data: dict[str, Any]) -> dict[str, Any]:
 def _source_name(data: dict[str, Any]) -> str:
     name = str(_source(data).get("name") or "").replace("\r", "").replace("\n", " ").strip()
     return name[:80] or "unknown"
+
+
+def _source_id(data: dict[str, Any]) -> str:
+    return str(_source(data).get("id") or "")
 
 
 def _request(data: dict[str, Any]) -> dict[str, Any]:
@@ -150,6 +157,10 @@ async def run_script(command: str, stdin: bytes, timeout: float = SCRIPT_TIMEOUT
     return proc.returncode, stdout, err.decode("utf-8", "replace")
 
 
+class InboundFull(Exception):
+    """The queue holds too much unfinished work to accept another delivery."""
+
+
 class InboundQueue:
     """Events persisted on receipt; each row walks script -> agent -> report -> done."""
 
@@ -168,16 +179,29 @@ class InboundQueue:
                         (time.time() - DONE_RETENTION_SECONDS,))
 
     def add(self, data: dict[str, Any]) -> bool:
-        """Persist a new delivery; False when this delivery id was already received."""
+        """Persist a new delivery; False when this delivery id was already received.
+
+        Raises ``InboundFull`` before storing when unfinished work is at its cap.
+        """
+        delivery_id = str(data["delivery_id"])
+        if self.db.execute("SELECT 1 FROM jobs WHERE delivery_id = ?", (delivery_id,)).fetchone():
+            return False
         script = _handler(data).get("type") == "script"
         body = None if script else str(_request(data).get("body") or "")
+        payload = json.dumps(data, ensure_ascii=False)
+        count, used = self.db.execute(
+            "SELECT count(*), coalesce(sum(length(CAST(data AS BLOB)) + coalesce(length(CAST(body AS BLOB)), 0)), 0)"
+            " FROM jobs WHERE stage != 'done'"
+        ).fetchone()
+        size = len(payload.encode()) + len((body or "").encode())
+        if count >= MAX_PENDING_EVENTS or used + size > MAX_PENDING_BYTES:
+            raise InboundFull("inbound queue is full")
         now = time.time()
-        cursor = self.db.execute(
-            "INSERT OR IGNORE INTO jobs (delivery_id, data, stage, due, body, since) VALUES (?, ?, ?, ?, ?, ?)",
-            (str(data["delivery_id"]), json.dumps(data, ensure_ascii=False),
-             "script" if script else "agent", now, body, now),
+        self.db.execute(
+            "INSERT INTO jobs (delivery_id, data, stage, due, body, since) VALUES (?, ?, ?, ?, ?, ?)",
+            (delivery_id, payload, "script" if script else "agent", now, body, now),
         )
-        return cursor.rowcount == 1
+        return True
 
     def pending(self) -> list[str]:
         return [row[0] for row in self.db.execute("SELECT delivery_id FROM jobs WHERE stage != 'done'")]
@@ -219,6 +243,7 @@ class InboundRunner:
         self.queue = InboundQueue(path)
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.started = False
+        self.script_slots = asyncio.Semaphore(MAX_CONCURRENT_SCRIPTS)
 
     def activity(self) -> int:
         """Deliveries still to handle, including script retry waits; pending failure reports are not counted."""
@@ -309,9 +334,10 @@ class InboundRunner:
         error = job["error"] or ("script run was interrupted by a restart" if command else "missing command")
         while command and attempts <= len(SCRIPT_RETRY_DELAYS):
             await self._wait(job["due"])
-            attempts += 1
-            self.queue.update(delivery_id, attempts=attempts)
-            code, out, err = await run_script(command, stdin)
+            async with self.script_slots:
+                attempts += 1
+                self.queue.update(delivery_id, attempts=attempts)
+                code, out, err = await run_script(command, stdin)
             if code == 0:
                 if out.strip():
                     self.queue.update(delivery_id, stage="agent", body=out)
@@ -329,23 +355,18 @@ class InboundRunner:
         event_id = str(data.get("event_id") or "")
         prompt = inbound_prompt(_source_name(data), event_id, str(_source(data).get("instructions") or ""),
                                 body, encoding)
-        turn = self.gateway.sessions.get(f"inbound:{_source_name(data)}").run_consult(prompt)
-        try:
-            reply = await asyncio.wait_for(turn, TURN_TIMEOUT_SECONDS)
-        except TimeoutError:
-            raise TimeoutError(f"agent turn did not finish within {TURN_TIMEOUT_SECONDS // 60} minutes") from None
+        session = self.gateway.sessions.get(f"inbound:{_source_id(data)}")
+        reply = await session.run_consult(prompt, fail_on_error=True, run_timeout=TURN_TIMEOUT_SECONDS)
         logger.info("[inbound] agent turn done: %s reply=%r", event_id, (reply or "")[:300])
 
     async def _report(self, delivery_id: str, job: dict[str, Any]) -> None:
         data, attempts = job["data"], job["attempts"]
         report = getattr(getattr(self.gateway._inkbox, "inbound", None), "report_inbound_event_result", None)
-        while True:
+        while report is not None:
             await self._wait(job["due"])
             try:
-                if report is None:
-                    raise RuntimeError("SDK cannot report inbound event results; upgrade inkbox")
                 await asyncio.to_thread(
-                    report, self.gateway.cfg.identity, str(_source(data).get("id") or ""), str(data["event_id"]),
+                    report, self.gateway.cfg.identity, _source_id(data), str(data["event_id"]),
                     status="failed", error=(job["error"] or "failed")[-REPORT_ERROR_CHARS:],
                     delivery_id=delivery_id,
                 )
@@ -360,4 +381,7 @@ class InboundRunner:
                 job["due"] = time.time() + min(REPORT_MAX_DELAY_SECONDS, 30.0 * 2 ** (attempts - 1))
                 logger.warning("[inbound] reporting the result for %s failed: %s", data.get("event_id"), exc)
                 self.queue.update(delivery_id, attempts=attempts, due=job["due"])
+        if report is None:
+            logger.error("[inbound] event %s failed and this SDK cannot report it: %s",
+                         data.get("event_id"), job["error"])
         self.queue.update(delivery_id, stage="done")

@@ -45,19 +45,21 @@ class _Session:
     def __init__(self, sessions, chat_id):
         self.sessions, self.chat_id = sessions, chat_id
 
-    async def run_consult(self, prompt):
+    async def run_consult(self, prompt, **kwargs):
         self.sessions.turns.append((self.chat_id, prompt))
+        self.sessions.kwargs.append(kwargs)
         self.sessions.owners.append(managed_work._current.get())
         if self.sessions.block is not None:
             await self.sessions.block.wait()
         if self.sessions.fail:
-            raise RuntimeError("model unavailable")
+            raise self.sessions.fail if isinstance(self.sessions.fail, Exception) else RuntimeError("model unavailable")
         return ""
 
 
 class _Sessions:
     def __init__(self):
         self.turns = []
+        self.kwargs = []
         self.owners = []
         self.block = None
         self.fail = False
@@ -247,7 +249,7 @@ def test_local_startup_opens_no_tunnel_resumes_queue_and_registers_nothing(monke
 
     monkeypatch.setattr(gateway_module, "_claude_health", lambda: "ok")
     asyncio.run(scenario())
-    assert [chat for chat, _ in sessions.turns] == ["inbound:payments"]
+    assert [chat for chat, _ in sessions.turns] == ["inbound:inbsrc_1"]
 
 
 def test_inbound_ignored_outside_local_mode():
@@ -280,7 +282,7 @@ def test_managed_delivery_completes_once_persisted_while_script_is_pending(isola
 
     gw = asyncio.run(scenario())
     [(chat, prompt)] = gw.sessions.turns
-    assert chat == "inbound:payments" and "ready" in prompt
+    assert chat == "inbound:inbsrc_1" and "ready" in prompt
     # The later agent turn must not join the already completed delivery.
     assert gw.sessions.owners == [()]
 
@@ -363,7 +365,7 @@ def test_agent_handler_prompt_session():
 
     gw = asyncio.run(scenario())
     [(chat_id, prompt)] = gw.sessions.turns
-    assert chat_id == "inbound:payments"
+    assert chat_id == "inbound:inbsrc_1"
     assert "untrusted external content" in prompt and '"payments"' in prompt
     assert prompt.index("Log it.") < prompt.index('{"ok":true}')
 
@@ -417,7 +419,7 @@ def test_script_empty_stdout_is_done_and_reads_stdin_in_home(isolated_home):
 def test_script_stdout_becomes_agent_message():
     gw = _run(_gateway(), _data({"type": "script", "command": "echo charge succeeded"}))
     [(chat_id, prompt)] = gw.sessions.turns
-    assert chat_id == "inbound:payments" and "charge succeeded" in prompt and '{"ok":true}' not in prompt
+    assert chat_id == "inbound:inbsrc_1" and "charge succeeded" in prompt and '{"ok":true}' not in prompt
 
 
 def test_script_output_is_drained_and_bounded():
@@ -499,13 +501,98 @@ def test_agent_handler_failure_is_reported():
     assert report[3:] == ("failed", "agent turn failed: RuntimeError", _data()["delivery_id"])
 
 
-def test_stuck_agent_turn_is_reported_after_the_bound(monkeypatch):
-    monkeypatch.setattr(inbound, "TURN_TIMEOUT_SECONDS", 0.05)
+def test_agent_turn_is_bounded_and_strict_and_a_timeout_is_reported():
     gw = _gateway()
-    gw.sessions.block = asyncio.Event()
+    gw.sessions.fail = TimeoutError("turn did not finish")
     _run(gw, _data())
+    assert gw.sessions.kwargs == [{"fail_on_error": True, "run_timeout": inbound.TURN_TIMEOUT_SECONDS}]
     [report] = gw._inkbox.inbound.reports
     assert report[3:] == ("failed", "agent turn failed: TimeoutError", _data()["delivery_id"])
+
+
+def test_session_is_keyed_by_source_id_not_name():
+    gw = _gateway()
+
+    async def scenario():
+        gw._inbound.start()
+        for n, (source_id, name) in enumerate([("inbsrc_1", "deploy"), ("inbsrc_2", "deploy"), ("inbsrc_3", "deploy[1]")]):
+            data = _data(delivery_id=f"5f0c6c1e-0000-4000-8000-00000000001{n}")
+            data["source"] = {"id": source_id, "name": name}
+            await _receive(gw, data)
+        await _settled(gw)
+        await gw._inbound.close()
+
+    asyncio.run(scenario())
+    assert sorted(chat for chat, _ in gw.sessions.turns) == ["inbound:inbsrc_1", "inbound:inbsrc_2", "inbound:inbsrc_3"]
+    assert all('"deploy' in prompt for _, prompt in gw.sessions.turns)
+
+
+def test_missing_source_id_is_rejected():
+    async def scenario():
+        gw = _gateway()
+        data = _data()
+        data["source"] = {"name": "payments"}
+        status, _ = await _receive(gw, data)
+        await gw._inbound.close()
+        return status
+
+    assert asyncio.run(scenario()) == 400
+
+
+def test_full_queue_rejects_new_deliveries_but_still_dedupes(monkeypatch):
+    monkeypatch.setattr(inbound, "MAX_PENDING_EVENTS", 2)
+
+    async def scenario():
+        gw = _gateway()
+        ids = [f"5f0c6c1e-0000-4000-8000-00000000002{n}" for n in range(3)]
+        results = [await _receive(gw, _data(delivery_id=i)) for i in ids]
+        duplicate = await _receive(gw, _data(delivery_id=ids[0]))
+        gw._inbound.queue.update(ids[0], stage="done")
+        after_drain = await _receive(gw, _data(delivery_id=ids[2]))
+        await gw._inbound.close()
+        return [r[0] for r in results], duplicate, after_drain[0]
+
+    statuses, duplicate, after_drain = asyncio.run(scenario())
+    assert statuses == [200, 200, 503]
+    assert duplicate == (200, {"ok": True, "deduped": True})
+    assert after_drain == 200
+
+
+def test_full_queue_counts_bytes(monkeypatch):
+    monkeypatch.setattr(inbound, "MAX_PENDING_BYTES", 6000)
+
+    async def scenario():
+        gw = _gateway()
+        first = await _receive(gw, _data(body="x" * 2000))
+        second = await _receive(gw, _data(body="x" * 2000, delivery_id="5f0c6c1e-0000-4000-8000-000000000031"))
+        await gw._inbound.close()
+        return first[0], second[0]
+
+    assert asyncio.run(scenario()) == (200, 503)
+
+
+def test_scripts_run_at_most_four_at_a_time(isolated_home):
+    command = "mkdir -p live; touch live/$$; ls live | wc -l >> peaks; sleep 0.3; rm live/$$"
+
+    async def scenario():
+        gw = _gateway()
+        gw._inbound.start()
+        for n in range(7):
+            await _receive(gw, _data({"type": "script", "command": command},
+                                     delivery_id=f"5f0c6c1e-0000-4000-8000-00000000004{n}"))
+        await _settled(gw)
+        await gw._inbound.close()
+
+    asyncio.run(scenario())
+    peaks = [int(line) for line in (isolated_home / "peaks").read_text().split()]
+    assert len(peaks) == 7 and max(peaks) <= inbound.MAX_CONCURRENT_SCRIPTS
+
+
+def test_report_without_sdk_support_finishes_without_retrying(instant_waits, monkeypatch):
+    monkeypatch.setattr(inbound, "SCRIPT_RETRY_DELAYS", ())
+    # _run settles only once every job is done.
+    _run(_gateway(), _data({"type": "script", "command": "exit 1"}), inkbox=types.SimpleNamespace())
+    assert instant_waits == []
 
 
 def test_interrupted_agent_turn_is_reported_not_repeated():

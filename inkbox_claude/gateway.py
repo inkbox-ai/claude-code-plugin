@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from . import managed_work
 from .voice_notes import FINISHED
-from .inbound import INBOUND_RECEIVED, InboundRunner
+from .inbound import INBOUND_RECEIVED, InboundFull, InboundRunner
 
 import asyncio
 import hashlib
@@ -871,7 +871,7 @@ class InkboxGateway:
         if not AIOHTTP_AVAILABLE:
             raise RuntimeError("aiohttp is not installed; run: pip install aiohttp")
         if not INKBOX_AVAILABLE:
-            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.7.6,<1.0.0'")
+            raise RuntimeError("inkbox SDK is not installed; run: pip install 'inkbox>=0.7.41,<1.0.0'")
         if self.cfg.voice_stack_invalid_value:
             raise RuntimeError(
                 f"invalid INKBOX_VOICE_STACK={self.cfg.voice_stack_invalid_value!r}; rerun setup"
@@ -3823,10 +3823,13 @@ class InkboxGateway:
         if self._inbound is None:
             return web.json_response({"ok": True, "ignored": INBOUND_RECEIVED})
         data = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
-        if not data.get("event_id") or not data.get("delivery_id"):
-            return web.Response(status=400, text="inbound event_id and delivery_id required")
+        source = data.get("source") if isinstance(data.get("source"), dict) else {}
+        if not data.get("event_id") or not data.get("delivery_id") or not source.get("id"):
+            return web.Response(status=400, text="inbound event_id, delivery_id and source id required")
         try:
             added = self._inbound.receive(data)
+        except InboundFull:
+            return web.Response(status=503, text="Inbound queue is full")
         except sqlite3.Error:
             logger.exception("[inbound] could not persist %s", data["event_id"])
             return web.Response(status=503, text="Inbound queue is unavailable")
