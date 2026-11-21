@@ -229,16 +229,24 @@ state directory) and acknowledged; queued events, including ones waiting for a
 retry, resume after a restart. Repeated deliveries with the same `delivery_id`
 are ignored; a replay (new `delivery_id`) runs again.
 
-- `agent` handler: one turn in the `inbound:<source ID>` session, so renaming a source keeps its history. The message
-  marks the content as untrusted, then carries the source's instructions and the
-  request body (base64 bodies that decode to UTF-8 are shown as text, other
-  binary bodies are noted, not inlined; bodies over 64 KiB are truncated). The agent's text reply is not sent anywhere; it acts through tools.
+- `agent` handler: one turn in the `inbound:<source ID>` session, so renaming a source keeps its history. The
+  request body (base64 decoded) is written to `inbound/events/<event_id>/body` in
+  the bridge state directory, next to `request.json` (method, query, headers and
+  event metadata; no body). The message gives the source, signature status,
+  receive time, content type, size and that directory, then the source's
+  instructions. A UTF-8 body up to 4 KiB is also shown inline, marked as untrusted
+  data; a larger or binary body is only pointed at. The agent's text reply is not sent anywhere; it acts through tools.
 - `script` handler: runs `/bin/sh -c "<command>"` in the home directory with
   `{"source", "event_id", "headers", "body", "body_encoding"}` as JSON on stdin and
   a 120 second timeout. Exit 0 with no output finishes the event; otherwise the
-  first 64 KiB of output is passed to the agent as the body, marked `(truncated)`
-  when cut. It runs up to 5 times: a failure or timeout is retried after 10 s,
-  30 s, 2 min and 10 min. A run cut off by a restart counts toward the 5.
+  first 64 KiB of output, marked `(truncated)` when cut, is passed to the agent
+  the same way, as the `body` file and labeled as script output. It runs up to 5
+  times: a failure or timeout is retried after 10 s, 30 s, 2 min and 10 min. A run
+  cut off by a restart counts toward the 5.
+
+Event directories are private to the user (0700, files 0600) and removed after 7
+days. If they cannot be written, the message says so and carries the body inline,
+truncated at 64 KiB.
 
 When the script's last run fails or the agent turn fails, the bridge reports the
 event as failed to Inkbox with the end of stderr (up to 4 KiB is kept). The report
