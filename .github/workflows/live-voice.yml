@@ -65,7 +65,7 @@ jobs:
         run: |
           tests/ci/retry_install.sh uv pip install --system \
             \
-            -e . "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@84386f5ea022a9594fb901894f927ee444c2cf91#subdirectory=sdk/python" pytest fastapi 'uvicorn[standard]'
+            -e . "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@dbcc15ccd2304e6104e6dd5286155d923698294e#subdirectory=sdk/python" pytest fastapi 'uvicorn[standard]'
 
       - name: Install Claude Code CLI
         run: tests/ci/retry_install.sh npm install -g @anthropic-ai/claude-code

@@ -1162,3 +1162,96 @@ def test_direct_contact_can_answer_email_permission_from_sms():
         assert await task == "allow"
         assert session._queue.empty()
     asyncio.run(scenario())
+
+
+def _result(subtype="success", is_error=False, result="done"):
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(subtype=subtype, duration_ms=1, duration_api_ms=1, is_error=is_error,
+                         num_turns=1, session_id="s1", result=result)
+
+
+@pytest.mark.parametrize(("subtype", "is_error"), [("success", True), ("error_max_turns", False)])
+def test_consult_fail_on_error_raises_on_error_result(subtype, is_error):
+    async def scenario():
+        session = make_session([])
+
+        class FakeClient:
+            async def query(self, _text):
+                pass
+
+            async def receive_response(self):
+                yield _result(subtype, is_error, "API error")
+
+        session._client = FakeClient()
+        assert await session.run_consult("plain") == "API error"
+        with pytest.raises(RuntimeError, match=subtype):
+            await session.run_consult("strict", fail_on_error=True)
+
+    asyncio.run(scenario())
+
+
+def test_consult_run_timeout_excludes_queue_wait_and_interrupts_the_turn():
+    async def scenario():
+        session = make_session([])
+        release = asyncio.Event()
+        interrupted = asyncio.Event()
+        queries = []
+
+        class FakeClient:
+            async def query(self, text):
+                queries.append(text)
+
+            async def receive_response(self):
+                if queries[-1] == "first":
+                    await release.wait()
+                    yield _result()
+                    return
+                await interrupted.wait()
+                yield _result("error_during_execution", True, "")
+
+            async def interrupt(self):
+                interrupted.set()
+
+        session._client = FakeClient()
+        first = asyncio.create_task(session.run_consult("first"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(session.run_consult("second", fail_on_error=True, run_timeout=0.1))
+        # Queued longer than its bound; the clock starts only when it runs.
+        await asyncio.sleep(0.3)
+        assert not second.done()
+        release.set()
+        assert await first == "done"
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(second, 2)
+        assert interrupted.is_set() and queries == ["first", "second"]
+
+    asyncio.run(scenario())
+
+
+def test_drain_skips_a_consult_whose_caller_gave_up():
+    async def scenario():
+        session = make_session([])
+        release = asyncio.Event()
+        queries = []
+
+        class FakeClient:
+            async def query(self, text):
+                queries.append(text)
+
+            async def receive_response(self):
+                await release.wait()
+                yield _result()
+
+        session._client = FakeClient()
+        first = asyncio.create_task(session.run_consult("first"))
+        await asyncio.sleep(0.01)
+        abandoned = asyncio.create_task(session.run_consult("abandoned"))
+        await asyncio.sleep(0.01)
+        abandoned.cancel()
+        release.set()
+        await first
+        await asyncio.wait_for(session._worker, 1)
+        assert queries == ["first"]
+
+    asyncio.run(scenario())

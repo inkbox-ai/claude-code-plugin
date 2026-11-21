@@ -220,6 +220,32 @@ Calls — inbound and outbound — can run over either of two lines, and the age
 
 Inbound answering is configured once per identity (`hosted_agent` for Inkbox Voice AI, otherwise `auto_accept` to the call bridge WebSocket), so a single setting governs both lines. Outbound, the agent sets `origination` on `inkbox_place_call` (`dedicated_number` / `shared_imessage_number`), or omits it — then it resolves to the only line available, or, when both are, to the line matching the current conversation's channel (an iMessage turn calls over the shared line; an SMS/phone turn over the dedicated number).
 
+## Inbound sources
+
+With `INKBOX_DELIVERY_MODE=local`, the bridge handles `inbound.received` events
+for the identity's inbound sources. These events always require a valid Inkbox
+signature. Each event is saved to a local queue (`inbound.sqlite` in the bridge
+state directory) and acknowledged; queued events, including ones waiting for a
+retry, resume after a restart. Repeated deliveries with the same `delivery_id`
+are ignored; a replay (new `delivery_id`) runs again.
+
+- `agent` handler: one turn in the `inbound:<source ID>` session, so renaming a source keeps its history. The message
+  marks the content as untrusted, then carries the source's instructions and the
+  request body (base64 bodies that decode to UTF-8 are shown as text, other
+  binary bodies are noted, not inlined; bodies over 64 KiB are truncated). The agent's text reply is not sent anywhere; it acts through tools.
+- `script` handler: runs `/bin/sh -c "<command>"` in the home directory with
+  `{"source", "event_id", "headers", "body", "body_encoding"}` as JSON on stdin and
+  a 120 second timeout. Exit 0 with no output finishes the event; otherwise the
+  first 64 KiB of output is passed to the agent as the body, marked `(truncated)`
+  when cut. It runs up to 5 times: a failure or timeout is retried after 10 s,
+  30 s, 2 min and 10 min. A run cut off by a restart counts toward the 5.
+
+When the script's last run fails or the agent turn fails, the bridge reports the
+event as failed to Inkbox with the end of stderr (up to 4 KiB is kept). The report
+is retried with backoff (at most an hour apart) while the bridge runs and again on
+every start, without running the script again, until it is recorded or rejected. An
+agent turn interrupted by a restart is reported rather than repeated.
+
 ## External webhooks
 
 Beyond Inkbox's own events, the `/webhook` endpoint can wake the agent for events from **other systems** (e.g. a GitHub Actions failure). Every request is classified by its signature header first, then verified with that source's scheme — routing keys off who actually *signed* the request, never off the body's claimed event type, so a forged payload can't impersonate an Inkbox event:
@@ -336,6 +362,7 @@ Companion context.
 | `CLAUDE_MODEL` | no | CLI default | Model override for bridged sessions. |
 | `INKBOX_REQUIRE_SIGNATURE` | no | `true` | Refuse unsigned inbound webhooks unless `false`. |
 | `INKBOX_SKIP_WEBHOOK_RECONCILE` | no | `false` | Leave webhook subscriptions untouched on start. For deployments that provision them ahead of time, where the destination is fixed or this API key may not change it. They must already point at this bridge's webhook URL, or nothing arrives. |
+| `INKBOX_DELIVERY_MODE` | no | `tunnel` | `local` opens no tunnel, registers no webhook URL, listens on 127.0.0.1 only, and handles `inbound.received` events (see [Inbound sources](#inbound-sources)). |
 | `INKBOX_EXTERNAL_EVENTS_ENABLED` | no | `false` | Wake the agent on unrecognised/unverified external webhooks (see [External webhooks](#external-webhooks)). |
 | `INKBOX_CONTACT_MEMORIES_ENABLED` | no | `true` | Include matched-contact memories as background context for human conversations and calls. |
 | `INKBOX_GROUP_REPLY_MODE` | no | `auto` | `auto` or `mention`; only current explicit mentions wake group turns. |
