@@ -229,7 +229,7 @@ state directory) and acknowledged; queued events, including ones waiting for a
 retry, resume after a restart. Repeated deliveries with the same `delivery_id`
 are ignored; a replay (new `delivery_id`) runs again.
 
-- `agent` handler: one turn in the `inbound:<source name>` session. The message
+- `agent` handler: one turn in the `inbound:<source ID>` session, so renaming a source keeps its history. The message
   marks the content as untrusted, then carries the source's instructions and the
   request body (base64 bodies that decode to UTF-8 are shown as text, other
   binary bodies are noted, not inlined; bodies over 64 KiB are truncated). The agent's text reply is not sent anywhere; it acts through tools.
