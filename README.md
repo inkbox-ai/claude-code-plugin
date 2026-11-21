@@ -230,12 +230,14 @@ retry, resume after a restart. Repeated deliveries with the same `delivery_id`
 are ignored; a replay (new `delivery_id`) runs again.
 
 - `agent` handler: one turn in the `inbound:<source ID>` session, so renaming a source keeps its history. The
-  request body (base64 decoded) is written to `inbound/events/<event_id>/body` in
-  the bridge state directory, next to `request.json` (method, query, headers and
-  event metadata; no body). The message gives the source, signature status,
-  receive time, content type, size and that directory, then the source's
-  instructions. A UTF-8 body up to 4 KiB is also shown inline, marked as untrusted
-  data; a larger or binary body is only pointed at. The agent's text reply is not sent anywhere; it acts through tools.
+  request body (base64 decoded) is written to
+  `~/.inkbox/inbound/events/<delivery_id>/body`, next to `request.json` (method,
+  query, headers and event metadata; no body). Each delivery gets its own
+  directory, so a replay never overwrites an earlier one. The message gives the
+  source, signature status, receive time, media type, request body size and that
+  directory, then the source's instructions, then the body under an untrusted-data
+  label: a UTF-8 body up to 4 KiB is shown inline; a larger or binary body is only
+  pointed at. The agent's text reply is not sent anywhere; it acts through tools.
 - `script` handler: runs `/bin/sh -c "<command>"` in the home directory with
   `{"source", "event_id", "headers", "body", "body_encoding"}` as JSON on stdin and
   a 120 second timeout. Exit 0 with no output finishes the event; otherwise the
@@ -245,8 +247,8 @@ are ignored; a replay (new `delivery_id`) runs again.
   cut off by a restart counts toward the 5.
 
 Event directories are private to the user (0700, files 0600) and removed after 7
-days. If they cannot be written, the message says so and carries the body inline,
-truncated at 64 KiB.
+days, checked at startup and hourly. If they cannot be written, the message says
+so and carries the body inline, truncated at 64 KiB.
 
 When the script's last run fails or the agent turn fails, the bridge reports the
 event as failed to Inkbox with the end of stderr (up to 4 KiB is kept). The report
