@@ -13,7 +13,7 @@ from inkbox_claude.gateway import InkboxGateway
 from inkbox_claude.prompts import frame_inbound
 from inkbox_claude.sessions import SessionManager, _Turn
 from inkbox_claude.slack import (
-    SLACK_SUBSCRIPTION_EVENTS, SLACK_INCOMING_EVENTS, inbound_message,
+    SLACK_SUBSCRIPTION_EVENTS, SLACK_TRANSCRIPTION_EVENT, SLACK_INCOMING_EVENTS, inbound_message,
     reconcile_subscription, run_tool, send_reply,
 )
 from inkbox_claude.channel_tools import build_channel_tools
@@ -22,6 +22,9 @@ async def call_inkbox_tool(client, identity, name, args):
     tools = build_channel_tools(client, identity, BridgeConfig(slack_enabled=True))
     return await next(t for t in tools if t.name == name).handler(args)
 from tests.test_sessions import make_session
+
+# The Slack receiver also carries voice-note completions for its own messages.
+ALL_EVENTS = (*SLACK_SUBSCRIPTION_EVENTS, SLACK_TRANSCRIPTION_EVENT)
 
 
 IDENTITY = "00000000-0000-4000-8000-000000000001"
@@ -300,9 +303,10 @@ def test_subscription_reconciliation_does_not_remove_other_receivers():
         "url": "https://agent.example/webhook?channel=slack",
         "event_types": ["slack.dm_received", "slack.group_dm_received",
                         "slack.channel_message_received", "slack.mention_received",
-                        "slack.thread_reply_received", "slack.session_stopped"],
+                        "slack.thread_reply_received", "slack.session_stopped",
+                        "message.transcription_finished"],
     }
-    assert set(created["event_types"]) == set(SLACK_SUBSCRIPTION_EVENTS)
+    assert set(created["event_types"]) == set(ALL_EVENTS)
     assert "slack.channel_message_received" in created["event_types"]
     client.webhooks.subscriptions.delete.assert_not_called()
     existing = NS(id="ours", status="active", **created)
@@ -326,7 +330,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed,
     row = {
         "id": "00000000-0000-4000-8000-000000000003", "organization_id": "org_test",
         "agent_identity_id": IDENTITY, "url": url, "status": "active",
-        "event_types": list(reversed(SLACK_SUBSCRIPTION_EVENTS)),
+        "event_types": list(reversed(ALL_EVENTS)),
         "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
     }
     if mixed or upgrade:
@@ -355,7 +359,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed,
         assert request.method == "POST"
         assert json.loads(request.content) == {
             "agent_identity_id": IDENTITY, "url": url,
-            "event_types": list(SLACK_SUBSCRIPTION_EVENTS),
+            "event_types": list(ALL_EVENTS),
         }
         rows.append(row)
         return httpx.Response(201, json=rows[0])
@@ -376,7 +380,7 @@ def test_subscription_uses_current_sdk_wire_and_reuses_migrated_selection(mixed,
 def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
     client = connected_client()
     url = "https://agent.example/webhook?channel=slack"
-    first, *remaining = SLACK_SUBSCRIPTION_EVENTS
+    first, *remaining = ALL_EVENTS
     rows = [NS(id="ours", url=url, status="active", event_types=["message.received", first])]
     if split:
         rows.append(NS(url=url, status="active", event_types=remaining))
@@ -390,6 +394,123 @@ def test_subscription_coverage_reuses_mixed_and_split_event_sets(split):
             "ours", event_types=["message.received", first, *remaining], scope="identity")
         client.webhooks.subscriptions.create.assert_not_called()
     client.webhooks.subscriptions.delete.assert_not_called()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_subscription_keeps_slack_available_without_completion_event_support(existing):
+    from inkbox.exceptions import InkboxAPIError
+
+    client = connected_client()
+    url = "https://agent.example/webhook?channel=slack"
+    previous = list(SLACK_SUBSCRIPTION_EVENTS)
+    client.webhooks.subscriptions.list.return_value = (
+        [NS(id="ours", url=url, status="active", event_types=previous)] if existing else [])
+
+    def reject(*_args, event_types, **_kwargs):
+        if "message.transcription_finished" in event_types:
+            raise InkboxAPIError(422, [{
+                "type": "enum", "input": "message.transcription_finished",
+                "loc": ["body", "event_types", event_types.index("message.transcription_finished"), family],
+            } for family in ("SlackWebhookEventType", "MailWebhookEventType")])
+
+    client.webhooks.subscriptions.create.side_effect = reject
+    client.webhooks.subscriptions.update.side_effect = reject
+    reconcile_subscription(client, IDENTITY, url)
+    if existing:
+        client.webhooks.subscriptions.update.assert_called_once_with(
+            "ours", event_types=list(ALL_EVENTS), scope="identity")
+        client.webhooks.subscriptions.create.assert_not_called()
+    else:
+        assert [call.kwargs["event_types"] for call in client.webhooks.subscriptions.create.call_args_list] == [
+            list(ALL_EVENTS), previous]
+
+
+def test_subscription_completion_fallback_does_not_hide_other_failures():
+    from inkbox.exceptions import InkboxAPIError
+
+    client = connected_client()
+    client.webhooks.subscriptions.list.return_value = []
+    client.webhooks.subscriptions.create.side_effect = InkboxAPIError(422, [{"type": "url_scheme", "loc": ["body", "url"]}])
+    with pytest.raises(InkboxAPIError):
+        reconcile_subscription(client, IDENTITY, "https://agent.example/webhook?channel=slack")
+    assert client.webhooks.subscriptions.create.call_count == 1
+
+
+class UniqueSubscriptions:
+    """Each event may sit on only one active subscription per URL, as the API enforces."""
+
+    def __init__(self, rows):
+        self.rows, self.writes = list(rows), []
+
+    def list(self, **_kwargs):
+        return [copy.copy(row) for row in self.rows]
+
+    def _claim(self, url, event_types, current=None):
+        from inkbox.exceptions import InkboxAPIError
+
+        for row in self.rows:
+            if (row.id != current and row.status == "active" and row.url == url
+                    and set(row.event_types) & set(event_types)):
+                raise InkboxAPIError(409, "An active subscription already selects this event")
+
+    def create(self, *, agent_identity_id, url, event_types):
+        self._claim(url, event_types)
+        self.writes.append(("create", list(event_types)))
+        self.rows.append(NS(id=f"row-{len(self.rows)}", url=url, status="active", event_types=list(event_types)))
+
+    def update(self, subscription_id, *, event_types, scope):
+        row = next(row for row in self.rows if row.id == subscription_id)
+        self._claim(row.url, event_types, subscription_id)
+        self.writes.append(("update", subscription_id, list(event_types)))
+        row.event_types = list(event_types)
+
+    def delete(self, subscription_id):
+        self.writes.append(("delete", subscription_id))
+        self.rows = [row for row in self.rows if row.id != subscription_id]
+
+
+SLACK_URL = "https://agent.example/webhook?channel=slack"
+FINISHED = "message.transcription_finished"
+PREVIOUS = list(SLACK_SUBSCRIPTION_EVENTS)
+
+
+@pytest.mark.parametrize("rows, holder", [
+    pytest.param([], None, id="fresh-install"),
+    pytest.param([NS(id="slack", url=SLACK_URL, status="active", event_types=PREVIOUS),
+                  NS(id="finished", url=SLACK_URL, status="active", event_types=[FINISHED])],
+                 "slack", id="upgrade-standalone-completion"),
+    pytest.param([NS(id="slack", url=SLACK_URL, status="active", event_types=PREVIOUS),
+                  NS(id="mail", url=SLACK_URL, status="active", event_types=["message.received", FINISHED])],
+                 "slack", id="upgrade-shared-completion"),
+    pytest.param([NS(id="direct", url=SLACK_URL, status="active",
+                     event_types=["slack.dm_received", "slack.group_dm_received", "slack.channel_message_received"]),
+                  NS(id="threads", url=SLACK_URL, status="active",
+                     event_types=["slack.mention_received", "slack.thread_reply_received"]),
+                  NS(id="finished", url=SLACK_URL, status="active", event_types=[FINISHED])],
+                 "direct", id="two-slack-rows"),
+    pytest.param([NS(id="direct", url=SLACK_URL, status="active", event_types=["slack.dm_received"]),
+                  NS(id="rest", url=SLACK_URL, status="active", event_types=ALL_EVENTS[1:])],
+                 "rest", id="two-slack-rows-with-completion"),
+])
+def test_completion_moves_to_one_slack_message_subscription(rows, holder):
+    client = connected_client()
+    other = NS(id="identity", url="https://agent.example/webhook", status="active", event_types=[FINISHED])
+    fake = client.webhooks.subscriptions = UniqueSubscriptions([*rows, other])
+    reconcile_subscription(client, IDENTITY, SLACK_URL)
+    active = [row for row in fake.rows if row.url == SLACK_URL and row.status == "active"]
+    for event in ALL_EVENTS:
+        assert len([row for row in active if event in row.event_types]) == 1, event
+    target = next(row for row in active if FINISHED in row.event_types)
+    # Slack completions reach only a subscription that also selects the original message.
+    assert set(target.event_types) & set(SLACK_INCOMING_EVENTS)
+    assert holder is None or target.id == holder
+    assert other in fake.rows and other.event_types == [FINISHED]
+    if any(row.id == "mail" for row in rows):
+        assert next(row for row in fake.rows if row.id == "mail").event_types == ["message.received"]
+    # A restart finds everything in place and writes nothing.
+    writes = list(fake.writes)
+    reconcile_subscription(client, IDENTITY, SLACK_URL)
+    assert fake.writes == writes
 
 
 def test_paused_subscription_is_not_bypassed_by_new_registration():
@@ -534,12 +655,11 @@ def test_existing_message_subscription_extends_selection_for_native_stop(gw):
     client = connected_client()
     url = "https://agent.example/webhook"
     client.webhooks.subscriptions.list.return_value = [NS(
-        id="ours", url=url, status="active", event_types=[event for event in SLACK_SUBSCRIPTION_EVENTS
-                                                if event != "slack.session_stopped"],
+        id="ours", url=url, status="active", event_types=list(SLACK_INCOMING_EVENTS),
     )]
     reconcile_subscription(client, IDENTITY, url)
     client.webhooks.subscriptions.update.assert_called_once_with(
-        "ours", event_types=list(SLACK_SUBSCRIPTION_EVENTS), scope="identity",
+        "ours", event_types=list(ALL_EVENTS), scope="identity",
     )
     client.webhooks.subscriptions.create.assert_not_called()
 

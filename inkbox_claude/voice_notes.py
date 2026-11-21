@@ -12,16 +12,25 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
+
+from .slack import SLACK_INCOMING_EVENTS, SLACK_TRANSCRIPTION_EVENT
 
 logger = logging.getLogger(__name__)
 RECEIVED = {
     "text.received": "text",
     "imessage.received": "imessage",
     "whatsapp.received": "whatsapp",
+    **{event_type: "slack" for event_type in SLACK_INCOMING_EVENTS},
 }
-FINISHED = "message.transcription_finished"
+FINISHED = SLACK_TRANSCRIPTION_EVENT
 WAIT_SECONDS = 60.0
+RETRY_SECONDS = 5.0
 POLL_SECONDS = 10.0
+
+
+class VoiceNoteNotAdmitted(Exception):
+    """The handler stopped before admission, so the resolved input may be replayed."""
 
 
 def message_for(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -31,8 +40,62 @@ def message_for(envelope: dict[str, Any]) -> dict[str, Any]:
         return {}
     event_type = envelope.get("event_type")
     channel = data.get("channel") if event_type == FINISHED else str(event_type).split(".", 1)[0]
+    if channel == "slack":
+        # Slack keys results by the retained message and lists them on event.files.
+        event = data.get("event")
+        files = event.get("files") if isinstance(event, dict) else None
+        return {
+            "id": data.get("message_id"),
+            "conversation_id": data.get("conversation_id"),
+            "connection_id": data.get("connection_id"),
+            "media": files if isinstance(files, list) else [],
+        }
     message = data.get("text_message" if channel == "text" else "message")
     return message if isinstance(message, dict) else {}
+
+
+def envelope_for(channel: str, message: dict[str, Any]) -> dict[str, Any]:
+    """Build the received-event shape whose message_for view is ``message``."""
+    if channel == "slack":
+        return {"event_type": SLACK_INCOMING_EVENTS[0], "data": {
+            "message_id": message.get("id"),
+            "conversation_id": message.get("conversation_id"),
+            "connection_id": message.get("connection_id"),
+            "event": {"files": message.get("media") or []},
+        }}
+    return {
+        "event_type": f"{channel}.received",
+        "data": {"text_message" if channel == "text" else "message": message},
+    }
+
+
+def store_message(channel: str, envelope: dict[str, Any], message: dict[str, Any]) -> None:
+    """Write resolved attachment results back into the original envelope."""
+    data = envelope["data"]
+    if channel == "slack":
+        data["event"]["files"] = message.get("media") or []
+    else:
+        data["text_message" if channel == "text" else "message"] = message
+
+
+def transcription_unsupported(exc: Exception) -> bool:
+    """Recognize a server that does not offer the completion event yet."""
+    if isinstance(exc, ValueError):
+        return str(exc).startswith("Identity-wide webhook subscriptions are not supported by this server yet.")
+    errors = getattr(exc, "detail", None)
+    if getattr(exc, "status_code", None) != 422 or not isinstance(errors, list) or not errors:
+        return False
+    # The API reports one enum error per channel when none recognize the event.
+    return all(
+        isinstance(error, dict)
+        and error.get("type") == "enum"
+        and isinstance(error.get("loc"), list)
+        and len(error["loc"]) >= 3
+        and error["loc"][:2] == ["body", "event_types"]
+        and type(error["loc"][2]) is int
+        and error.get("input") == FINISHED
+        for error in errors
+    )
 
 
 def pending(message: dict[str, Any]) -> bool:
@@ -70,12 +133,9 @@ def merge_results(original: dict[str, Any], current: dict[str, Any]) -> dict[str
     result = deepcopy(original)
     if str(current.get("id") or "") != str(original.get("id") or ""):
         return result
-    if (
-        current.get("conversation_id")
-        and original.get("conversation_id")
-        and current["conversation_id"] != original["conversation_id"]
-    ):
-        return result
+    for field in ("conversation_id", "connection_id"):
+        if current.get(field) and original.get(field) and str(current[field]) != str(original[field]):
+            return result
     refreshed = current.get("media") or []
     by_id = {
         str(item["id"]): item
@@ -226,25 +286,33 @@ class VoiceNotes:
 
     async def _deliver(self, key: str) -> None:
         envelope = await self._resolve(key)
-        retry_at, = self.db.execute("SELECT retry_at FROM voice_notes WHERE key=?", (key,)).fetchone()
-        if retry_at and retry_at > time.time():
-            await asyncio.sleep(retry_at - time.time())
-        while not self.ready():
-            self.db.execute("UPDATE voice_notes SET retry_at=? WHERE key=?", (time.time() + 5, key))
-            self.db.commit()
-            await asyncio.sleep(5)
+        while True:
+            retry_at, = self.db.execute("SELECT retry_at FROM voice_notes WHERE key=?", (key,)).fetchone()
+            if retry_at and retry_at > time.time():
+                await asyncio.sleep(retry_at - time.time())
+            while not self.ready():
+                self.db.execute("UPDATE voice_notes SET retry_at=? WHERE key=?", (time.time() + 5, key))
+                self.db.commit()
+                await asyncio.sleep(5)
 
-        # An interrupted handler may already own the input. Only pending rows
-        # are recoverable; keep ambiguous receipts for inspection.
-        claimed = self.db.execute("UPDATE voice_notes SET done=2 WHERE key=? AND done=0", (key,))
-        self.db.commit()
-        if not claimed.rowcount:
-            return
-        try:
-            response = await self.deliver(envelope)
-        except Exception:
-            logger.exception("Voice-note admission is unconfirmed; not replaying")
-            return
+            # An interrupted handler may already own the input. Only pending rows
+            # are recoverable; keep ambiguous receipts for inspection.
+            claimed = self.db.execute("UPDATE voice_notes SET done=2 WHERE key=? AND done=0", (key,))
+            self.db.commit()
+            if not claimed.rowcount:
+                return
+            try:
+                response = await self.deliver(envelope)
+            except VoiceNoteNotAdmitted:
+                # Nothing reached a session; retry the stored result without polling again.
+                logger.warning("Voice-note admission could not start yet; retrying", exc_info=True)
+                self.db.execute("UPDATE voice_notes SET done=0, retry_at=? WHERE key=?", (time.time() + RETRY_SECONDS, key))
+                self.db.commit()
+                continue
+            except Exception:
+                logger.exception("Voice-note admission is unconfirmed; not replaying")
+                return
+            break
         status = getattr(response, "status", 200)
         if 200 <= status < 300 or status in (400, 401, 403, 404, 422):
             self.db.execute("UPDATE voice_notes SET done=1 WHERE key=?", (key,))
@@ -261,10 +329,7 @@ class VoiceNotes:
         key = self.key(channel, message)
         if not key or not pending(message):
             return message
-        envelope = {
-            "event_type": f"{channel}.received",
-            "data": {"text_message" if channel == "text" else "message": message},
-        }
+        envelope = envelope_for(channel, message)
         self._remember(key, envelope, direct=False)
         return message_for(await self._resolve(key))
 
@@ -274,8 +339,10 @@ class VoiceNotes:
         ).fetchone()
         envelope = json.loads(original)
         message = message_for(envelope)
+        channel = key.split(":", 1)[0]
         if result:
             message.update(json.loads(result))
+            store_message(channel, envelope, message)
             return envelope
         event = self.events.setdefault(key, asyncio.Event())
         while pending(message):
@@ -300,7 +367,7 @@ class VoiceNotes:
                     try:
                         current = await asyncio.wait_for(
                             asyncio.to_thread(
-                                self._poll, key.split(":", 1)[0], message
+                                self._poll, channel, message
                             ),
                             POLL_SECONDS,
                         )
@@ -322,13 +389,30 @@ class VoiceNotes:
         )
         self.db.commit()
         self.events.pop(key, None)
-        field = "text_message" if key.startswith("text:") else "message"
-        envelope["data"][field] = message
+        store_message(channel, envelope, message)
         return envelope
 
     def _poll(self, channel: str, message: dict[str, Any]) -> dict[str, Any]:
         """Read raw additive metadata using the existing authenticated SDK transport."""
         message_id = str(message["id"])
+        if channel == "slack":
+            connection_id = quote(str(message["connection_id"]), safe="")
+            page = self.client._api_http.get(
+                f"/slack/connections/{connection_id}/archive/messages",
+                params={"message_id": message_id}, timeout=POLL_SECONDS,
+            )
+            found = [
+                item for item in page.get("messages") or []
+                if isinstance(item, dict) and str(item.get("id")) == message_id
+            ]
+            if len(found) != 1:
+                return {}
+            return {
+                "id": message_id,
+                "conversation_id": found[0].get("conversation_id"),
+                "connection_id": found[0].get("connection_id"),
+                "media": found[0].get("files") or [],
+            }
         if channel == "text":
             phone_id = str(self.identity.phone_number.id)
             return self.client._phone_http.get(

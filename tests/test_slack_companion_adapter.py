@@ -254,3 +254,23 @@ def test_preparation_uses_real_sdk_archive_and_user_wire(monkeypatch, receipt):
         }
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("message_id", [SOURCE, SOURCE.upper(), OTHER, None])
+def test_voice_note_wait_enrols_only_the_envelope_message(client, receipt, message_id):
+    voice = {"id": "FVOICE", "name": "voice.m4a", "mimetype": "audio/mp4",
+             "transcription": {"status": "completed", "text": "Move the review to Thursday."}}
+    receipt["companion"] = {"conversation_id": OTHER}
+    receipt["data"]["event"]["files"] = [voice]
+    if message_id:
+        receipt["data"]["message_id"] = message_id
+    message = normalize_envelope(client, "example-agent", receipt)["data"]["message"]
+    assert message["id"] == SOURCE
+    if message_id and message_id.lower() == SOURCE:
+        assert message["media"] == [voice]
+        assert "Voice note" not in message["text"]
+    else:
+        # A result keyed to another message would never arrive, so label what is known now.
+        assert "media" not in message
+        assert message["text"].count("Move the review to Thursday.") == 1
+    assert "Attachment references (not downloaded)" in message["text"]
