@@ -3827,13 +3827,21 @@ class InkboxGateway:
         if not data.get("event_id") or not data.get("delivery_id") or not source.get("id"):
             return web.Response(status=400, text="inbound event_id, delivery_id and source id required")
         try:
-            added = self._inbound.receive(data)
+            added = self._inbound.receive(data, bounded=self.inbound_bounded)
         except InboundFull:
             return web.Response(status=503, text="Inbound queue is full")
         except sqlite3.Error:
             logger.exception("[inbound] could not persist %s", data["event_id"])
             return web.Response(status=503, text="Inbound queue is unavailable")
         return web.json_response({"ok": True} if added else {"ok": True, "deduped": True})
+
+    # A host that acknowledges deliveries itself checks ``inbound_full`` first and
+    # clears this, so a delivery it already acknowledged is never refused here.
+    inbound_bounded = True
+
+    def inbound_full(self) -> bool:
+        """Whether a host should refuse a new ``inbound.received`` delivery before acknowledging it."""
+        return self._inbound is not None and self._inbound.queue.full()
 
     def inbound_activity(self) -> int:
         """Inbound deliveries still to handle, including script retry waits; pending failure reports are not counted."""

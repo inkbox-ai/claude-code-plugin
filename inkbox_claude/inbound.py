@@ -178,10 +178,20 @@ class InboundQueue:
         self.db.execute("DELETE FROM jobs WHERE stage = 'done' AND since < ?",
                         (time.time() - DONE_RETENTION_SECONDS,))
 
-    def add(self, data: dict[str, Any]) -> bool:
+    def _used(self) -> tuple[int, int]:
+        return self.db.execute(
+            "SELECT count(*), coalesce(sum(length(CAST(data AS BLOB)) + coalesce(length(CAST(body AS BLOB)), 0)), 0)"
+            " FROM jobs WHERE stage != 'done'"
+        ).fetchone()
+
+    def full(self) -> bool:
+        count, used = self._used()
+        return count >= MAX_PENDING_EVENTS or used >= MAX_PENDING_BYTES
+
+    def add(self, data: dict[str, Any], *, bounded: bool = True) -> bool:
         """Persist a new delivery; False when this delivery id was already received.
 
-        Raises ``InboundFull`` before storing when unfinished work is at its cap.
+        With ``bounded``, raises ``InboundFull`` before storing when unfinished work is at its cap.
         """
         delivery_id = str(data["delivery_id"])
         if self.db.execute("SELECT 1 FROM jobs WHERE delivery_id = ?", (delivery_id,)).fetchone():
@@ -189,12 +199,9 @@ class InboundQueue:
         script = _handler(data).get("type") == "script"
         body = None if script else str(_request(data).get("body") or "")
         payload = json.dumps(data, ensure_ascii=False)
-        count, used = self.db.execute(
-            "SELECT count(*), coalesce(sum(length(CAST(data AS BLOB)) + coalesce(length(CAST(body AS BLOB)), 0)), 0)"
-            " FROM jobs WHERE stage != 'done'"
-        ).fetchone()
+        count, used = self._used()
         size = len(payload.encode()) + len((body or "").encode())
-        if count >= MAX_PENDING_EVENTS or used + size > MAX_PENDING_BYTES:
+        if bounded and (count >= MAX_PENDING_EVENTS or used + size > MAX_PENDING_BYTES):
             raise InboundFull("inbound queue is full")
         now = time.time()
         self.db.execute(
@@ -249,8 +256,8 @@ class InboundRunner:
         """Deliveries still to handle, including script retry waits; pending failure reports are not counted."""
         return self.queue.db.execute("SELECT count(*) FROM jobs WHERE stage IN ('script', 'agent')").fetchone()[0]
 
-    def receive(self, data: dict[str, Any]) -> bool:
-        added = self.queue.add(data)
+    def receive(self, data: dict[str, Any], *, bounded: bool = True) -> bool:
+        added = self.queue.add(data, bounded=bounded)
         if added and self.started:
             self._start(str(data["delivery_id"]))
         return added

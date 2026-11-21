@@ -558,6 +558,23 @@ def test_full_queue_rejects_new_deliveries_but_still_dedupes(monkeypatch):
     assert after_drain == 200
 
 
+def test_host_admitted_delivery_is_stored_past_the_cap(monkeypatch):
+    monkeypatch.setattr(inbound, "MAX_PENDING_EVENTS", 1)
+
+    async def scenario():
+        gw = _gateway()
+        before = gw.inbound_full()
+        first = await _receive(gw, _data())
+        full = gw.inbound_full()
+        gw.inbound_bounded = False
+        second = await _receive(gw, _data(delivery_id="5f0c6c1e-0000-4000-8000-000000000032"))
+        pending = len(gw._inbound.queue.pending())
+        await gw._inbound.close()
+        return before, first[0], full, second[0], pending
+
+    assert asyncio.run(scenario()) == (False, 200, True, 200, 2)
+
+
 def test_full_queue_counts_bytes(monkeypatch):
     monkeypatch.setattr(inbound, "MAX_PENDING_BYTES", 6000)
 
