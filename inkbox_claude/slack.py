@@ -24,8 +24,8 @@ SLACK_ATTENTION_EVENTS = tuple(
 )
 SLACK_STOP_EVENT = "slack.session_stopped"
 SLACK_SUBSCRIPTION_EVENTS = (*SLACK_INCOMING_EVENTS, SLACK_STOP_EVENT)
-# Slack delivers a voice-note completion only to receivers that also select its
-# original message event, so the completion shares the Slack receiver.
+# Every subscription with the completion event receives every Slack completion;
+# the plugin keeps it on its Slack receiver, since a URL holds each event once.
 SLACK_TRANSCRIPTION_EVENT = "message.transcription_finished"
 SLACK_MAX_TEXT_LENGTH = 12000
 SLACK_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -89,7 +89,7 @@ def reconcile_subscription(client: Any, identity_id: Any, url: str) -> None:
             if overlap.intersection(SLACK_INCOMING_EVENTS):
                 message_subscriptions.append(sub)
     missing = [event for event in events if event not in covered]
-    # A completion counts only on a Slack message subscription; elsewhere it is never delivered.
+    # Keep the completion on the Slack message subscription; a URL holds each event once.
     target = next((sub for sub in message_subscriptions if SLACK_TRANSCRIPTION_EVENT in sub.event_types), None)
     if target is None and message_subscriptions:
         # Extend the existing receiver: a second channel-only subscription
