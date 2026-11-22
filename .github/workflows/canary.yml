@@ -28,7 +28,7 @@ jobs:
         run: |
           tests/ci/retry_install.sh uv pip install --system \
             \
-            -e . "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@84386f5ea022a9594fb901894f927ee444c2cf91#subdirectory=sdk/python" pytest
+            -e . "inkbox @ git+https://github.com/inkbox-ai/inkbox.git@dbcc15ccd2304e6104e6dd5286155d923698294e#subdirectory=sdk/python" pytest
           tests/ci/retry_install.sh uv pip install --system -U claude-agent-sdk
 
       - name: Install latest Claude Code CLI
