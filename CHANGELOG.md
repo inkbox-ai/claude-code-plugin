@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.32 (unreleased)
+
+- Wait for incoming Slack voice-note transcripts the same way as other channels, including the completion notification, a single message read, and the transcript label.
+
 ## 0.2.31 (unreleased)
 
 - Add `INKBOX_DELIVERY_MODE=local`: open no tunnel, register no webhook URL, listen on 127.0.0.1 only, and accept event bodies up to 2 MiB. Signature verification is unchanged.

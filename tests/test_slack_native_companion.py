@@ -230,3 +230,52 @@ def test_active_native_stop_clears_companion_working_status(harness, client, rec
             released.set()
             await gw._cleanup()
     asyncio.run(run())
+
+
+def test_native_slack_voice_note_waits_for_completion_and_queries_one_labelled_turn(harness, client, receipt):
+    async def run():
+        envelope, pages = fixture()
+        scope = {**envelope["companion"], "channel": "slack"}
+        for page in pages:
+            page["channel"] = "slack"
+            page["reply_context"] = {"channel": "slack", "conversation_id": scope["conversation_id"],
+                "connection_id": CONNECTION, "slack_conversation_id": "CEXAMPLE", "thread_ts": None}
+            for entry in page["items"]:
+                entry["author"] = "THOME:UALICE"
+        gw, _ = harness.build(pages, slack_enabled=True, group_reply_mode="mention")
+        gw._identity.id = UUID(IDENTITY)
+        gw._inkbox.slack = client.slack
+        client.slack.send_message.return_value = NS(status="sent", id="action")
+        voice = {"id": "FVOICE", "name": "voice.m4a", "mimetype": "audio/mp4",
+                 "transcription": {"status": "pending", "text": None}}
+        envelope = deepcopy(receipt)
+        envelope["companion"] = scope
+        envelope["data"].update(message_kinds=["channel", "mention"], sender_access="direct", message_id=SOURCE)
+        envelope["data"]["event"]["files"] = [voice]
+        assert (await gw._handle_webhook(Request(envelope))).status == 200
+        inbox = gw._voice_note_inbox()
+        for _ in range(200):
+            if inbox.events:
+                break
+            await asyncio.sleep(0.01)
+        assert inbox.events and harness.queries == []
+        finished = deepcopy(envelope)
+        finished.pop("companion")
+        finished.update(id="evt-finished", event_type="message.transcription_finished")
+        finished["data"]["channel"] = "slack"
+        finished["data"]["event"]["files"] = [{**voice, "transcription": {
+            "status": "completed", "text": "Move the review to Thursday."}}]
+        assert (await gw._handle_webhook(Request(finished, request_id="request-finished"))).status == 200
+        await drained(gw)
+        assert len(harness.queries) == 1
+        prompt = harness.queries[0]
+        assert "Please help" in prompt
+        assert "Move the review to Thursday." in prompt
+        assert prompt.count("Voice note 1") == 1 and prompt.count("automatically transcribed") == 1
+        assert "transcript unavailable" not in prompt
+        # A repeated completion is retained but never starts another turn.
+        assert (await gw._handle_webhook(Request(finished, request_id="request-again"))).status == 200
+        await drained(gw)
+        assert len(harness.queries) == 1
+        await gw._cleanup()
+    asyncio.run(run())
