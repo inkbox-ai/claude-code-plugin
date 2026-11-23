@@ -75,6 +75,18 @@ def test_bootstrap_configures_voice_signing_and_gateway(monkeypatch):
     assert saved["INKBOX_SIGNING_KEY"] == "signing-secret"
 
 
+def test_non_voice_bootstrap_ignores_ambient_openai_key(monkeypatch):
+    identity = Identity()
+    saved = install(monkeypatch, identity)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-unrelated")
+
+    result = subject.bootstrap(identity_handle="helper", api_key="agent-secret")
+
+    assert result["status"] == "configured"
+    assert saved["INKBOX_VOICE_STACK"] == "inkbox_tts_stt"
+    assert saved["INKBOX_REALTIME_ENABLED"] == "false"
+
+
 def test_bootstrap_requires_explicit_signing_rotation(monkeypatch):
     identity = Identity(signing=True)
     install(monkeypatch, identity)
