@@ -43,7 +43,8 @@ def build_channel_tools(client, identity_handle, cfg):
                         message = marker
                         break
                 if message == "Vault is locked":
-                    message = "Vault is locked. Set INKBOX_CLAUDE_VAULT_KEY locally and restart. Never send the key in chat."
+                    message = ("Vault is locked. Set INKBOX_CLAUDE_VAULT_KEY locally and restart (hosted by Inkbox: a Secret "
+                               "in the identity's Env vars tab). Never send the key in chat.")
                 status = getattr(exc, "status_code", None)
                 recovery = {}
                 if "_whatsapp" in name:

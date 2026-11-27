@@ -4777,6 +4777,7 @@ class InkboxGateway:
             reply = await session.run_consult(
                 f"{marker}\n{text}".rstrip(),
                 a2a_context=context,
+                fail_on_error=True,
             )
             if (
                 not context["reply_intent_committed"]
@@ -4816,6 +4817,24 @@ class InkboxGateway:
             raise
         except Exception:
             logger.exception("[bridge] A2A turn failed: %s", task_id)
+            if context["reply_intent_committed"]:
+                return
+            try:
+                await self._fence_a2a_progress_updates(task_id, registry_key, data)
+                context["reply_intent_committed"] = True
+                authoritative = await asyncio.to_thread(
+                    self._identity.a2a_task, task_id
+                )
+                if _a2a_state(authoritative.state) not in A2A_STOPPED_STATES:
+                    await _to_thread_drained(
+                        self._identity.a2a_reply,
+                        task_id,
+                        intent="fail",
+                        text="The agent could not finish this task.",
+                    )
+                self._write_a2a_registry(registry_key, data, "finalized")
+            except Exception:
+                logger.exception("[bridge] could not fail A2A task: %s", task_id)
         finally:
             await self._stop_a2a_progress_updates(task_id, owner=registry_key)
 

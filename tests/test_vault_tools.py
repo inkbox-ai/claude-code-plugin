@@ -56,6 +56,7 @@ def test_locked_vault_explains_local_configuration(vault, name):
     assert result["isError"]
     assert "INKBOX_CLAUDE_VAULT_KEY" in data["error"]
     assert "restart" in data["error"]
+    assert "Env vars tab" in data["error"]
     assert not api.requests
 
 
