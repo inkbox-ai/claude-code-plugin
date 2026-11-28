@@ -697,6 +697,7 @@ A2A_TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 A2A_STOPPED_STATES = A2A_TERMINAL_STATES | {"input_required", "auth_required"}
 _A2A_RECEIPT_TEMPLATE = "Task {task_id} received. Work is queued and starting."
 _A2A_RETRY_INTERVAL_SECONDS = 5.0
+_A2A_FAIL_ATTEMPTS = 3
 
 
 def _is_unsupported_a2a_event_types(exc: Exception) -> bool:
@@ -4817,24 +4818,34 @@ class InkboxGateway:
             raise
         except Exception:
             logger.exception("[bridge] A2A turn failed: %s", task_id)
-            if context["reply_intent_committed"]:
+            # A shutdown can kill the Claude child first; leave the task to replay.
+            if context["reply_intent_committed"] or self._closing:
                 return
-            try:
-                await self._fence_a2a_progress_updates(task_id, registry_key, data)
-                context["reply_intent_committed"] = True
-                authoritative = await asyncio.to_thread(
-                    self._identity.a2a_task, task_id
-                )
-                if _a2a_state(authoritative.state) not in A2A_STOPPED_STATES:
-                    await _to_thread_drained(
-                        self._identity.a2a_reply,
-                        task_id,
-                        intent="fail",
-                        text="The agent could not finish this task.",
+            for attempt in range(_A2A_FAIL_ATTEMPTS):
+                try:
+                    # Read before fencing: a fenced entry is never replayed.
+                    authoritative = await asyncio.to_thread(
+                        self._identity.a2a_task, task_id
                     )
-                self._write_a2a_registry(registry_key, data, "finalized")
-            except Exception:
-                logger.exception("[bridge] could not fail A2A task: %s", task_id)
+                    if _a2a_state(authoritative.state) not in A2A_STOPPED_STATES:
+                        await self._fence_a2a_progress_updates(
+                            task_id, registry_key, data
+                        )
+                        context["reply_intent_committed"] = True
+                        await _to_thread_drained(
+                            self._identity.a2a_reply,
+                            task_id,
+                            intent="fail",
+                            text="The agent could not finish this task.",
+                        )
+                    self._write_a2a_registry(registry_key, data, "finalized")
+                    return
+                except Exception:
+                    logger.exception(
+                        "[bridge] could not fail A2A task: %s", task_id
+                    )
+                if attempt + 1 < _A2A_FAIL_ATTEMPTS:
+                    await asyncio.sleep(_A2A_RETRY_INTERVAL_SECONDS)
         finally:
             await self._stop_a2a_progress_updates(task_id, owner=registry_key)
 

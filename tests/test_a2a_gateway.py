@@ -220,6 +220,87 @@ def test_failed_a2a_turn_does_not_fail_canceled_task(tmp_path):
     assert entry["state"] == "finalized"
 
 
+def _failing_turn(gateway):
+    async def failed_turn(prompt, *, a2a_context=None, fail_on_error=False):
+        raise RuntimeError("turn failed")
+
+    gateway.sessions.session.run_consult = failed_turn
+
+
+def _run_first_job(gateway):
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    return json.loads(gateway._a2a_registry_path.read_text())["task-1:message-1"]
+
+
+def test_failed_a2a_turn_retries_transient_read_and_send(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_mod, "_A2A_RETRY_INTERVAL_SECONDS", 0)
+    gateway = _gateway(tmp_path)
+    _failing_turn(gateway)
+    reads = {"fail": False}
+    read = gateway._identity.a2a_task
+    reply = gateway._identity.a2a_reply
+
+    def flaky_read(task_id):
+        if reads.pop("fail", False):
+            raise ConnectionError("read")
+        return read(task_id)
+
+    def flaky_reply(task_id, **kwargs):
+        if kwargs["intent"] == "fail":
+            reads["fail"] = True
+            if not getattr(flaky_reply, "failed", False):
+                flaky_reply.failed = True
+                raise ConnectionError("send")
+        reply(task_id, **kwargs)
+
+    gateway._identity.a2a_task = flaky_read
+    gateway._identity.a2a_reply = flaky_reply
+    entry = _run_first_job(gateway)
+
+    assert [r[1]["intent"] for r in gateway.replies] == ["progress", "fail"]
+    assert entry["state"] == "finalized"
+
+
+def test_failed_a2a_turn_unreadable_task_stays_replayable(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_mod, "_A2A_RETRY_INTERVAL_SECONDS", 0)
+    gateway = _gateway(tmp_path)
+    read = gateway._identity.a2a_task
+
+    async def fail_reads_after_ack(prompt, *, a2a_context=None, fail_on_error=False):
+        def unreadable(_task_id):
+            raise ConnectionError("read")
+
+        gateway._identity.a2a_task = unreadable
+        raise RuntimeError("turn failed")
+
+    gateway.sessions.session.run_consult = fail_reads_after_ack
+    entry = _run_first_job(gateway)
+    gateway._identity.a2a_task = read
+
+    assert [r[1]["intent"] for r in gateway.replies] == ["progress"]
+    assert entry["state"] == "running"
+    assert not gateway._a2a_entry_is_fenced(entry)
+
+
+def test_failed_a2a_turn_during_shutdown_is_left_to_replay(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def child_killed(prompt, *, a2a_context=None, fail_on_error=False):
+        gateway._closing = True
+        raise RuntimeError("Claude process exited")
+
+    gateway.sessions.session.run_consult = child_killed
+    entry = _run_first_job(gateway)
+
+    assert [r[1]["intent"] for r in gateway.replies] == ["progress"]
+    assert entry["state"] == "running"
+    assert not gateway._a2a_entry_is_fenced(entry)
+
+
 def test_concurrent_duplicate_a2a_delivery_sends_one_acknowledgement(tmp_path):
     gateway = _gateway(tmp_path)
 
