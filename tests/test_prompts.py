@@ -192,6 +192,12 @@ def test_channel_prompt_mentions_identity_and_dir():
     assert "vCard export/import" in text
 
 
+def test_channel_prompt_gives_hosted_and_local_vault_key_paths():
+    text = build_channel_prompt(project_dir="/srv/app")
+    assert "Secret named INKBOX_CLAUDE_VAULT_KEY in this identity's Env vars tab" in text
+    assert "export INKBOX_CLAUDE_VAULT_KEY in the shell launching Claude Code" in text
+
+
 def test_strip_markdown():
     raw = "**Done!** Ran `npm test`:\n```\nall green\n```\nSee [docs](https://x.y)."
     flat = strip_markdown(raw)

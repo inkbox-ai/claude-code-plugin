@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.33 (unreleased)
+
+- Fail an inbound A2A task with a short generic reason when its Claude turn ends in an error or raises, instead of completing it with the error text or leaving it working. A transient error while failing the task is retried, and a turn cut short by shutdown is left to run again on restart. A task the agent already completed, failed, or handed back to the caller is not changed, and neither is a task that was canceled.
+- Explain how to provide `INKBOX_CLAUDE_VAULT_KEY` to an agent hosted by Inkbox: save it as a Secret in the identity's Env vars tab. Self-hosted setups still set it in the local environment.
+
 ## 0.2.32 (unreleased)
 
 - Wait for incoming Slack voice-note transcripts the same way as other channels, including the completion notification, a single message read, and the transcript label.

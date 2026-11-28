@@ -30,8 +30,9 @@ class _Session:
         self.calls = []
         self.inbound = []
 
-    async def run_consult(self, prompt, *, a2a_context=None):
+    async def run_consult(self, prompt, *, a2a_context=None, fail_on_error=False):
         self.calls.append((prompt, a2a_context))
+        self.fail_on_error = fail_on_error
         return "Completed."
 
     async def handle_inbound(self, prompt, mode, meta):
@@ -152,6 +153,152 @@ def test_a2a_gateway_persists_dedupes_and_completes(tmp_path, monkeypatch):
         ),
         ("task-1", {"intent": "complete", "text": "Completed."}),
     ]
+    assert gateway.sessions.session.fail_on_error is True
+
+
+def test_failed_a2a_turn_fails_task_with_generic_reason(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def failed_turn(prompt, *, a2a_context=None, fail_on_error=False):
+        gateway.sessions.session.calls.append((prompt, a2a_context))
+        assert fail_on_error is True
+        raise RuntimeError("Claude turn ended with error_during_execution: secret detail")
+
+    gateway.sessions.session.run_consult = failed_turn
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    entry = json.loads(gateway._a2a_registry_path.read_text())["task-1:message-1"]
+
+    assert gateway.replies[-1] == (
+        "task-1",
+        {"intent": "fail", "text": "The agent could not finish this task."},
+    )
+    assert entry["state"] == "finalized"
+    assert entry["progress"]["fenced"] is True
+    assert gateway._a2a_progress_tasks == {}
+
+
+def test_failed_a2a_turn_after_explicit_intent_sends_no_fail(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def complete_then_fail(prompt, *, a2a_context=None, fail_on_error=False):
+        a2a_context["reply_intent_committed"] = True
+        raise RuntimeError("late failure")
+
+    gateway.sessions.session.run_consult = complete_then_fail
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+
+    assert [reply[1]["intent"] for reply in gateway.replies] == ["progress"]
+
+
+def test_failed_a2a_turn_does_not_fail_canceled_task(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def canceled_then_fail(prompt, *, a2a_context=None, fail_on_error=False):
+        gateway._a2a_authoritative_task.state = "canceled"
+        raise RuntimeError("turn failed")
+
+    gateway.sessions.session.run_consult = canceled_then_fail
+
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    entry = json.loads(gateway._a2a_registry_path.read_text())["task-1:message-1"]
+
+    assert [reply[1]["intent"] for reply in gateway.replies] == ["progress"]
+    assert entry["state"] == "finalized"
+
+
+def _failing_turn(gateway):
+    async def failed_turn(prompt, *, a2a_context=None, fail_on_error=False):
+        raise RuntimeError("turn failed")
+
+    gateway.sessions.session.run_consult = failed_turn
+
+
+def _run_first_job(gateway):
+    async def scenario():
+        await gateway._on_a2a_event(_event())
+        await asyncio.gather(*gateway._a2a_jobs["task-1"])
+
+    asyncio.run(scenario())
+    return json.loads(gateway._a2a_registry_path.read_text())["task-1:message-1"]
+
+
+def test_failed_a2a_turn_retries_transient_read_and_send(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_mod, "_A2A_RETRY_INTERVAL_SECONDS", 0)
+    gateway = _gateway(tmp_path)
+    _failing_turn(gateway)
+    reads = {"fail": False}
+    read = gateway._identity.a2a_task
+    reply = gateway._identity.a2a_reply
+
+    def flaky_read(task_id):
+        if reads.pop("fail", False):
+            raise ConnectionError("read")
+        return read(task_id)
+
+    def flaky_reply(task_id, **kwargs):
+        if kwargs["intent"] == "fail":
+            reads["fail"] = True
+            if not getattr(flaky_reply, "failed", False):
+                flaky_reply.failed = True
+                raise ConnectionError("send")
+        reply(task_id, **kwargs)
+
+    gateway._identity.a2a_task = flaky_read
+    gateway._identity.a2a_reply = flaky_reply
+    entry = _run_first_job(gateway)
+
+    assert [r[1]["intent"] for r in gateway.replies] == ["progress", "fail"]
+    assert entry["state"] == "finalized"
+
+
+def test_failed_a2a_turn_unreadable_task_stays_replayable(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_mod, "_A2A_RETRY_INTERVAL_SECONDS", 0)
+    gateway = _gateway(tmp_path)
+    read = gateway._identity.a2a_task
+
+    async def fail_reads_after_ack(prompt, *, a2a_context=None, fail_on_error=False):
+        def unreadable(_task_id):
+            raise ConnectionError("read")
+
+        gateway._identity.a2a_task = unreadable
+        raise RuntimeError("turn failed")
+
+    gateway.sessions.session.run_consult = fail_reads_after_ack
+    entry = _run_first_job(gateway)
+    gateway._identity.a2a_task = read
+
+    assert [r[1]["intent"] for r in gateway.replies] == ["progress"]
+    assert entry["state"] == "running"
+    assert not gateway._a2a_entry_is_fenced(entry)
+
+
+def test_failed_a2a_turn_during_shutdown_is_left_to_replay(tmp_path):
+    gateway = _gateway(tmp_path)
+
+    async def child_killed(prompt, *, a2a_context=None, fail_on_error=False):
+        gateway._closing = True
+        raise RuntimeError("Claude process exited")
+
+    gateway.sessions.session.run_consult = child_killed
+    entry = _run_first_job(gateway)
+
+    assert [r[1]["intent"] for r in gateway.replies] == ["progress"]
+    assert entry["state"] == "running"
+    assert not gateway._a2a_entry_is_fenced(entry)
 
 
 def test_concurrent_duplicate_a2a_delivery_sends_one_acknowledgement(tmp_path):
@@ -498,7 +645,7 @@ def test_failed_a2a_acknowledgement_keeps_referenced_background_retry(
 
     gateway._identity.a2a_reply = fail_once
 
-    async def stay_active(prompt, *, a2a_context=None):
+    async def stay_active(prompt, *, a2a_context=None, **_kwargs):
         gateway.sessions.session.calls.append((prompt, a2a_context))
         return "[SILENT]"
 
@@ -1335,7 +1482,7 @@ def test_waiting_state_restart_settles_and_new_caller_reacquires(
         entered = asyncio.Event()
         release = asyncio.Event()
 
-        async def wait_for_release(prompt, *, a2a_context=None):
+        async def wait_for_release(prompt, *, a2a_context=None, **_kwargs):
             gateway.sessions.session.calls.append((prompt, a2a_context))
             entered.set()
             await release.wait()
@@ -1484,7 +1631,7 @@ def test_a2a_cancel_before_admission_blocks_current_generation(tmp_path):
         assert gateway.sessions.session.calls == []
         assert gateway._a2a_jobs == {}
 
-        async def stay_active(prompt, *, a2a_context=None):
+        async def stay_active(prompt, *, a2a_context=None, **_kwargs):
             gateway.sessions.session.calls.append((prompt, a2a_context))
             return "[SILENT]"
 
@@ -1809,7 +1956,7 @@ def test_a2a_catch_up_rejects_persisted_stale_generation_and_runs_current(tmp_pa
 
     gateway._identity.iter_a2a_tasks = iter_a2a_tasks
 
-    async def stay_active(prompt, *, a2a_context=None):
+    async def stay_active(prompt, *, a2a_context=None, **_kwargs):
         gateway.sessions.session.calls.append((prompt, a2a_context))
         return "[SILENT]"
 

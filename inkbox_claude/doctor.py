@@ -94,7 +94,9 @@ def run_doctor() -> List[Tuple[str, bool, str]]:
     host_ready, detail = local_readiness()
     checks.append(("Claude readiness", host_ready, detail))
     checks.append(("Vault unlock key", True,
-                   "configured locally" if os.getenv("INKBOX_CLAUDE_VAULT_KEY") else "locked (optional); set INKBOX_CLAUDE_VAULT_KEY locally"))
+                   "configured locally" if os.getenv("INKBOX_CLAUDE_VAULT_KEY") else
+                   "locked (optional); set INKBOX_CLAUDE_VAULT_KEY locally "
+                   "(hosted by Inkbox: a Secret in the identity's Env vars tab)"))
     checks.append(("Slack receiver", bool(cfg.signing_key) if cfg.slack_enabled else True,
                    "enabled; requires signed Inkbox events" if cfg.slack_enabled else "disabled"))
     checks.append(("response policy", True, f"groups={cfg.group_reply_mode}; Companion={cfg.companion_response_mode}"))

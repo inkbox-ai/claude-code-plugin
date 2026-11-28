@@ -576,7 +576,10 @@ delivery tracking is temporarily unavailable.
 
 The agent can list identity-accessible secret metadata, retrieve one selected
 credential, or obtain a current login 2FA code. Set **`INKBOX_CLAUDE_VAULT_KEY`**
-locally to enable lazy unlocking. Never put it in a conversation or tool argument.
+locally to enable lazy unlocking. If the agent is hosted by Inkbox, save the key
+as a Secret named `INKBOX_CLAUDE_VAULT_KEY` in the identity's Env vars tab in the
+Inkbox Console instead; the agent picks it up once the change is applied, and a key
+exported in a terminal does not reach it. Never put it in a conversation or tool argument.
 Metadata and unrelated tools remain available with a missing or wrong bridge key.
 Every credential/code invocation validates the current bridge-local key and freshly
 checks the selected secret's identity access before and after decryption. Cached or

@@ -120,7 +120,11 @@ def build_channel_prompt(
     return ("Use inkbox_list_vault_secrets to select a credential by name and UUID. "
             "Fetch a secret only for the requested task; do not repeat its value in chat. "
             "For 2FA use inkbox_get_totp_code, never request or expose its seed. "
-            "If Vault is locked, configure INKBOX_CLAUDE_VAULT_KEY locally and restart; never ask for it in chat.\n\n") + CHANNEL_PROMPT.format(
+            "If Vault is locked and this agent is hosted by Inkbox, ask the user to save the vault unlock key as a "
+            "Secret named INKBOX_CLAUDE_VAULT_KEY in this identity's Env vars tab and retry once the agent shows "
+            "the change applied; exporting it in a terminal does not reach the agent. Otherwise, direct the user "
+            "to export INKBOX_CLAUDE_VAULT_KEY in the shell launching Claude Code, then restart and retry. "
+            "Never ask for the key in chat.\n\n") + CHANNEL_PROMPT.format(
         channels=channels,
         identity_line=identity_line,
         project_dir=project_dir or "the current directory",

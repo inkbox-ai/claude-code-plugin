@@ -2510,7 +2510,8 @@ def interactive_setup() -> None:
 
     _configure_slack(api_key, base_url, identity.agent_handle, Inkbox)
     _configure_response_modes()
-    print_info("Vault tools are available. To unlock credentials, set INKBOX_CLAUDE_VAULT_KEY locally; never send it in a conversation.")
+    print_info("Vault tools are available. To unlock credentials, set INKBOX_CLAUDE_VAULT_KEY locally "
+               "(hosted by Inkbox: a Secret in the identity's Env vars tab); never send it in a conversation.")
     _configure_project_dir()
 
     # A live bridge means setup finished the job, so close on that rather than
